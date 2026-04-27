@@ -20,6 +20,7 @@ from maoer_api import (
     AccountInfo,
     BASE_URL,
     ApiError,
+    CheckInResult,
     COMMENT_SORT_HOTTEST,
     COMMENT_SORT_NEWEST,
     DANMAKU_MODE_SUBTITLE,
@@ -106,7 +107,12 @@ class DramaDetailDialog(wx.Dialog):
 
 
 class AccountInfoDialog(wx.Dialog):
-    def __init__(self, parent: wx.Window, account: AccountInfo) -> None:
+    def __init__(
+        self,
+        parent: wx.Window,
+        account: AccountInfo,
+        on_check_in: Callable[[wx.Button], None] | None = None,
+    ) -> None:
         super().__init__(parent, title="我的信息", size=(520, 420))
         panel = wx.Panel(self)
         root = wx.BoxSizer(wx.VERTICAL)
@@ -119,10 +125,18 @@ class AccountInfoDialog(wx.Dialog):
         self.content_box.SetName("我的信息")
 
         button_row = wx.BoxSizer(wx.HORIZONTAL)
+        if on_check_in is not None:
+            check_in_button = wx.Button(panel, label="签到")
+            check_in_button.SetName("签到")
+            check_in_button.Bind(wx.EVT_BUTTON, lambda _event: on_check_in(check_in_button))
+            button_row.Add(check_in_button, 0)
+            button_row.AddStretchSpacer(1)
+        else:
+            button_row.AddStretchSpacer(1)
+
         close_button = wx.Button(panel, wx.ID_CLOSE, label="关闭")
         close_button.SetName("关闭")
         close_button.Bind(wx.EVT_BUTTON, lambda _event: self.EndModal(wx.ID_CLOSE))
-        button_row.AddStretchSpacer(1)
         button_row.Add(close_button, 0)
 
         root.Add(self.content_box, 1, wx.EXPAND | wx.ALL, 10)
@@ -1209,11 +1223,77 @@ class MaoerFrame(wx.Frame):
         )
 
     def _show_account_info_dialog(self, account: AccountInfo) -> None:
-        dialog = AccountInfoDialog(self, account)
+        dialog = AccountInfoDialog(self, account, self._check_in_from_account_dialog)
         try:
             dialog.ShowModal()
         finally:
             dialog.Destroy()
+
+    def _check_in_from_account_dialog(self, button: wx.Button) -> None:
+        button.Enable(False)
+        self.SetStatusText("正在签到...")
+        dialog = button.GetTopLevelParent()
+
+        def runner() -> None:
+            try:
+                result = self.api.check_in()
+                updated_account = None
+                if result.success:
+                    try:
+                        updated_account = self.api.account_info()
+                    except (ApiError, requests.RequestException, ValueError) as exc:
+                        debug_log(f"account refresh after check-in failed: {exc}")
+                    except Exception as exc:
+                        debug_log(f"account refresh after check-in failed: {type(exc).__name__}: {exc}")
+            except ApiError as exc:
+                if str(exc) == "需要登录":
+                    wx.CallAfter(self._mark_account_logged_out, "需要登录")
+                wx.CallAfter(self.show_error, str(exc))
+            except (requests.RequestException, ValueError) as exc:
+                wx.CallAfter(self.show_error, str(exc))
+            except Exception as exc:
+                wx.CallAfter(self.show_error, f"{type(exc).__name__}: {exc}")
+            else:
+                wx.CallAfter(self._show_check_in_result, result, dialog, updated_account)
+            finally:
+                wx.CallAfter(self._safe_enable_window, button, True)
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    @staticmethod
+    def _safe_enable_window(window: wx.Window, enabled: bool) -> None:
+        try:
+            if not window.IsBeingDeleted():
+                window.Enable(enabled)
+        except RuntimeError:
+            pass
+
+    def _show_check_in_result(
+        self,
+        result: CheckInResult,
+        parent: wx.Window | None = None,
+        updated_account: AccountInfo | None = None,
+    ) -> None:
+        title = "签到成功" if result.success else "签到提示"
+        message = result.message or ("签到成功" if result.success else "签到失败")
+        if "请明天再来" in message:
+            message = "您今天已经签到过了，请明天再来哟。"
+        if result.fish_count is not None and str(result.fish_count) not in message:
+            message = f"{message}\n获得小鱼干：{result.fish_count}"
+        if updated_account is not None and isinstance(parent, AccountInfoDialog):
+            try:
+                if not parent.IsBeingDeleted():
+                    parent.content_box.SetValue(updated_account.text)
+            except RuntimeError:
+                parent = None
+        self.SetStatusText(message)
+        message_parent = parent or self
+        wx.MessageBox(message, title, wx.OK | wx.ICON_INFORMATION, message_parent)
+        try:
+            message_parent.Raise()
+            message_parent.SetFocus()
+        except RuntimeError:
+            pass
 
     def _account_list_previous_state(self) -> NavigationState:
         if self.current_title == "首页":

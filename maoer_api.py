@@ -101,6 +101,14 @@ class AccountInfo:
 
 
 @dataclass(slots=True)
+class CheckInResult:
+    success: bool
+    message: str
+    fish_count: int | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class CommentItem:
     id: int
     username: str
@@ -203,6 +211,15 @@ class MaoerApi:
         data = response.json()
         if isinstance(data, dict) and data.get("success") is False:
             raise ApiError(self._payload_message(data))
+        return data
+
+    def _get_json_allow_failure(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        url = path if path.startswith("http") else BASE_URL + path
+        response = self.session.get(url, params=params, timeout=self.timeout)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ApiError("接口返回格式不正确")
         return data
 
     def _get_text(self, path: str, params: dict[str, Any] | None = None) -> str:
@@ -319,6 +336,23 @@ class MaoerApi:
 
     def account_nickname(self) -> str:
         return self.account_info().nickname
+
+    def check_in(self) -> CheckInResult:
+        data = self._get_json_allow_failure("/member/getcatears", {"gtype": 1})
+        if data.get("success") is True:
+            info = data.get("info") or {}
+            if isinstance(info, dict):
+                message = self._first_scalar_value(info, ("message", "msg", "text", "content"))
+            else:
+                message = _text(info)
+            message = message.strip() or "签到成功"
+            self._account_info_cache = None
+            return CheckInResult(True, message, self._fish_count_from_text(message), data)
+
+        message = self._payload_message(data)
+        if message == "需要登录":
+            raise ApiError(message)
+        return CheckInResult(False, message, self._fish_count_from_text(message), data)
 
     def account_info(self, user_id: int | None = None) -> AccountInfo:
         if user_id is None and self._account_info_cache is not None:
@@ -991,6 +1025,8 @@ class MaoerApi:
             ("昵称", ("nickname", "nick_name", "username", "user_name", "name", "uname")),
             ("用户ID", ("id", "user_id", "uid", "userid", "member_id")),
             ("等级", ("level", "lv", "user_level", "rank")),
+            ("小鱼干", ("point", "fish", "fish_count", "catears", "cat_ears")),
+            ("钻石余额", ("balance", "diamond", "diamond_balance", "diamonds")),
             ("关注数", ("followNum", "follow_num", "follow_count", "following_count", "follows", "following_num", "attention_count")),
             ("粉丝数", ("fansNum", "fans_num", "fans_count", "fan_count", "followers_count", "follower_count", "follower_num")),
             ("声音数", ("sound_count", "sounds_count", "sound_num", "music_count")),
@@ -1029,8 +1065,6 @@ class MaoerApi:
         code = _to_int(payload.get("code"))
         if code == 100010006:
             return "需要登录"
-        if code == 100010007:
-            return "参数有误"
         info = payload.get("info")
         if isinstance(info, list) and info:
             item = info[0]
@@ -1038,7 +1072,16 @@ class MaoerApi:
                 return _text(item.get("message") or item.get("msg") or "接口返回失败")
         if isinstance(info, dict):
             return _text(info.get("message") or info.get("msg") or "接口返回失败")
+        if code == 100010007:
+            return _text(info or "参数有误")
         return _text(payload.get("message") or payload.get("msg") or info or "接口返回失败")
+
+    @staticmethod
+    def _fish_count_from_text(text: str) -> int | None:
+        match = re.search(r"小鱼干\s*[×xX*]\s*(\d+)", text)
+        if not match:
+            return None
+        return _to_int(match.group(1))
 
     def homepage(self) -> list[MediaItem]:
         self._open_homepage_shell()
