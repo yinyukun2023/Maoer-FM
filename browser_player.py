@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
 import wx
@@ -18,10 +17,6 @@ class PlayerUnavailable(RuntimeError):
 
 
 WEBVIEW_AUDIO_PROCESS_NAMES = ("msedgewebview2.exe", "webview2", "missevan.com")
-PLAYBACK_MODE_DEFAULT = "default"
-PLAYBACK_MODE_REPEAT_ONE = "repeat_one"
-PLAYBACK_MODE_SEQUENCE = "sequence"
-PLAYBACK_MODES = {PLAYBACK_MODE_DEFAULT, PLAYBACK_MODE_REPEAT_ONE, PLAYBACK_MODE_SEQUENCE}
 
 
 def debug_log(message: str) -> None:
@@ -90,31 +85,23 @@ CONTROL_SCRIPT = r"""
       );
     }
 
-      function installPlaybackGuard(options) {
+    function installSingleSoundGuard(options) {
       options = options || {};
-      var guard = window.__maoerPlaybackGuard || {};
+      var guard = window.__maoerSingleSoundGuard || {};
       var nextSoundId = options.soundId == null ? null : String(options.soundId);
-      var nextMode = options.mode || "default";
-      if (guard.soundId !== nextSoundId || guard.mode !== nextMode) {
+      if (guard.soundId !== nextSoundId) {
         guard.handled = false;
         guard.blockNext = false;
-        guard.sequenceAdvance = false;
-        guard.restartUntil = 0;
         guard.originalSrc = "";
         guard.originalSoundSignature = "";
       }
-      guard.mode = nextMode;
       guard.soundId = nextSoundId;
       guard.expectedUrl = options.url || "";
       guard.generation = options.generation || 0;
-      window.__maoerPlaybackGuard = guard;
+      window.__maoerSingleSoundGuard = guard;
 
       function currentGuard() {
-        return window.__maoerPlaybackGuard || {};
-      }
-
-      function shouldGuard() {
-        return currentGuard().mode !== "off";
+        return window.__maoerSingleSoundGuard || {};
       }
 
       function normalizedUrl(url) {
@@ -140,16 +127,7 @@ CONTROL_SCRIPT = r"""
           return "";
         }
         var values = [];
-        [
-          "id",
-          "sID",
-          "url",
-          "_url",
-          "src",
-          "currentSrc",
-          "soundId",
-          "sound_id"
-        ].forEach(function(key) {
+        ["id", "sID", "url", "_url", "src", "currentSrc", "soundId", "sound_id"].forEach(function(key) {
           try {
             if (sound[key] != null && sound[key] !== "") {
               values.push(key + "=" + normalizedUrl(sound[key]));
@@ -215,22 +193,12 @@ CONTROL_SCRIPT = r"""
 
       function markHandled(item, sound) {
         var state = currentGuard();
-        if (!shouldGuard() || (state.handled && state.mode !== "repeat_one")) {
+        if (state.handled) {
           return;
         }
-        sound = sound || demo();
-
-        if (state.mode === "repeat_one") {
-          restartCurrent(item, sound);
-          return;
-        }
-
         state.handled = true;
         state.blockNext = true;
-        if (state.mode === "sequence") {
-          state.sequenceAdvance = true;
-        }
-        stopSound(sound);
+        stopSound(sound || demo());
         try {
           if (item) {
             item.loop = false;
@@ -244,84 +212,9 @@ CONTROL_SCRIPT = r"""
         } catch (err) {}
       }
 
-      function restartCurrent(item, sound) {
-        var state = currentGuard();
-        var now = Date.now ? Date.now() : new Date().getTime();
-        if (state.restartUntil && now < state.restartUntil) {
-          return;
-        }
-        state.restartUntil = now + 1200;
-        state.handled = false;
-        state.blockNext = false;
-
-        try {
-          if (window.play && play.js && typeof play.js.changeSoundPosition === "function") {
-            play.js.changeSoundPosition(0);
-          }
-        } catch (err) {}
-
-        if (sound) {
-          try {
-            if (typeof sound.setPosition === "function") {
-              sound.setPosition(0);
-            } else if ("position" in sound) {
-              sound.position = 0;
-            }
-          } catch (err) {}
-        }
-
-        if (item) {
-          try {
-            item.loop = true;
-          } catch (err) {}
-          try {
-            item.currentTime = 0;
-          } catch (err) {}
-        }
-
-        function resume() {
-          var played = false;
-          if (sound) {
-            if (typeof sound.play === "function") {
-              try {
-                sound.play();
-                played = true;
-              } catch (err) {}
-            } else if (typeof sound.resume === "function") {
-              try {
-                sound.resume();
-                played = true;
-              } catch (err) {}
-            }
-          }
-          if (item) {
-            played = playMedia(item) || played;
-          }
-          if (played) {
-            return;
-          }
-          if (click("#mpi")) {
-            return;
-          }
-          click("#centerplaybtn");
-        }
-
-        resume();
-        window.setTimeout(resume, 180);
-        window.setTimeout(function() {
-          var latest = currentGuard();
-          if (latest.mode === "repeat_one") {
-            latest.restartUntil = 0;
-          }
-        }, 1300);
-      }
-
       function blockUnexpected(item, sound) {
         var state = currentGuard();
         state.blockNext = true;
-        if (state.mode === "sequence") {
-          state.sequenceAdvance = true;
-        }
         stopSound(sound || demo());
         if (item) {
           try {
@@ -341,16 +234,13 @@ CONTROL_SCRIPT = r"""
           return;
         }
         try {
-          item.loop = currentGuard().mode === "repeat_one";
+          item.loop = false;
         } catch (err) {}
-        if (item.__maoerPlaybackGuardInstalled) {
+        if (item.__maoerSingleSoundGuardInstalled) {
           return;
         }
-        item.__maoerPlaybackGuardInstalled = true;
+        item.__maoerSingleSoundGuardInstalled = true;
         item.addEventListener("ended", function(event) {
-          if (!shouldGuard()) {
-            return;
-          }
           event.preventDefault();
           event.stopImmediatePropagation();
           markHandled(item, demo());
@@ -358,10 +248,10 @@ CONTROL_SCRIPT = r"""
       }
 
       function protectSound(sound) {
-        if (!sound || sound.__maoerPlaybackGuardInstalled) {
+        if (!sound || sound.__maoerSingleSoundGuardInstalled) {
           return;
         }
-        sound.__maoerPlaybackGuardInstalled = true;
+        sound.__maoerSingleSoundGuardInstalled = true;
         ["play", "resume"].forEach(function(name) {
           if (typeof sound[name] !== "function") {
             return;
@@ -369,7 +259,7 @@ CONTROL_SCRIPT = r"""
           var original = sound[name];
           sound[name] = function() {
             var state = currentGuard();
-            if (shouldGuard() && ((state.blockNext && state.mode !== "repeat_one") || isUnexpectedSound(sound))) {
+            if ((state.blockNext && state.handled) || isUnexpectedSound(sound)) {
               blockUnexpected(currentMedia(), sound);
               return sound;
             }
@@ -379,14 +269,14 @@ CONTROL_SCRIPT = r"""
       }
 
       function protectPlayPrototype() {
-        if (!window.HTMLMediaElement || HTMLMediaElement.prototype.__maoerPlaybackGuardPatched) {
+        if (!window.HTMLMediaElement || HTMLMediaElement.prototype.__maoerSingleSoundGuardPatched) {
           return;
         }
         var nativePlay = HTMLMediaElement.prototype.play;
-        HTMLMediaElement.prototype.__maoerPlaybackGuardPatched = true;
+        HTMLMediaElement.prototype.__maoerSingleSoundGuardPatched = true;
         HTMLMediaElement.prototype.play = function() {
           var state = currentGuard();
-          if (shouldGuard() && ((state.blockNext && state.mode !== "repeat_one") || isUnexpectedMedia(this))) {
+          if ((state.blockNext && state.handled) || isUnexpectedMedia(this)) {
             blockUnexpected(this, demo());
             if (window.Promise && Promise.resolve) {
               return Promise.resolve();
@@ -403,9 +293,6 @@ CONTROL_SCRIPT = r"""
         protectPlayPrototype();
         protectSound(sound);
         mediaElements().forEach(protectMedia);
-        if (!shouldGuard()) {
-          return;
-        }
 
         var item = currentMedia();
         captureOriginal(item, sound);
@@ -413,24 +300,6 @@ CONTROL_SCRIPT = r"""
 
         if ((item && isUnexpectedMedia(item)) || (sound && isUnexpectedSound(sound))) {
           blockUnexpected(item, sound);
-          return;
-        }
-
-        if (state.mode === "repeat_one") {
-          if (state.restartUntil) {
-            return;
-          }
-          if (item && isFinite(item.duration) && item.duration > 0 && isFinite(item.currentTime)) {
-            if (item.ended || item.currentTime >= Math.max(0, item.duration - 0.35)) {
-              markHandled(item, sound);
-              return;
-            }
-          }
-          if (sound && isFinite(sound.duration) && sound.duration > 0 && isFinite(sound.position)) {
-            if (sound.position >= Math.max(0, sound.duration - 450)) {
-              markHandled(item, sound);
-            }
-          }
           return;
         }
 
@@ -451,9 +320,6 @@ CONTROL_SCRIPT = r"""
       if (!guard.installed) {
         guard.installed = true;
         document.addEventListener("ended", function(event) {
-          if (!shouldGuard()) {
-            return;
-          }
           event.preventDefault();
           event.stopImmediatePropagation();
           markHandled(event.target || currentMedia(), demo());
@@ -462,53 +328,7 @@ CONTROL_SCRIPT = r"""
       }
 
       tick();
-      return result({ok: true, mode: guard.mode, soundId: guard.soundId});
-    }
-
-    function playbackStatus() {
-      var sound = demo();
-      var item = currentMedia();
-      var position = 0;
-      var duration = 0;
-      var ended = false;
-
-      if (sound) {
-        if (isFinite(sound.position)) {
-          position = Number(sound.position);
-        }
-        if (isFinite(sound.duration)) {
-          duration = Number(sound.duration);
-        }
-        try {
-          ended = ended || !!sound.ended;
-        } catch (err) {}
-      }
-
-      if (item) {
-        if (isFinite(item.currentTime)) {
-          position = Math.max(position, Number(item.currentTime) * 1000);
-        }
-        if (isFinite(item.duration)) {
-          duration = Math.max(duration, Number(item.duration) * 1000);
-        }
-        ended = ended || !!item.ended;
-      }
-
-      var nearEnd = false;
-      if (duration > 0 && position > 0) {
-        nearEnd = position >= Math.max(0, duration - 650);
-      }
-      var guard = window.__maoerPlaybackGuard || {};
-      return result({
-        ok: true,
-        position: position,
-        duration: duration,
-        ended: ended,
-        nearEnd: nearEnd,
-        sequenceAdvance: !!guard.sequenceAdvance,
-        generation: guard.generation || 0,
-        mode: guard.mode || "default"
-      });
+      return result({ok: true, soundId: guard.soundId});
     }
 
     function tryCall(callback) {
@@ -800,12 +620,8 @@ CONTROL_SCRIPT = r"""
       return autoplay();
     }
 
-    if (action === "playbackMode") {
-      return installPlaybackGuard(value);
-    }
-
-    if (action === "status") {
-      return playbackStatus();
+    if (action === "guard") {
+      return installSingleSoundGuard(value);
     }
 
     if (action === "seek") {
@@ -844,26 +660,18 @@ CONTROL_SCRIPT = r"""
 })
 """
 
-
 class HiddenBrowserPlayer:
     def __init__(
         self,
         parent: wx.Window,
         cookie: str = "",
         volume: int = 100,
-        on_sound_changed: Callable[[int], None] | None = None,
-        on_sequence_advance: Callable[[], None] | None = None,
     ) -> None:
         self.parent = parent
         self.cookie = cookie
-        self.on_sound_changed = on_sound_changed
-        self.on_sequence_advance = on_sequence_advance
         self._volume = volume
-        self._playback_mode = PLAYBACK_MODE_DEFAULT
         self._webview: html2.WebView | None = None
         self._current: PlaybackInfo | None = None
-        self._reported_sound_id: int | None = None
-        self._sequence_advance_reported = False
         self._load_generation = 0
         self._page_loaded = False
         self._paused = False
@@ -876,8 +684,6 @@ class HiddenBrowserPlayer:
         debug_log(f"play sound_id={playback.sound_id} title={playback.title!r} url={page_url}")
         webview = self._ensure_webview()
         self._current = playback
-        self._reported_sound_id = playback.sound_id
-        self._sequence_advance_reported = False
         self._page_loaded = False
         self._paused = False
         self._suppress_autoplay = False
@@ -892,15 +698,6 @@ class HiddenBrowserPlayer:
 
         self._load_playback_url(page_url, self._load_generation)
 
-    def set_playback_mode(self, mode: str) -> None:
-        if mode not in PLAYBACK_MODES:
-            mode = PLAYBACK_MODE_DEFAULT
-        self._playback_mode = mode
-        self._sequence_advance_reported = False
-        self._run_control("playbackMode", self._playback_guard_options())
-        if self._playback_mode == PLAYBACK_MODE_SEQUENCE:
-            self._schedule_status_poll(self._load_generation)
-
     def _load_playback_url(self, page_url: str, generation: int) -> None:
         if self._webview is None or generation != self._load_generation or self._current is None:
             return
@@ -908,7 +705,6 @@ class HiddenBrowserPlayer:
         self._webview.LoadURL(page_url)
         wx.CallLater(1500, self._mark_loaded_if_current, self._load_generation)
         wx.CallLater(2500, self._schedule_autoplay, self._load_generation)
-        wx.CallLater(2800, self._schedule_status_poll, self._load_generation)
 
     def seek(self, seconds: int) -> None:
         self._run_control("seek", seconds)
@@ -986,7 +782,6 @@ class HiddenBrowserPlayer:
         webview.Bind(html2.EVT_WEBVIEW_LOADED, self._on_loaded)
         webview.Bind(html2.EVT_WEBVIEW_NAVIGATED, self._on_navigated)
         webview.Bind(html2.EVT_WEBVIEW_ERROR, self._on_error)
-        webview.Bind(html2.EVT_WEBVIEW_SCRIPT_RESULT, self._on_script_result)
 
         self._install_user_scripts(webview)
 
@@ -999,7 +794,7 @@ class HiddenBrowserPlayer:
             webview.RemoveAllUserScripts()
         except Exception:
             pass
-        webview.AddUserScript(self._playback_guard_script(), html2.WEBVIEW_INJECT_AT_DOCUMENT_START)
+        webview.AddUserScript(self._single_sound_guard_script(), html2.WEBVIEW_INJECT_AT_DOCUMENT_START)
         webview.AddUserScript(self._volume_bootstrap_script(), html2.WEBVIEW_INJECT_AT_DOCUMENT_START)
         cookie_script = self._cookie_script()
         if cookie_script:
@@ -1073,8 +868,6 @@ class HiddenBrowserPlayer:
             ):
                 debug_log(f"blocked auto-next current={self._current.sound_id} navigated={navigated_id}")
                 wx.CallAfter(self._block_auto_next, self._load_generation)
-                if self._playback_mode == PLAYBACK_MODE_SEQUENCE:
-                    self._request_sequence_advance(self._load_generation)
                 return
             self._page_loaded = True
 
@@ -1119,76 +912,15 @@ class HiddenBrowserPlayer:
 
         changed = set_current_app_volume(self._volume, include_process_names=WEBVIEW_AUDIO_PROCESS_NAMES)
         debug_log(f"autoplay attempt={13 - attempts} volume={self._volume} audio_session_changed={changed}")
-        self._run_control("playbackMode", self._playback_guard_options())
+        self._run_control("guard", self._single_sound_guard_options())
         self._run_control("autoplay", self._volume)
         wx.CallLater(800, self._schedule_autoplay, generation, attempts - 1)
 
-    def _schedule_status_poll(self, generation: int) -> None:
-        if (
-            generation != self._load_generation
-            or self._current is None
-            or self._webview is None
-            or self._playback_mode != PLAYBACK_MODE_SEQUENCE
-            or self._suppress_autoplay
-        ):
-            return
-        result = self._run_control_sync("status", self._playback_guard_options())
-        payload = self._decode_script_payload(result)
-        if payload:
-            self._handle_script_payload(payload)
-        else:
-            self._run_control("status", self._playback_guard_options())
-        wx.CallLater(700, self._schedule_status_poll, generation)
+    def _single_sound_guard_script(self) -> str:
+        return f"{CONTROL_SCRIPT}({json.dumps('guard')}, {json.dumps(self._single_sound_guard_options())});"
 
-    def _on_script_result(self, event: wx.Event) -> None:
-        try:
-            result = event.GetString()
-        except Exception as exc:
-            result = f"<GetString failed: {exc}>"
-        try:
-            status = event.GetInt()
-        except Exception:
-            status = ""
-        debug_log(f"script_result status={status} result={result}")
-        payload = self._decode_script_payload(result)
-        if payload:
-            self._handle_script_payload(payload)
-
-    def _decode_script_payload(self, result: str) -> dict[str, object] | None:
-        try:
-            payload = json.loads(result)
-            if isinstance(payload, str):
-                payload = json.loads(payload)
-        except (TypeError, ValueError):
-            return None
-        return payload if isinstance(payload, dict) else None
-
-    def _handle_script_payload(self, payload: dict[str, object]) -> None:
-        if payload.get("action") != "status" or self._playback_mode != PLAYBACK_MODE_SEQUENCE:
-            return
-        try:
-            generation = int(payload.get("generation") or 0)
-        except (TypeError, ValueError):
-            generation = 0
-        if generation and generation != self._load_generation:
-            return
-        try:
-            position = float(payload.get("position") or 0)
-        except (TypeError, ValueError):
-            position = 0
-        advance_requested = bool(payload.get("ended") or payload.get("sequenceAdvance"))
-        if advance_requested and not self._sequence_advance_reported:
-            self._request_sequence_advance(self._load_generation)
-            return
-        if self._sequence_advance_reported and 0 < position < 3000 and not advance_requested:
-            self._sequence_advance_reported = False
-
-    def _playback_guard_script(self) -> str:
-        return f"{CONTROL_SCRIPT}({json.dumps('playbackMode')}, {json.dumps(self._playback_guard_options())});"
-
-    def _playback_guard_options(self) -> dict[str, object]:
+    def _single_sound_guard_options(self) -> dict[str, object]:
         return {
-            "mode": self._playback_mode,
             "soundId": self._current.sound_id if self._current is not None else None,
             "url": self._current.url if self._current is not None else "",
             "generation": self._load_generation,
@@ -1200,35 +932,6 @@ class HiddenBrowserPlayer:
         except Exception:
             return None
         return self._sound_id_from_url(url)
-
-    def _mark_sequence_sound_changed(self, sound_id: int) -> None:
-        if self._reported_sound_id == sound_id:
-            return
-        previous = self._current
-        if previous is not None:
-            self._current = PlaybackInfo(
-                sound_id=sound_id,
-                title=previous.title,
-                url="",
-                drama_id=previous.drama_id,
-                page_url=f"{BASE_URL}/sound/player?id={sound_id}",
-                drm=previous.drm,
-            )
-        self._reported_sound_id = sound_id
-        if self.on_sound_changed is not None:
-            wx.CallAfter(self.on_sound_changed, sound_id)
-
-    def _request_sequence_advance(self, generation: int) -> None:
-        if (
-            generation != self._load_generation
-            or self._current is None
-            or self._playback_mode != PLAYBACK_MODE_SEQUENCE
-            or self._sequence_advance_reported
-        ):
-            return
-        self._sequence_advance_reported = True
-        if self.on_sequence_advance is not None:
-            wx.CallAfter(self.on_sequence_advance)
 
     @staticmethod
     def _sound_id_from_url(url: str) -> int | None:
@@ -1245,10 +948,6 @@ class HiddenBrowserPlayer:
 
     def _block_auto_next(self, generation: int) -> None:
         if generation != self._load_generation or self._webview is None or self._current is None:
-            return
-        if self._playback_mode == PLAYBACK_MODE_REPEAT_ONE:
-            page_url = self._current.page_url or f"https://www.missevan.com/sound/player?id={self._current.sound_id}"
-            self._load_playback_url(page_url, generation)
             return
         self.stop()
 
@@ -1267,16 +966,4 @@ class HiddenBrowserPlayer:
             debug_log(f"run_control exception action={action} value={value}")
             return ""
         debug_log(f"run_control sync action={action} value={value} ok={ok} result={result}")
-        return result if ok else ""
-
-    def _run_control_sync(self, action: str, value: object | None = None) -> str:
-        if self._webview is None or not hasattr(self._webview, "RunScript"):
-            return ""
-        script = f"{CONTROL_SCRIPT}({json.dumps(action)}, {json.dumps(value)})"
-        try:
-            ok, result = self._webview.RunScript(script)
-        except Exception:
-            debug_log(f"run_control_sync exception action={action} value={value}")
-            return ""
-        debug_log(f"run_control_sync action={action} value={value} ok={ok} result={result}")
         return result if ok else ""

@@ -4,6 +4,7 @@ import json
 import html
 import os
 import re
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -72,6 +73,18 @@ class PlaybackInfo:
 
 
 @dataclass(slots=True)
+class DanmakuItem:
+    time: float
+    text: str
+    mode: int = 0
+    size: int = 0
+    color: int = 0
+    created_at: str = ""
+    user_id: str = ""
+    danmaku_id: str = ""
+
+
+@dataclass(slots=True)
 class LoginCaptcha:
     gt: str
     challenge: str
@@ -112,6 +125,15 @@ def _to_int(value: Any, default: int | None = None) -> int | None:
         return default
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return default
 
@@ -486,6 +508,33 @@ class MaoerApi:
             page=page,
             page_size=page_size,
         )
+
+    def sound_danmaku(self, sound_id: int) -> list[DanmakuItem]:
+        xml_text = self._get_text("/sound/getdm", {"soundid": int(sound_id)})
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError as exc:
+            raise ApiError(f"弹幕数据解析失败: {exc}") from exc
+
+        items: list[DanmakuItem] = []
+        for element in root.findall(".//d"):
+            text = (element.text or "").strip()
+            if not text:
+                continue
+            parts = (element.get("p") or "").split(",")
+            items.append(
+                DanmakuItem(
+                    time=_to_float(parts[0]) if len(parts) > 0 else 0.0,
+                    text=text,
+                    mode=(_to_int(parts[1], 0) or 0) if len(parts) > 1 else 0,
+                    size=(_to_int(parts[2], 0) or 0) if len(parts) > 2 else 0,
+                    color=(_to_int(parts[3], 0) or 0) if len(parts) > 3 else 0,
+                    created_at=self._danmaku_time(parts[4]) if len(parts) > 4 else "",
+                    user_id=parts[6] if len(parts) > 6 else "",
+                    danmaku_id=parts[7] if len(parts) > 7 else "",
+                )
+            )
+        return sorted(items, key=lambda item: item.time)
 
     def comments(
         self,
@@ -915,6 +964,16 @@ class MaoerApi:
 
     @staticmethod
     def _comment_time(value: Any) -> str:
+        timestamp = _to_int(value)
+        if timestamp is None or timestamp <= 0:
+            return ""
+        try:
+            return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
+        except (OSError, OverflowError, ValueError):
+            return _text(value)
+
+    @staticmethod
+    def _danmaku_time(value: Any) -> str:
         timestamp = _to_int(value)
         if timestamp is None or timestamp <= 0:
             return ""

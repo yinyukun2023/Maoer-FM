@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import ctypes
 from dataclasses import dataclass
 import os
 import re
-import sys
 import threading
 import time
 from typing import Callable
@@ -14,9 +12,6 @@ import wx
 
 from app_paths import clear_webview2_profile
 from browser_player import (
-    PLAYBACK_MODE_DEFAULT,
-    PLAYBACK_MODE_REPEAT_ONE,
-    PLAYBACK_MODE_SEQUENCE,
     HiddenBrowserPlayer,
     PlayerUnavailable,
 )
@@ -27,6 +22,7 @@ from maoer_api import (
     ApiError,
     COMMENT_SORT_HOTTEST,
     COMMENT_SORT_NEWEST,
+    DanmakuItem,
     DrmUnsupported,
     MaoerApi,
     CommentItem,
@@ -35,20 +31,6 @@ from maoer_api import (
     PlaybackInfo,
     PurchaseRequired,
 )
-
-
-IS_WINDOWS = sys.platform.startswith("win")
-HOTKEY_ID_BASE = 0x5100
-WIN_MOD_CONTROL = 0x0002
-WIN_MOD_SHIFT = 0x0004
-WIN_MOD_NOREPEAT = 0x4000
-WIN_VK_LEFT = 0x25
-WIN_VK_UP = 0x26
-WIN_VK_RIGHT = 0x27
-WIN_VK_DOWN = 0x28
-WIN_VK_HOME = 0x24
-WIN_VK_END = 0x23
-WM_HOTKEY = 0x0312
 
 
 def debug_log(message: str) -> None:
@@ -497,38 +479,309 @@ class CommentsFrame(wx.Frame):
         self.comment_list.EnsureVisible(index)
 
 
+@dataclass
+class DanmakuSprite:
+    item: DanmakuItem
+    lane: int
+    start_position: float
+    text_width: int
+
+
+class DanmakuCanvas(wx.Panel):
+    FRAME_MS = 33
+    TRAVEL_SECONDS = 8.0
+
+    def __init__(self, parent: wx.Window) -> None:
+        super().__init__(parent, style=wx.BORDER_NONE)
+        self.SetBackgroundColour(wx.BLACK)
+        self.SetName("")
+        self.bitmap_view = wx.StaticBitmap(self, bitmap=wx.Bitmap(1, 1))
+        self.bitmap_view.SetName("")
+        root = wx.BoxSizer(wx.VERTICAL)
+        root.Add(self.bitmap_view, 1, wx.EXPAND)
+        self.SetSizer(root)
+        self.items: list[DanmakuItem] = []
+        self.active: list[DanmakuSprite] = []
+        self.next_index = 0
+        self.next_lane = 0
+        self.position = 0.0
+        self.paused = False
+        self.message = ""
+        self.last_tick = time.monotonic()
+        self.font = wx.Font(16, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL)
+        self.timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.on_timer, self.timer)
+        self.Bind(wx.EVT_SIZE, self.on_size)
+
+    def reset(self, message: str = "") -> None:
+        self.items = []
+        self.active = []
+        self.next_index = 0
+        self.next_lane = 0
+        self.position = 0.0
+        self.paused = False
+        self.message = message
+        self.last_tick = time.monotonic()
+        self.timer.Start(self.FRAME_MS)
+        self._render_frame()
+
+    def set_items(self, items: list[DanmakuItem]) -> None:
+        self.items = sorted(items, key=lambda item: item.time)
+        self.active = []
+        self.next_index = self._first_index_at_or_after(self.position)
+        self.next_lane = 0
+        self.message = "" if self.items else "暂无弹幕"
+        self._render_frame()
+
+    def set_error(self, message: str) -> None:
+        self.items = []
+        self.active = []
+        self.message = f"弹幕加载失败: {message or '未知错误'}"
+        self._render_frame()
+
+    def set_paused(self, paused: bool) -> None:
+        self._advance_position()
+        self.paused = paused
+        self.last_tick = time.monotonic()
+        self._render_frame()
+
+    def seek(self, seconds: int) -> None:
+        self.position = max(0.0, self.position + float(seconds))
+        self.active = []
+        self.next_index = self._first_index_at_or_after(self.position)
+        self.next_lane = 0
+        self.last_tick = time.monotonic()
+        self._render_frame()
+
+    def stop(self) -> None:
+        self.timer.Stop()
+
+    def on_size(self, event: wx.SizeEvent) -> None:
+        self.active = []
+        self.next_lane = 0
+        self._render_frame()
+        event.Skip()
+
+    def on_timer(self, _event: wx.TimerEvent) -> None:
+        if not self.paused:
+            self._advance_position()
+            self._spawn_due_items()
+            self._drop_finished_items()
+        self._render_frame()
+
+    def _render_frame(self) -> None:
+        size = self.GetClientSize()
+        width = max(1, size.width)
+        height = max(1, size.height)
+        bitmap = wx.Bitmap(width, height)
+        dc = wx.MemoryDC(bitmap)
+        dc.SetBackground(wx.Brush(wx.BLACK))
+        dc.Clear()
+        dc.SetFont(self.font)
+
+        if self.message:
+            dc.SetTextForeground(wx.Colour(210, 210, 210))
+            text_width, text_height = dc.GetTextExtent(self.message)
+            x = max(0, (width - text_width) // 2)
+            y = max(0, (height - text_height) // 2)
+            dc.DrawText(self.message, x, y)
+            dc.SelectObject(wx.NullBitmap)
+            self.bitmap_view.SetBitmap(bitmap)
+            return
+
+        for sprite in self.active:
+            elapsed = max(0.0, self.position - sprite.start_position)
+            speed = (width + sprite.text_width) / self.TRAVEL_SECONDS
+            x = int(width - elapsed * speed)
+            y = self._lane_y(sprite.lane)
+            dc.SetTextForeground(self._item_colour(sprite.item))
+            dc.DrawText(sprite.item.text, x, y)
+        dc.SelectObject(wx.NullBitmap)
+        self.bitmap_view.SetBitmap(bitmap)
+
+    def _advance_position(self) -> None:
+        now = time.monotonic()
+        if not self.paused:
+            self.position += max(0.0, now - self.last_tick)
+        self.last_tick = now
+
+    def _spawn_due_items(self) -> None:
+        if not self.items:
+            return
+        now = self.position
+        stale_before = max(0.0, now - 0.4)
+        while self.next_index < len(self.items) and self.items[self.next_index].time < stale_before:
+            self.next_index += 1
+        while self.next_index < len(self.items) and self.items[self.next_index].time <= now:
+            self._spawn_item(self.items[self.next_index])
+            self.next_index += 1
+
+    def _spawn_item(self, item: DanmakuItem) -> None:
+        lane_count = self._lane_count()
+        lane = self.next_lane % lane_count
+        self.next_lane = (lane + 1) % lane_count
+        bitmap = wx.Bitmap(1, 1)
+        dc = wx.MemoryDC(bitmap)
+        dc.SetFont(self.font)
+        text_width = dc.GetTextExtent(item.text)[0]
+        dc.SelectObject(wx.NullBitmap)
+        self.active.append(DanmakuSprite(item, lane, self.position, text_width))
+
+    def _drop_finished_items(self) -> None:
+        width = self.GetClientSize().width
+        kept: list[DanmakuSprite] = []
+        for sprite in self.active:
+            elapsed = max(0.0, self.position - sprite.start_position)
+            speed = (width + sprite.text_width) / self.TRAVEL_SECONDS
+            if width - elapsed * speed + sprite.text_width >= 0:
+                kept.append(sprite)
+        self.active = kept
+
+    def _lane_count(self) -> int:
+        height = max(1, self.GetClientSize().height)
+        return max(1, height // self._lane_height())
+
+    def _lane_height(self) -> int:
+        return max(self.GetCharHeight() + 8, 28)
+
+    def _lane_y(self, lane: int) -> int:
+        return 4 + (lane % self._lane_count()) * self._lane_height()
+
+    def _first_index_at_or_after(self, seconds: float) -> int:
+        for index, item in enumerate(self.items):
+            if item.time >= seconds:
+                return index
+        return len(self.items)
+
+    @staticmethod
+    def _item_colour(item: DanmakuItem) -> wx.Colour:
+        if item.color <= 0:
+            return wx.Colour(255, 255, 255)
+        return wx.Colour((item.color >> 16) & 0xFF, (item.color >> 8) & 0xFF, item.color & 0xFF)
+
+
+class PlaybackFrame(wx.Frame):
+    SEEK_SECONDS = 15
+
+    def __init__(
+        self,
+        parent: wx.Window,
+        api: MaoerApi,
+        player: HiddenBrowserPlayer,
+        on_closed: Callable[["PlaybackFrame"], None],
+    ) -> None:
+        super().__init__(parent, title="", size=(760, 480))
+        self.api = api
+        self.player = player
+        self.on_closed = on_closed
+        self.playback: PlaybackInfo | None = None
+        self.load_generation = 0
+
+        root = wx.BoxSizer(wx.VERTICAL)
+        self.danmaku_canvas = DanmakuCanvas(self)
+        root.Add(self.danmaku_canvas, 1, wx.EXPAND)
+        self.SetSizer(root)
+
+        self.Bind(wx.EVT_CHAR_HOOK, self.on_char_hook)
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+
+    def play(self, playback: PlaybackInfo) -> None:
+        self.playback = playback
+        self.load_generation += 1
+        generation = self.load_generation
+        self.SetTitle(playback.title)
+        self.danmaku_canvas.reset("正在加载弹幕...")
+        self.player.play(playback)
+        self._load_danmaku(playback.sound_id, generation)
+        wx.CallAfter(self.SetFocus)
+
+    def _load_danmaku(self, sound_id: int, generation: int) -> None:
+        def runner() -> None:
+            try:
+                items = self.api.sound_danmaku(sound_id)
+            except (ApiError, requests.RequestException, ValueError) as exc:
+                wx.CallAfter(self._set_danmaku_failed, generation, str(exc))
+            except Exception as exc:
+                wx.CallAfter(self._set_danmaku_failed, generation, f"{type(exc).__name__}: {exc}")
+            else:
+                wx.CallAfter(self._set_danmaku_items, generation, items)
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _set_danmaku_items(self, generation: int, items: list[DanmakuItem]) -> None:
+        if generation != self.load_generation:
+            return
+        self.danmaku_canvas.set_items(items)
+
+    def _set_danmaku_failed(self, generation: int, message: str) -> None:
+        if generation != self.load_generation:
+            return
+        self.danmaku_canvas.set_error(message)
+
+    def on_char_hook(self, event: wx.KeyEvent) -> None:
+        key = event.GetKeyCode()
+        try:
+            if key == wx.WXK_SPACE:
+                paused = self.player.toggle_pause()
+                self.danmaku_canvas.set_paused(paused)
+                self._set_parent_status("已暂停" if paused else "继续播放")
+                return
+            if key == wx.WXK_UP:
+                volume = self.player.volume_up()
+                self._set_parent_status(f"音量: {volume}")
+                return
+            if key == wx.WXK_DOWN:
+                volume = self.player.volume_down()
+                self._set_parent_status(f"音量: {volume}")
+                return
+            if key == wx.WXK_RIGHT:
+                self.player.seek(self.SEEK_SECONDS)
+                self.danmaku_canvas.seek(self.SEEK_SECONDS)
+                self._set_parent_status(f"快进 {self.SEEK_SECONDS} 秒")
+                return
+            if key == wx.WXK_LEFT:
+                self.player.seek(-self.SEEK_SECONDS)
+                self.danmaku_canvas.seek(-self.SEEK_SECONDS)
+                self._set_parent_status(f"快退 {self.SEEK_SECONDS} 秒")
+                return
+        except PlayerUnavailable as exc:
+            self._set_parent_status("操作失败")
+            wx.MessageBox(str(exc), "错误", wx.OK | wx.ICON_ERROR, self)
+            return
+        event.Skip()
+
+    def on_close(self, event: wx.CloseEvent) -> None:
+        self.load_generation += 1
+        self.danmaku_canvas.stop()
+        self.player.stop()
+        self.on_closed(self)
+        event.Skip()
+
+    def _set_parent_status(self, message: str) -> None:
+        parent = self.GetParent()
+        if parent is not None and hasattr(parent, "SetStatusText"):
+            parent.SetStatusText(message)
+
+
 class MaoerFrame(wx.Frame):
     def __init__(self) -> None:
         super().__init__(None, title="猫耳FM", size=(940, 620))
         self.api = MaoerApi()
-        self.browser_player = HiddenBrowserPlayer(
-            self,
-            cookie=self.api.cookie_header,
-            on_sound_changed=self.on_player_sound_changed,
-            on_sequence_advance=self.on_player_sequence_advance,
-        )
+        self.browser_player = HiddenBrowserPlayer(self, cookie=self.api.cookie_header)
         self.active_player: HiddenBrowserPlayer | None = None
+        self.player_frame: PlaybackFrame | None = None
         self.items: list[MediaItem] = []
         self.current_title = ""
         self.page_state: PageState | None = None
         self.navigation_stack: list[NavigationState] = []
         self.homepage_state: NavigationState | None = None
-        self.hotkey_handlers: dict[int, Callable[[], None]] = {}
-        self.native_hotkey_ids: list[int] = []
-        self.wx_hotkey_ids: list[int] = []
         self.comment_windows: list[CommentsFrame] = []
         self.last_mouse_context_menu_at = 0.0
         self.account_logged_in = bool(self.api.cookie_header)
-        self.playback_mode = PLAYBACK_MODE_DEFAULT
-        self.playback_generation = 0
-        self.sequence_advance_pending = False
-        self.sequence_page_advance_generation: int | None = None
 
         self._build_ui()
         self._build_menu()
         self._bind_events()
-        self.browser_player.set_playback_mode(self.playback_mode)
-        self._register_hotkeys()
         if self.api.cookie_header:
             self._refresh_account_title()
         wx.CallAfter(lambda: self.load_homepage(focus_list=True))
@@ -569,9 +822,6 @@ class MaoerFrame(wx.Frame):
         self.account_purchased_dramas_menu_id = wx.NewIdRef()
         self.account_logout_menu_id = wx.NewIdRef()
         self.account_exit_menu_id = wx.NewIdRef()
-        self.playback_mode_default_menu_id = wx.NewIdRef()
-        self.playback_mode_repeat_one_menu_id = wx.NewIdRef()
-        self.playback_mode_sequence_menu_id = wx.NewIdRef()
         self._update_account_menu()
 
     def _update_account_menu(self) -> None:
@@ -588,20 +838,6 @@ class MaoerFrame(wx.Frame):
         account_menu.AppendSeparator()
         account_menu.Append(self.account_exit_menu_id, "退出程序(&Q)")
         menu_bar.Append(account_menu, "账号(&A)")
-
-        settings_menu = wx.Menu()
-        playback_menu = wx.Menu()
-        default_item = playback_menu.AppendRadioItem(self.playback_mode_default_menu_id, "默认(&D)")
-        repeat_one_item = playback_menu.AppendRadioItem(self.playback_mode_repeat_one_menu_id, "单集循环(&R)")
-        sequence_item = playback_menu.AppendRadioItem(self.playback_mode_sequence_menu_id, "顺序播放(&S)")
-        if self.playback_mode == PLAYBACK_MODE_REPEAT_ONE:
-            repeat_one_item.Check(True)
-        elif self.playback_mode == PLAYBACK_MODE_SEQUENCE:
-            sequence_item.Check(True)
-        else:
-            default_item.Check(True)
-        settings_menu.AppendSubMenu(playback_menu, "播放设置(&P)")
-        menu_bar.Append(settings_menu, "设置(&S)")
         self.SetMenuBar(menu_bar)
 
     def _bind_events(self) -> None:
@@ -623,79 +859,8 @@ class MaoerFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_account_purchased_dramas, id=self.account_purchased_dramas_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_logout, id=self.account_logout_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_exit, id=self.account_exit_menu_id)
-        self.Bind(wx.EVT_MENU, self.on_playback_mode_changed, id=self.playback_mode_default_menu_id)
-        self.Bind(wx.EVT_MENU, self.on_playback_mode_changed, id=self.playback_mode_repeat_one_menu_id)
-        self.Bind(wx.EVT_MENU, self.on_playback_mode_changed, id=self.playback_mode_sequence_menu_id)
         self.Bind(wx.EVT_CHAR_HOOK, self.on_char_hook)
         self.Bind(wx.EVT_CLOSE, self.on_close)
-
-    def _register_hotkeys(self) -> None:
-        specs = [
-            ("快进", wx.WXK_RIGHT, WIN_VK_RIGHT, lambda: self._seek(15), True),
-            ("快退", wx.WXK_LEFT, WIN_VK_LEFT, lambda: self._seek(-15), True),
-            ("音量加", wx.WXK_UP, WIN_VK_UP, self._volume_up, True),
-            ("音量减", wx.WXK_DOWN, WIN_VK_DOWN, self._volume_down, True),
-            ("暂停/继续", wx.WXK_HOME, WIN_VK_HOME, self._toggle_pause, False),
-            ("停止", wx.WXK_END, WIN_VK_END, self._stop, False),
-        ]
-        modifiers = wx.MOD_CONTROL | wx.MOD_SHIFT
-        failures: list[str] = []
-        for offset, (label, wx_key_code, win_key_code, handler, repeatable) in enumerate(specs):
-            numeric_id = HOTKEY_ID_BASE + offset
-            registered = False
-            if self._register_native_hotkey(numeric_id, win_key_code, repeatable):
-                self.native_hotkey_ids.append(numeric_id)
-                registered = True
-            elif self.RegisterHotKey(numeric_id, modifiers, wx_key_code):
-                self.wx_hotkey_ids.append(numeric_id)
-                registered = True
-
-            if registered:
-                self.hotkey_handlers[numeric_id] = handler
-                self.Bind(wx.EVT_HOTKEY, self.on_hotkey, id=numeric_id)
-                debug_log(f"hotkey registered label={label} id={numeric_id} native={numeric_id in self.native_hotkey_ids}")
-            else:
-                failures.append(label)
-                debug_log(f"hotkey register failed label={label} id={numeric_id}")
-
-        if failures:
-            wx.CallAfter(self.SetStatusText, "以下全局快捷键注册失败: " + "、".join(failures))
-
-    def _register_native_hotkey(self, hotkey_id: int, virtual_key: int, repeatable: bool) -> bool:
-        if not IS_WINDOWS:
-            return False
-        modifiers = WIN_MOD_CONTROL | WIN_MOD_SHIFT
-        if not repeatable:
-            modifiers |= WIN_MOD_NOREPEAT
-        hwnd = ctypes.c_void_p(self.GetHandle())
-        return bool(
-            ctypes.windll.user32.RegisterHotKey(
-                hwnd,
-                ctypes.c_int(hotkey_id),
-                ctypes.c_uint(modifiers),
-                ctypes.c_uint(virtual_key),
-            )
-        )
-
-    def MSWWindowProc(self, message: int, w_param: int, l_param: int) -> int:
-        if message == WM_HOTKEY:
-            debug_log(f"WM_HOTKEY id={int(w_param)} l_param={int(l_param)}")
-            handler = self.hotkey_handlers.get(int(w_param))
-            if handler:
-                wx.CallAfter(handler)
-                return 0
-        return super().MSWWindowProc(message, w_param, l_param)
-
-    def _unregister_hotkeys(self) -> None:
-        if IS_WINDOWS:
-            hwnd = ctypes.c_void_p(self.GetHandle())
-            for hotkey_id in self.native_hotkey_ids:
-                ctypes.windll.user32.UnregisterHotKey(hwnd, ctypes.c_int(hotkey_id))
-        self.native_hotkey_ids.clear()
-
-        for hotkey_id in self.wx_hotkey_ids:
-            self.UnregisterHotKey(hotkey_id)
-        self.wx_hotkey_ids.clear()
 
     def load_homepage(self, focus_list: bool = False) -> None:
         self._run_background(
@@ -796,24 +961,6 @@ class MaoerFrame(wx.Frame):
         self.SetStatusText("已退出登录")
         if self.current_title in {"剧集订阅", "已购广播剧"}:
             self.load_homepage(focus_list=True)
-
-    def on_playback_mode_changed(self, event: wx.CommandEvent) -> None:
-        mode_by_id = {
-            int(self.playback_mode_default_menu_id): PLAYBACK_MODE_DEFAULT,
-            int(self.playback_mode_repeat_one_menu_id): PLAYBACK_MODE_REPEAT_ONE,
-            int(self.playback_mode_sequence_menu_id): PLAYBACK_MODE_SEQUENCE,
-        }
-        label_by_mode = {
-            PLAYBACK_MODE_DEFAULT: "默认",
-            PLAYBACK_MODE_REPEAT_ONE: "单集循环",
-            PLAYBACK_MODE_SEQUENCE: "顺序播放",
-        }
-        self.playback_mode = mode_by_id.get(event.GetId(), PLAYBACK_MODE_DEFAULT)
-        self.browser_player.set_playback_mode(self.playback_mode)
-        if self.playback_mode != PLAYBACK_MODE_SEQUENCE:
-            self.sequence_advance_pending = False
-            self.sequence_page_advance_generation = None
-        self.SetStatusText(f"播放模式: {label_by_mode[self.playback_mode]}")
 
     def _refresh_account_title(self) -> None:
         def runner() -> None:
@@ -942,81 +1089,6 @@ class MaoerFrame(wx.Frame):
         self.list.SetItemState(index, state, state)
         if ensure_visible:
             self.list.EnsureVisible(index)
-
-    def on_player_sound_changed(self, sound_id: int) -> None:
-        if self.playback_mode != PLAYBACK_MODE_SEQUENCE:
-            return
-        for index, item in enumerate(self.items):
-            if item.kind == "sound" and item.id == sound_id:
-                self._select_list_row(index)
-                self.SetStatusText(f"正在后台播放: {item.title}")
-                return
-
-    def on_player_sequence_advance(self) -> None:
-        if self.playback_mode != PLAYBACK_MODE_SEQUENCE:
-            return
-        self._play_next_in_sequence(self.playback_generation)
-
-    def _play_next_in_sequence(self, generation: int) -> None:
-        if generation != self.playback_generation or self.playback_mode != PLAYBACK_MODE_SEQUENCE:
-            return
-        if self.sequence_advance_pending:
-            return
-        if self.active_player is not None and self.active_player.is_paused():
-            wx.CallLater(1000, self._play_next_in_sequence, generation)
-            return
-        current_index = self._selected_index()
-        index = self._next_playable_index(current_index)
-        if index is None:
-            if self.page_state is not None and self.page_state.has_more:
-                self.sequence_advance_pending = True
-                self.sequence_page_advance_generation = generation
-            self._load_next_page()
-            return
-        self.sequence_advance_pending = True
-        self._select_list_row(index)
-        self.list.SetFocus()
-        self.playback_generation += 1
-        self._play_sequence_item(index, self.playback_generation)
-
-    def _next_playable_index(self, current_index: int) -> int | None:
-        start = max(current_index + 1, 0)
-        for index in range(start, len(self.items)):
-            item = self.items[index]
-            if item.kind == "sound" and not item.need_pay:
-                return index
-        return None
-
-    def _index_for_item(self, target: MediaItem) -> int | None:
-        for index, item in enumerate(self.items):
-            if item.kind == target.kind and item.id == target.id:
-                return index
-        return None
-
-    def _play_sequence_item(self, index: int, generation: int) -> None:
-        if index < 0 or index >= len(self.items):
-            self.sequence_advance_pending = False
-            return
-        item = self.items[index]
-        if item.kind != "sound" or item.need_pay:
-            self.sequence_advance_pending = False
-            return
-
-        def done(playback: PlaybackInfo) -> None:
-            if generation != self.playback_generation:
-                return
-            self._play(playback, item, index)
-
-        def failed(exc: Exception) -> None:
-            self.sequence_advance_pending = False
-            self.show_error(str(exc) or type(exc).__name__)
-
-        self._run_background_with_error(
-            f"正在获取播放地址: {item.title}",
-            lambda: self.api.playback_info(item),
-            done,
-            failed,
-        )
 
     def _resize_list_columns(self) -> None:
         width = self.list.GetClientSize().width
@@ -1185,7 +1257,7 @@ class MaoerFrame(wx.Frame):
         self._run_background(
             f"正在获取播放地址: {item.title}",
             lambda: self.api.playback_info(item),
-            lambda playback, item=item, index=self._index_for_item(item): self._play(playback, item, index),
+            lambda playback: self._play(playback),
         )
 
     def _set_root_items(
@@ -1325,7 +1397,6 @@ class MaoerFrame(wx.Frame):
         new_items = [item for item in items if (item.kind, item.id) not in existing]
         if not new_items:
             state.has_more = False
-            self._clear_sequence_page_advance()
             self.SetStatusText("已经到最后一页")
             return
 
@@ -1343,41 +1414,39 @@ class MaoerFrame(wx.Frame):
             self._select_list_row(previous_selection)
         self.SetStatusText(f"{self.current_title}，共 {len(self.items)} 项")
 
-        self._continue_sequence_after_page_load()
+    def _play(self, playback: PlaybackInfo) -> None:
+        created = False
+        if self.player_frame is None:
+            self.player_frame = PlaybackFrame(
+                self,
+                self.api,
+                self.browser_player,
+                self._on_player_window_close,
+            )
+            created = True
 
-    def _continue_sequence_after_page_load(self) -> None:
-        generation = self.sequence_page_advance_generation
-        if generation is None:
-            return
-
-        self.sequence_page_advance_generation = None
-        if generation != self.playback_generation or self.playback_mode != PLAYBACK_MODE_SEQUENCE:
-            self.sequence_advance_pending = False
-            return
-
-        self.sequence_advance_pending = False
-        self._play_next_in_sequence(generation)
-
-    def _clear_sequence_page_advance(self) -> None:
-        if self.sequence_page_advance_generation is not None:
-            self.sequence_page_advance_generation = None
-            self.sequence_advance_pending = False
-
-    def _play(self, playback: PlaybackInfo, item: MediaItem | None = None, index: int | None = None) -> None:
         try:
             self.browser_player.cookie = self.api.cookie_header
-            self.browser_player.set_playback_mode(self.playback_mode)
-            self.browser_player.play(playback)
+            self.player_frame.play(playback)
             self.active_player = self.browser_player
         except PlayerUnavailable as exc:
+            if created and self.player_frame is not None:
+                self.player_frame.Destroy()
+                self.player_frame = None
             self.show_error(str(exc))
             return
 
-        self.playback_generation += 1
-        self.sequence_advance_pending = False
-        self.sequence_page_advance_generation = None
-        self.SetStatusText(f"正在后台播放: {playback.title}")
+        self.player_frame.Show()
+        self.player_frame.Raise()
+        self.SetStatusText(f"正在播放: {playback.title}")
         threading.Thread(target=self.api.add_play_times, args=(playback,), daemon=True).start()
+
+    def _on_player_window_close(self, frame: PlaybackFrame) -> None:
+        if self.player_frame is frame:
+            self.player_frame = None
+        if self.active_player is self.browser_player:
+            self.active_player = None
+        self.SetStatusText("已停止播放")
 
     def _run_background(
         self,
@@ -1410,53 +1479,10 @@ class MaoerFrame(wx.Frame):
 
         threading.Thread(target=runner, daemon=True).start()
 
-    def _run_background_with_error(
-        self,
-        status: str,
-        work: Callable[[], object],
-        done: Callable[[object], None],
-        failed: Callable[[Exception], None],
-    ) -> None:
-        self.SetStatusText(status)
-        self.search_button.Enable(False)
-
-        def runner() -> None:
-            try:
-                result = work()
-            except Exception as exc:
-                wx.CallAfter(failed, exc)
-            else:
-                wx.CallAfter(done, result)
-            finally:
-                wx.CallAfter(self.search_button.Enable, True)
-
-        threading.Thread(target=runner, daemon=True).start()
-
-    def on_hotkey(self, event: wx.KeyEvent) -> None:
-        debug_log(f"EVT_HOTKEY id={event.GetId()}")
-        handler = self.hotkey_handlers.get(event.GetId())
-        if handler:
-            handler()
-
     def on_account_exit(self, _event: wx.CommandEvent) -> None:
         self.Close()
 
     def on_char_hook(self, event: wx.KeyEvent) -> None:
-        if event.ControlDown() and event.ShiftDown():
-            key = event.GetKeyCode()
-            debug_log(f"EVT_CHAR_HOOK ctrl+shift key={key}")
-            fallback = {
-                wx.WXK_RIGHT: lambda: self._seek(15),
-                wx.WXK_LEFT: lambda: self._seek(-15),
-                wx.WXK_UP: self._volume_up,
-                wx.WXK_DOWN: self._volume_down,
-                wx.WXK_HOME: self._toggle_pause,
-                wx.WXK_END: self._stop,
-            }.get(key)
-            if fallback:
-                fallback()
-                return
-
         if self.FindFocus() is self.list:
             key = event.GetKeyCode()
             if key == wx.WXK_MENU or (key == wx.WXK_F10 and event.ShiftDown()):
@@ -1538,9 +1564,9 @@ class MaoerFrame(wx.Frame):
             self.show_error(str(exc))
 
     def _stop(self) -> None:
-        self.playback_generation += 1
-        self.sequence_advance_pending = False
-        self.sequence_page_advance_generation = None
+        if self.player_frame is not None:
+            self.player_frame.Close()
+            return
         if self.active_player is not None:
             self.active_player.stop()
         self.active_player = None
@@ -1559,7 +1585,10 @@ class MaoerFrame(wx.Frame):
         wx.MessageBox(message or "未知错误", "错误", wx.OK | wx.ICON_ERROR, self)
 
     def on_close(self, event: wx.CloseEvent) -> None:
-        self._unregister_hotkeys()
+        if self.player_frame is not None:
+            self.player_frame.Destroy()
+            self.player_frame = None
+        self.active_player = None
         self.browser_player.shutdown()
         clear_webview2_profile()
         event.Skip()
