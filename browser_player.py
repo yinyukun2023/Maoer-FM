@@ -18,6 +18,9 @@ class PlayerUnavailable(RuntimeError):
 
 
 WEBVIEW_AUDIO_PROCESS_NAMES = ("msedgewebview2.exe", "webview2", "missevan.com")
+MIN_PLAYBACK_RATE = 0.5
+MAX_PLAYBACK_RATE = 2.0
+ScriptCallback = Callable[[dict[str, object] | None], None]
 
 
 def debug_log(message: str) -> None:
@@ -378,6 +381,265 @@ CONTROL_SCRIPT = r"""
       return 0;
     }
 
+    function clampPlaybackRate(rate) {
+      rate = Number(rate);
+      if (!isFinite(rate) || rate <= 0) {
+        rate = 1;
+      }
+      return Math.max(0.5, Math.min(2, Math.round(rate * 10) / 10));
+    }
+
+    function applyMediaPlaybackRate(target, rate) {
+      if (!target) {
+        return 0;
+      }
+      var touched = 0;
+      if ("defaultPlaybackRate" in target) {
+        touched += tryCall(function() { target.defaultPlaybackRate = rate; }) &&
+          Math.abs(Number(target.defaultPlaybackRate) - rate) < 0.05 ? 1 : 0;
+      }
+      if ("playbackRate" in target) {
+        touched += tryCall(function() { target.playbackRate = rate; }) &&
+          Math.abs(Number(target.playbackRate) - rate) < 0.05 ? 1 : 0;
+      }
+      return touched;
+    }
+
+    function applyPlayerPlaybackRate(target, rate) {
+      if (!target) {
+        return 0;
+      }
+      var touched = applyMediaPlaybackRate(target, rate);
+      ["setPlaybackRate", "setSpeed", "setRate", "changePlaybackRate"].forEach(function(name) {
+        if (typeof target[name] === "function") {
+          touched += tryCall(function() { target[name](rate); }) ? 1 : 0;
+        }
+      });
+      if ("speed" in target && typeof target.speed !== "function") {
+        touched += tryCall(function() { target.speed = rate; }) &&
+          Math.abs(Number(target.speed) - rate) < 0.05 ? 1 : 0;
+      }
+      if ("rate" in target && typeof target.rate !== "function") {
+        touched += tryCall(function() { target.rate = rate; }) &&
+          Math.abs(Number(target.rate) - rate) < 0.05 ? 1 : 0;
+      }
+      return touched;
+    }
+
+    function scanNestedMediaPlaybackRates(root, rate, depth) {
+      var touched = 0;
+      var seen = typeof WeakSet === "function" ? new WeakSet() : null;
+      var keysPattern = /audio|video|media|sound|player|element|node|html5|rate|speed|_a/i;
+
+      function visit(target, remaining) {
+        if (!target || remaining < 0) {
+          return;
+        }
+        var kind = typeof target;
+        if (kind !== "object" && kind !== "function") {
+          return;
+        }
+        try {
+          if (seen) {
+            if (seen.has(target)) {
+              return;
+            }
+            seen.add(target);
+          }
+        } catch (err) {
+          return;
+        }
+
+        touched += applyMediaPlaybackRate(target, rate);
+        if (remaining <= 0) {
+          return;
+        }
+
+        var keys = [];
+        try {
+          keys = Object.keys(target);
+        } catch (err) {
+          return;
+        }
+        keys.slice(0, 100).forEach(function(key) {
+          if (!keysPattern.test(key)) {
+            return;
+          }
+          try {
+            visit(target[key], remaining - 1);
+          } catch (err) {}
+        });
+      }
+
+      visit(root, depth);
+      return touched;
+    }
+
+    function objectPlaybackRate(target) {
+      if (!target) {
+        return 0;
+      }
+      try {
+        if (isFinite(target.playbackRate) && Number(target.playbackRate) > 0) {
+          return Number(target.playbackRate);
+        }
+      } catch (err) {}
+      try {
+        if (isFinite(target.defaultPlaybackRate) && Number(target.defaultPlaybackRate) > 0) {
+          return Number(target.defaultPlaybackRate);
+        }
+      } catch (err) {}
+      return 0;
+    }
+
+    function playerObjectPlaybackRate(target) {
+      var rate = objectPlaybackRate(target);
+      if (rate > 0) {
+        return rate;
+      }
+      try {
+        if (isFinite(target.speed) && Number(target.speed) > 0) {
+          return Number(target.speed);
+        }
+      } catch (err) {}
+      try {
+        if (isFinite(target.rate) && Number(target.rate) > 0) {
+          return Number(target.rate);
+        }
+      } catch (err) {}
+      return 0;
+    }
+
+    function storedPlaybackRate() {
+      try {
+        if (isFinite(window.__maoerPlaybackRate) && Number(window.__maoerPlaybackRate) > 0) {
+          return Number(window.__maoerPlaybackRate);
+        }
+      } catch (err) {}
+      return 0;
+    }
+
+    function findNestedPlaybackRate(root, depth) {
+      var seen = typeof WeakSet === "function" ? new WeakSet() : null;
+      var keysPattern = /audio|video|media|sound|player|element|node|html5|rate|speed|_a/i;
+
+      function visit(target, remaining) {
+        if (!target || remaining < 0) {
+          return 0;
+        }
+        var kind = typeof target;
+        if (kind !== "object" && kind !== "function") {
+          return 0;
+        }
+        try {
+          if (seen) {
+            if (seen.has(target)) {
+              return 0;
+            }
+            seen.add(target);
+          }
+        } catch (err) {
+          return 0;
+        }
+
+        var rate = objectPlaybackRate(target);
+        if (rate > 0 || remaining <= 0) {
+          return rate;
+        }
+
+        var keys = [];
+        try {
+          keys = Object.keys(target);
+        } catch (err) {
+          return 0;
+        }
+        for (var index = 0; index < Math.min(keys.length, 100); index += 1) {
+          var key = keys[index];
+          if (!keysPattern.test(key)) {
+            continue;
+          }
+          try {
+            rate = visit(target[key], remaining - 1);
+          } catch (err) {
+            rate = 0;
+          }
+          if (rate > 0) {
+            return rate;
+          }
+        }
+        return 0;
+      }
+
+      return visit(root, depth);
+    }
+
+    function currentPlaybackRate(item, sound) {
+      return (
+        objectPlaybackRate(item) ||
+        playerObjectPlaybackRate(sound) ||
+        playerObjectPlaybackRate(window.play && play.soundBox) ||
+        findNestedPlaybackRate(sound, 3) ||
+        findNestedPlaybackRate(window.soundManager, 2) ||
+        findNestedPlaybackRate(window.play && play.soundBox, 2) ||
+        storedPlaybackRate() ||
+        1
+      );
+    }
+
+    function setPlaybackRate(rate) {
+      rate = clampPlaybackRate(rate);
+      var touched = 0;
+      var target = "none";
+
+      function remember(count, name) {
+        if (count > 0 && target === "none") {
+          target = name;
+        }
+        touched += count;
+      }
+
+      var item = currentMedia();
+      remember(applyMediaPlaybackRate(item, rate), "media");
+      mediaElements().forEach(function(media) {
+        remember(applyMediaPlaybackRate(media, rate), "media");
+      });
+
+      var sound = demo();
+      remember(applyPlayerPlaybackRate(sound, rate), "soundDemo");
+      remember(scanNestedMediaPlaybackRates(sound, rate, 3), "soundDemo");
+
+      if (window.soundManager && soundManager.sounds) {
+        Object.keys(soundManager.sounds).forEach(function(key) {
+          try {
+            var soundItem = soundManager.sounds[key];
+            remember(applyPlayerPlaybackRate(soundItem, rate), "soundManager");
+            remember(scanNestedMediaPlaybackRates(soundItem, rate, 2), "soundManager");
+          } catch (err) {}
+        });
+      }
+
+      if (window.play && play.soundBox) {
+        remember(applyPlayerPlaybackRate(play.soundBox, rate), "play.soundBox");
+        remember(scanNestedMediaPlaybackRates(play.soundBox, rate, 2), "play.soundBox");
+      }
+
+      var actualRate = currentPlaybackRate(currentMedia(), demo());
+      if (touched > 0 && Math.abs(actualRate - rate) > 0.05 && target !== "media") {
+        actualRate = rate;
+      }
+      if (touched > 0) {
+        window.__maoerPlaybackRate = actualRate;
+      }
+
+      return result({
+        ok: touched > 0,
+        rate: actualRate,
+        requestedRate: rate,
+        touched: touched,
+        target: target
+      });
+    }
+
     function setPosition(ms) {
       ms = Math.max(0, Number(ms) || 0);
       if (window.play && play.js && typeof play.js.changeSoundPosition === "function") {
@@ -657,6 +919,7 @@ CONTROL_SCRIPT = r"""
         position: statusPositionMs / 1000,
         duration: statusDurationMs / 1000,
         paused: statusPaused,
+        rate: currentPlaybackRate(statusItem, statusSound),
         target: statusItem ? "media" : (statusSound ? "soundDemo" : "none")
       });
     }
@@ -674,6 +937,10 @@ CONTROL_SCRIPT = r"""
 
     if (action === "volume") {
       return setVolume(value);
+    }
+
+    if (action === "rate") {
+      return setPlaybackRate(value);
     }
 
     if (action === "stop") {
@@ -713,9 +980,10 @@ class HiddenBrowserPlayer:
         self._page_loaded = False
         self._paused = False
         self._suppress_autoplay = False
+        self._playback_rate = 1.0
         self._cookie_primer_target: str | None = None
         self._cookie_primer_generation = 0
-        self._script_callbacks: dict[int, Callable[[dict[str, object] | None], None]] = {}
+        self._script_callbacks: dict[int, tuple[str, ScriptCallback]] = {}
         self._next_script_callback_id = 1
 
     def play(self, playback: PlaybackInfo) -> None:
@@ -726,6 +994,7 @@ class HiddenBrowserPlayer:
         self._page_loaded = False
         self._paused = False
         self._suppress_autoplay = False
+        self._playback_rate = 1.0
         self._load_generation += 1
         self._install_user_scripts(webview)
         if self.cookie:
@@ -748,6 +1017,18 @@ class HiddenBrowserPlayer:
     def seek(self, seconds: int) -> None:
         self._run_control("seek", seconds)
 
+    def set_playback_rate(self, rate: float, callback: ScriptCallback) -> None:
+        rate = self._clamp_playback_rate(rate)
+
+        def done(result: dict[str, object] | None) -> None:
+            if result and result.get("ok"):
+                actual_rate = self._float_value(result.get("rate")) or rate
+                self._playback_rate = self._clamp_playback_rate(actual_rate)
+                result["rate"] = self._playback_rate
+            callback(result)
+
+        self._run_control_callback("rate", rate, done)
+
     def volume_up(self, step: int = 10) -> int:
         return self._change_volume(step)
 
@@ -764,10 +1045,13 @@ class HiddenBrowserPlayer:
         return self._paused
 
     def status(self, callback: Callable[[dict[str, object] | None], None]) -> None:
+        self._run_control_callback("status", None, callback)
+
+    def _run_control_callback(self, action: str, value: object | None, callback: ScriptCallback) -> None:
         callback_id = self._next_script_callback_id
         self._next_script_callback_id += 1
-        self._script_callbacks[callback_id] = callback
-        if not self._run_control_async("status", None, callback_id):
+        self._script_callbacks[callback_id] = (action, callback)
+        if not self._run_control_async(action, value, callback_id):
             self._script_callbacks.pop(callback_id, None)
             wx.CallAfter(callback, None)
             return
@@ -1007,25 +1291,41 @@ class HiddenBrowserPlayer:
         except Exception:
             result = ""
         parsed = self._parse_control_result(result)
-        if not parsed or parsed.get("action") != "status":
+        if not parsed:
             debug_log(f"script_result ignored result={parsed}")
             return
 
+        parsed_action = str(parsed.get("action") or "")
         callback_id = self._script_callback_id_from_event(event)
-        callback = self._script_callbacks.pop(callback_id, None) if callback_id is not None else None
-        if callback is None and self._script_callbacks:
-            callback_id = next(iter(self._script_callbacks))
-            callback = self._script_callbacks.pop(callback_id)
-        if callback is None:
-            debug_log(f"script_result unmatched callback_id={callback_id} pending={len(self._script_callbacks)}")
+        callback_entry = self._script_callbacks.pop(callback_id, None) if callback_id is not None else None
+        if callback_entry is None and parsed_action:
+            for pending_id, (expected_action, _callback) in list(self._script_callbacks.items()):
+                if expected_action == parsed_action:
+                    callback_id = pending_id
+                    callback_entry = self._script_callbacks.pop(pending_id)
+                    break
+        if callback_entry is None:
+            debug_log(
+                f"script_result unmatched action={parsed_action!r} "
+                f"callback_id={callback_id} pending={len(self._script_callbacks)}"
+            )
+            return
+        expected_action, callback = callback_entry
+        if expected_action != parsed_action:
+            debug_log(
+                f"script_result action mismatch expected={expected_action!r} "
+                f"actual={parsed_action!r} callback_id={callback_id}"
+            )
+            callback(None)
             return
         debug_log(f"script_result callback_id={callback_id} result={parsed}")
         callback(parsed)
 
     def _expire_script_callback(self, callback_id: int) -> None:
-        callback = self._script_callbacks.pop(callback_id, None)
-        if callback is None:
+        callback_entry = self._script_callbacks.pop(callback_id, None)
+        if callback_entry is None:
             return
+        _action, callback = callback_entry
         debug_log(f"script callback timeout id={callback_id}")
         callback(None)
 
@@ -1074,6 +1374,23 @@ class HiddenBrowserPlayer:
             return ""
         debug_log(f"run_control sync action={action} value={value} ok={ok} result={result}")
         return result if ok else ""
+
+    @staticmethod
+    def _clamp_playback_rate(rate: float) -> float:
+        try:
+            value = float(rate)
+        except (TypeError, ValueError):
+            value = 1.0
+        value = round(value, 1)
+        return max(MIN_PLAYBACK_RATE, min(MAX_PLAYBACK_RATE, value))
+
+    @staticmethod
+    def _float_value(value: object) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if number > 0 else None
 
     @staticmethod
     def _parse_control_result(result: str) -> dict[str, object] | None:

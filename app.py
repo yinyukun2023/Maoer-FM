@@ -659,6 +659,7 @@ class DanmakuCanvas(wx.Panel):
         self.next_lane = 0
         self.position = 0.0
         self.paused = True
+        self.playback_rate = 1.0
         self.message = ""
         self.on_danmaku_due: Callable[[DanmakuItem], None] | None = None
         self.on_subtitle_due: Callable[[DanmakuItem], None] | None = None
@@ -675,6 +676,7 @@ class DanmakuCanvas(wx.Panel):
         self.next_lane = 0
         self.position = 0.0
         self.paused = True
+        self.playback_rate = 1.0
         self.message = message
         self.last_tick = time.monotonic()
         self.timer.Start(self.FRAME_MS)
@@ -700,13 +702,20 @@ class DanmakuCanvas(wx.Panel):
         self.last_tick = time.monotonic()
         self._render_frame()
 
+    def set_playback_rate(self, rate: float) -> None:
+        self._advance_position()
+        self.playback_rate = self._normalised_playback_rate(rate)
+        self.last_tick = time.monotonic()
+
     def current_position(self) -> float:
         self._advance_position()
         return self.position
 
-    def sync_position(self, seconds: float, paused: bool) -> None:
+    def sync_position(self, seconds: float, paused: bool, playback_rate: float | None = None) -> None:
         target = max(0.0, float(seconds))
         self._advance_position()
+        if playback_rate is not None:
+            self.playback_rate = self._normalised_playback_rate(playback_rate)
         if abs(self.position - target) > 0.75:
             self.position = target
             self.active = []
@@ -773,8 +782,16 @@ class DanmakuCanvas(wx.Panel):
     def _advance_position(self) -> None:
         now = time.monotonic()
         if not self.paused:
-            self.position += max(0.0, now - self.last_tick)
+            self.position += max(0.0, now - self.last_tick) * self.playback_rate
         self.last_tick = now
+
+    @staticmethod
+    def _normalised_playback_rate(rate: float) -> float:
+        try:
+            value = float(rate)
+        except (TypeError, ValueError):
+            return 1.0
+        return value if value > 0 else 1.0
 
     def _spawn_due_items(self) -> None:
         if not self.items:
@@ -845,6 +862,9 @@ class DanmakuCanvas(wx.Panel):
 
 class PlaybackFrame(wx.Frame):
     SEEK_SECONDS = 15
+    PLAYBACK_RATE_STEP = 0.2
+    MIN_PLAYBACK_RATE = 0.5
+    MAX_PLAYBACK_RATE = 2.0
 
     def __init__(
         self,
@@ -862,6 +882,9 @@ class PlaybackFrame(wx.Frame):
         self.read_danmaku_enabled = False
         self.read_subtitle_enabled = False
         self.time_announcement_generation = 0
+        self.rate_change_generation = 0
+        self.playback_rate = 1.0
+        self.requested_playback_rate = 1.0
 
         root = wx.BoxSizer(wx.VERTICAL)
         self.danmaku_canvas = DanmakuCanvas(self)
@@ -881,9 +904,13 @@ class PlaybackFrame(wx.Frame):
     def play(self, playback: PlaybackInfo) -> None:
         self.playback = playback
         self.load_generation += 1
+        self.rate_change_generation += 1
         generation = self.load_generation
         self.SetTitle(playback.title)
+        self.playback_rate = 1.0
+        self.requested_playback_rate = 1.0
         self.danmaku_canvas.reset("正在加载弹幕...")
+        self.danmaku_canvas.set_playback_rate(self.playback_rate)
         self.player.play(playback)
         self._load_danmaku(playback.sound_id, generation)
         wx.CallLater(500, self._sync_playback_status, generation)
@@ -924,6 +951,15 @@ class PlaybackFrame(wx.Frame):
             if key in (ord("T"), ord("t")):
                 self._announce_playback_time()
                 return
+            if key in (ord("C"), ord("c")):
+                self._change_playback_rate(self.PLAYBACK_RATE_STEP)
+                return
+            if key in (ord("X"), ord("x")):
+                self._change_playback_rate(-self.PLAYBACK_RATE_STEP)
+                return
+            if key in (ord("Z"), ord("z")):
+                self._set_playback_rate(1.0)
+                return
             if key == wx.WXK_SPACE:
                 paused = self.player.toggle_pause()
                 self.danmaku_canvas.set_paused(paused)
@@ -962,6 +998,42 @@ class PlaybackFrame(wx.Frame):
     def _toggle_subtitle_reader(self) -> None:
         self.read_subtitle_enabled = not self.read_subtitle_enabled
         message = "字幕朗读已开启" if self.read_subtitle_enabled else "字幕朗读已关闭"
+        self.screen_reader.announce(message)
+        self._set_parent_status(message)
+
+    def _change_playback_rate(self, delta: float) -> None:
+        self._set_playback_rate(self.requested_playback_rate + delta)
+
+    def _set_playback_rate(self, rate: float) -> None:
+        target_rate = self._clamp_playback_rate(rate)
+        self.requested_playback_rate = target_rate
+        self.rate_change_generation += 1
+        generation = self.rate_change_generation
+        self.player.set_playback_rate(
+            target_rate,
+            lambda status: self._set_playback_rate_done(generation, target_rate, status),
+        )
+
+    def _set_playback_rate_done(
+        self,
+        generation: int,
+        target_rate: float,
+        status: dict[str, object] | None,
+    ) -> None:
+        if generation != self.rate_change_generation:
+            return
+        if not status or not status.get("ok"):
+            self.requested_playback_rate = self.playback_rate
+            message = "当前播放器不支持倍速"
+            self.screen_reader.announce(message)
+            self._set_parent_status(message)
+            return
+
+        actual_rate = self._positive_float(status.get("rate")) or target_rate
+        self.playback_rate = self._clamp_playback_rate(actual_rate)
+        self.requested_playback_rate = self.playback_rate
+        self.danmaku_canvas.set_playback_rate(self.playback_rate)
+        message = self._format_playback_rate(self.playback_rate)
         self.screen_reader.announce(message)
         self._set_parent_status(message)
 
@@ -1027,23 +1099,39 @@ class PlaybackFrame(wx.Frame):
     def _sync_playback_status(self, generation: int) -> None:
         if generation != self.load_generation or self.playback is None:
             return
-        self.player.status(lambda status: self._sync_playback_status_done(generation, status))
+        rate_generation = self.rate_change_generation
+        self.player.status(lambda status: self._sync_playback_status_done(generation, rate_generation, status))
 
-    def _sync_playback_status_done(self, generation: int, status: dict[str, object] | None) -> None:
+    def _sync_playback_status_done(
+        self,
+        generation: int,
+        rate_generation: int,
+        status: dict[str, object] | None,
+    ) -> None:
         if generation != self.load_generation or self.playback is None:
             return
         if status and status.get("ok"):
             position = self._positive_float(status.get("position"))
             paused = bool(status.get("paused"))
+            playback_rate = None
+            if rate_generation == self.rate_change_generation:
+                playback_rate = self._positive_float(status.get("rate"))
+            if playback_rate is not None:
+                self.playback_rate = self._clamp_playback_rate(playback_rate)
+                self.requested_playback_rate = self.playback_rate
             if position is not None:
                 if position > 0 or paused or self.danmaku_canvas.position < 0.75:
-                    self.danmaku_canvas.sync_position(position, paused)
+                    self.danmaku_canvas.sync_position(position, paused, self.playback_rate)
                 else:
                     self.danmaku_canvas.set_paused(False)
+                    self.danmaku_canvas.set_playback_rate(self.playback_rate)
+            elif playback_rate is not None:
+                self.danmaku_canvas.set_playback_rate(self.playback_rate)
         wx.CallLater(1000, self._sync_playback_status, generation)
 
     def on_close(self, event: wx.CloseEvent) -> None:
         self.load_generation += 1
+        self.rate_change_generation += 1
         self.danmaku_canvas.stop()
         self.player.stop()
         self.on_closed(self)
@@ -1061,6 +1149,22 @@ class PlaybackFrame(wx.Frame):
         except (TypeError, ValueError):
             return None
         return number if number >= 0 else None
+
+    @classmethod
+    def _clamp_playback_rate(cls, rate: float) -> float:
+        try:
+            value = float(rate)
+        except (TypeError, ValueError):
+            value = 1.0
+        value = round(value, 1)
+        return max(cls.MIN_PLAYBACK_RATE, min(cls.MAX_PLAYBACK_RATE, value))
+
+    @staticmethod
+    def _format_playback_rate(rate: float) -> str:
+        if abs(rate - 1.0) < 0.05:
+            return "正常速度"
+        text = f"{rate:.1f}".rstrip("0").rstrip(".")
+        return f"{text}倍速"
 
     @staticmethod
     def _format_spoken_time(seconds: float) -> str:
