@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SPEC_FILE = ROOT / "maoer.spec"
-OUTPUT_EXE = ROOT / "dist" / "Maoer-FM.exe"
+OUTPUT_EXE = ROOT / "dist" / "猫耳FM.exe"
 
 
 def run_command(command: list[str]) -> None:

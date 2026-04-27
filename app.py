@@ -1130,9 +1130,9 @@ class MaoerFrame(wx.Frame):
         self.CreateStatusBar()
 
     def _build_menu(self) -> None:
-        self.content_favorites_menu_id = wx.NewIdRef()
         self.account_login_menu_id = wx.NewIdRef()
         self.account_info_menu_id = wx.NewIdRef()
+        self.account_favorites_menu_id = wx.NewIdRef()
         self.account_subscriptions_menu_id = wx.NewIdRef()
         self.account_purchased_dramas_menu_id = wx.NewIdRef()
         self.account_logout_menu_id = wx.NewIdRef()
@@ -1145,6 +1145,7 @@ class MaoerFrame(wx.Frame):
         account_menu = wx.Menu()
         if self.account_logged_in:
             account_menu.Append(self.account_info_menu_id, "我的信息(&I)")
+            account_menu.Append(self.account_favorites_menu_id, "我的收藏(&F)")
             account_menu.Append(self.account_subscriptions_menu_id, "剧集订阅(&S)")
             account_menu.Append(self.account_purchased_dramas_menu_id, "已购广播剧(&P)")
             account_menu.AppendSeparator()
@@ -1154,11 +1155,6 @@ class MaoerFrame(wx.Frame):
         account_menu.AppendSeparator()
         account_menu.Append(self.account_exit_menu_id, "退出程序(&Q)")
         menu_bar.Append(account_menu, "账号(&A)")
-
-        content_menu = wx.Menu()
-        favorites_item = content_menu.Append(self.content_favorites_menu_id, "我的收藏(&F)")
-        favorites_item.Enable(self.account_logged_in)
-        menu_bar.Append(content_menu, "内容(&C)")
 
         self.SetMenuBar(menu_bar)
 
@@ -1175,9 +1171,9 @@ class MaoerFrame(wx.Frame):
         self.list.Bind(wx.EVT_SIZE, self.on_list_size)
         self.panel.Bind(wx.EVT_CONTEXT_MENU, self.on_list_context_menu)
         self.Bind(wx.EVT_CONTEXT_MENU, self.on_list_context_menu)
-        self.Bind(wx.EVT_MENU, self.on_content_favorites, id=self.content_favorites_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_login, id=self.account_login_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_info, id=self.account_info_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_account_favorites, id=self.account_favorites_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_subscriptions, id=self.account_subscriptions_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_purchased_dramas, id=self.account_purchased_dramas_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_logout, id=self.account_logout_menu_id)
@@ -1209,7 +1205,7 @@ class MaoerFrame(wx.Frame):
             ),
         )
 
-    def on_content_favorites(self, _event: wx.Event) -> None:
+    def on_account_favorites(self, _event: wx.Event) -> None:
         previous_state = self._account_list_previous_state()
         self.page_state = None
         self.set_items([], "我的收藏", focus_list=True)

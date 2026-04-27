@@ -30,7 +30,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='Maoer-FM',
+    name='猫耳FM',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
