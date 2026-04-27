@@ -1277,6 +1277,12 @@ class MaoerApi:
                 items.append(item)
         return items
 
+    def favorite_folders(self, page: int = 1, page_size: int = 30) -> list[MediaItem]:
+        account = self.account_info()
+        if account.user_id is None:
+            raise ApiError("没有拿到账号用户 ID，无法加载我的收藏")
+        return self.user_favorite_folders(account.user_id, page=page, page_size=page_size)
+
     def user_subscribed_dramas(self, user_id: int, page: int = 1, page_size: int = 30) -> list[MediaItem]:
         data = self._get(
             "/dramaapi/getusersubscriptions",
@@ -1296,6 +1302,25 @@ class MaoerApi:
                 items.append(item)
         return items
 
+    def user_favorite_folders(self, user_id: int, page: int = 1, page_size: int = 30) -> list[MediaItem]:
+        data = self._get(
+            "/person/getuseralbum",
+            {"user_id": user_id, "type": 0, "p": page, "page_size": page_size},
+        )
+        info = data.get("info") or {}
+        if not isinstance(info, dict):
+            return []
+
+        albums = info.get("Datas") or info.get("data") or info.get("albums") or []
+        items: list[MediaItem] = []
+        for album in albums:
+            if not isinstance(album, dict):
+                continue
+            item = self._album_item(album, hide_author=True)
+            if item:
+                items.append(item)
+        return items
+
     def album_sounds(self, album_id: int) -> list[MediaItem]:
         data = self._get("/sound/soundalllist", {"albumid": album_id})
         info = data.get("info") or {}
@@ -1311,6 +1336,14 @@ class MaoerApi:
             if item:
                 items.append(item)
         return items
+
+    def album_sounds_page(self, album_id: int, page: int = 1, page_size: int = 30) -> list[MediaItem]:
+        if page_size <= 0:
+            return self.album_sounds(album_id)
+        page = max(1, int(page))
+        start = (page - 1) * page_size
+        end = start + page_size
+        return self.album_sounds(album_id)[start:end]
 
     def playback_info(self, item: MediaItem) -> PlaybackInfo:
         if item.need_pay:
@@ -1453,20 +1486,38 @@ class MaoerApi:
             raw=drama,
         )
 
-    def _album_item(self, album: dict[str, Any]) -> MediaItem | None:
-        album_id = _to_int(album.get("id"))
+    def _album_item(
+        self,
+        album: dict[str, Any],
+        fallback_subtitle: str = "",
+        hide_author: bool = False,
+    ) -> MediaItem | None:
+        album_id = self._first_direct_int_value(album, ("id", "album_id", "albumid", "albumId"))
         if album_id is None:
             return None
-        count = _to_int(album.get("music_count"))
-        subtitle = _text(album.get("username"))
+        count = self._first_direct_int_value(
+            album,
+            ("music_count", "musicCount", "sound_count", "soundCount", "sound_num", "soundnum", "count", "num"),
+        )
+        username = ""
+        if not hide_author:
+            username = self._first_scalar_value(album, ("username", "user_name", "nickname", "author", "owner_name"))
+        parts = [fallback_subtitle, username]
+        subtitle = " / ".join(part for part in parts if part)
         if count is not None:
-            subtitle = f"{subtitle} / {count} 个声音" if subtitle else f"{count} 个声音"
+            if hide_author:
+                subtitle = str(count)
+            else:
+                subtitle = f"{subtitle} / {count} 个声音" if subtitle else f"{count} 个声音"
+        raw = dict(album)
+        if hide_author:
+            raw["_hide_author"] = True
         return MediaItem(
             kind="album",
             id=album_id,
-            title=_text(album.get("title") or album_id),
+            title=self._first_scalar_value(album, ("title", "name", "album_title", "albumName")) or str(album_id),
             subtitle=subtitle,
-            raw=album,
+            raw=raw,
         )
 
     def _link_item(self, link: dict[str, Any]) -> MediaItem | None:

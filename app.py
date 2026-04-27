@@ -1130,6 +1130,7 @@ class MaoerFrame(wx.Frame):
         self.CreateStatusBar()
 
     def _build_menu(self) -> None:
+        self.content_favorites_menu_id = wx.NewIdRef()
         self.account_login_menu_id = wx.NewIdRef()
         self.account_info_menu_id = wx.NewIdRef()
         self.account_subscriptions_menu_id = wx.NewIdRef()
@@ -1140,6 +1141,7 @@ class MaoerFrame(wx.Frame):
 
     def _update_account_menu(self) -> None:
         menu_bar = wx.MenuBar()
+
         account_menu = wx.Menu()
         if self.account_logged_in:
             account_menu.Append(self.account_info_menu_id, "我的信息(&I)")
@@ -1152,6 +1154,12 @@ class MaoerFrame(wx.Frame):
         account_menu.AppendSeparator()
         account_menu.Append(self.account_exit_menu_id, "退出程序(&Q)")
         menu_bar.Append(account_menu, "账号(&A)")
+
+        content_menu = wx.Menu()
+        favorites_item = content_menu.Append(self.content_favorites_menu_id, "我的收藏(&F)")
+        favorites_item.Enable(self.account_logged_in)
+        menu_bar.Append(content_menu, "内容(&C)")
+
         self.SetMenuBar(menu_bar)
 
     def _bind_events(self) -> None:
@@ -1167,6 +1175,7 @@ class MaoerFrame(wx.Frame):
         self.list.Bind(wx.EVT_SIZE, self.on_list_size)
         self.panel.Bind(wx.EVT_CONTEXT_MENU, self.on_list_context_menu)
         self.Bind(wx.EVT_CONTEXT_MENU, self.on_list_context_menu)
+        self.Bind(wx.EVT_MENU, self.on_content_favorites, id=self.content_favorites_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_login, id=self.account_login_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_info, id=self.account_info_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_subscriptions, id=self.account_subscriptions_menu_id)
@@ -1197,6 +1206,22 @@ class MaoerFrame(wx.Frame):
                 f"搜索: {keyword}",
                 focus_list=focus_list,
                 page_state=PageState(1, lambda page: self.api.search(keyword, page)),
+            ),
+        )
+
+    def on_content_favorites(self, _event: wx.Event) -> None:
+        previous_state = self._account_list_previous_state()
+        self.page_state = None
+        self.set_items([], "我的收藏", focus_list=True)
+        self._run_background(
+            "正在加载我的收藏...",
+            lambda: self.api.favorite_folders(1),
+            lambda items: self._enter_items(
+                items,
+                "我的收藏",
+                previous_state,
+                focus_list=True,
+                page_state=PageState(1, lambda page: self.api.favorite_folders(page)),
             ),
         )
 
@@ -1339,7 +1364,7 @@ class MaoerFrame(wx.Frame):
         self._update_account_menu()
         self.SetTitle("猫耳FM")
         self.SetStatusText("已退出登录")
-        if self.current_title in {"剧集订阅", "已购广播剧"}:
+        if self.current_title in {"我的收藏", "剧集订阅", "已购广播剧"}:
             self.load_homepage(focus_list=True)
 
     def _refresh_account_title(self) -> None:
@@ -1480,6 +1505,12 @@ class MaoerFrame(wx.Frame):
         self.list.SetColumnWidth(0, name_width)
         self.list.SetColumnWidth(1, max(120, width - name_width - 24))
 
+    def _update_list_column_headers(self, title: str) -> None:
+        label = "声音数" if title == "我的收藏" else "作者"
+        column = wx.ListItem()
+        column.SetText(label)
+        self.list.SetColumn(1, column)
+
     def _append_list_item(self, index: int, item: MediaItem) -> None:
         self.list.InsertItem(index, item.title)
         self.list.SetItem(index, 1, self._item_author(item))
@@ -1487,6 +1518,9 @@ class MaoerFrame(wx.Frame):
     def _item_author(self, item: MediaItem) -> str:
         raw = item.raw
         if isinstance(raw, dict):
+            if raw.get("_hide_author"):
+                return item.subtitle
+
             author = self._raw_text_value(
                 raw,
                 ("author", "author_name", "username", "user_name", "uname", "nickname", "nick_name"),
@@ -1623,6 +1657,19 @@ class MaoerFrame(wx.Frame):
                 )
                 return
 
+            if item.kind == "album":
+                self._run_background(
+                    f"正在加载: {item.title}",
+                    lambda: self.api.album_sounds_page(item.id, 1),
+                    lambda items: self._enter_items(
+                        items,
+                        item.title,
+                        previous_state,
+                        page_state=PageState(1, lambda page: self.api.album_sounds_page(item.id, page)),
+                    ),
+                )
+                return
+
             self._run_background(
                 f"正在加载: {item.title}",
                 lambda: self.api.collection_items(item),
@@ -1687,6 +1734,7 @@ class MaoerFrame(wx.Frame):
     ) -> None:
         self.current_title = title
         self.items = items
+        self._update_list_column_headers(title)
         self.list.Freeze()
         try:
             self.list.DeleteAllItems()
@@ -1704,6 +1752,8 @@ class MaoerFrame(wx.Frame):
         if focus_list:
             wx.CallAfter(self._focus_list)
         self.SetStatusText(f"{title}，共 {len(items)} 项")
+        if self.page_state is not None:
+            wx.CallAfter(self._load_next_page_if_near_bottom)
 
     def _top_index(self) -> int:
         try:
@@ -1793,6 +1843,7 @@ class MaoerFrame(wx.Frame):
         if previous_selection != -1:
             self._select_list_row(previous_selection)
         self.SetStatusText(f"{self.current_title}，共 {len(self.items)} 项")
+        wx.CallAfter(self._load_next_page_if_near_bottom)
 
     def _play(self, playback: PlaybackInfo) -> None:
         created = False
