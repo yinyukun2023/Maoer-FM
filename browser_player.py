@@ -93,7 +93,7 @@ CONTROL_SCRIPT = r"""
       options = options || {};
       var guard = window.__maoerSingleSoundGuard || {};
       var nextSoundId = options.soundId == null ? null : String(options.soundId);
-      if (guard.soundId !== nextSoundId) {
+      if (guard.soundId !== nextSoundId || guard.generation !== options.generation) {
         guard.handled = false;
         guard.blockNext = false;
         guard.originalSrc = "";
@@ -909,16 +909,22 @@ CONTROL_SCRIPT = r"""
       var statusPositionMs = currentPositionMs(statusItem, statusSound);
       var statusDurationMs = currentDurationMs(statusItem, statusSound);
       var statusPaused = false;
+      var guard = window.__maoerSingleSoundGuard || {};
+      var statusEnded = !!guard.handled;
       if (statusSound) {
         statusPaused = !!statusSound.paused || statusSound.playState === 0;
       } else if (statusItem) {
         statusPaused = !!statusItem.paused;
+      }
+      if (statusItem && statusItem.ended) {
+        statusEnded = true;
       }
       return result({
         ok: !!(statusSound || statusItem),
         position: statusPositionMs / 1000,
         duration: statusDurationMs / 1000,
         paused: statusPaused,
+        ended: statusEnded,
         rate: currentPlaybackRate(statusItem, statusSound),
         target: statusItem ? "media" : (statusSound ? "soundDemo" : "none")
       });

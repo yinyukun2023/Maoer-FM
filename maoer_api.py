@@ -162,6 +162,23 @@ def _duration_ms(value: Any) -> int | None:
     return duration
 
 
+def _duration_text_ms(value: Any) -> int | None:
+    text = _text(value).strip()
+    if not text:
+        return None
+    parts = text.split(":")
+    if len(parts) not in {2, 3}:
+        return None
+    try:
+        numbers = [int(part.strip()) for part in parts]
+    except ValueError:
+        return None
+    total = 0
+    for number in numbers:
+        total = total * 60 + number
+    return total * 1000
+
+
 def _text(value: Any) -> str:
     return "" if value is None else str(value)
 
@@ -1157,6 +1174,74 @@ class MaoerApi:
                 items.append(item)
         return items
 
+    def content_categories(self) -> list[MediaItem]:
+        data = self._get("/site/getnavbar")
+        info = data.get("info") or {}
+        if not isinstance(info, dict):
+            return []
+
+        catalogs = info.get("catalogs") or []
+        items: list[MediaItem] = []
+        for catalog in catalogs:
+            if not isinstance(catalog, dict):
+                continue
+            item = self._category_item(catalog)
+            if item:
+                items.append(item)
+        return items
+
+    def category_children(self, item: MediaItem) -> list[MediaItem]:
+        if item.kind != "category":
+            return []
+        children = item.raw.get("children") if isinstance(item.raw, dict) else None
+        if not isinstance(children, list):
+            return []
+
+        items: list[MediaItem] = []
+        for child in children:
+            if not isinstance(child, dict):
+                continue
+            child_item = self._category_item(child, parent_title=item.title)
+            if child_item:
+                items.append(child_item)
+        return items
+
+    def category_contents(self, item: MediaItem, page: int = 1, page_size: int = 20) -> list[MediaItem]:
+        if item.kind != "category":
+            raise ApiError(f"不支持的分类类型: {item.kind}")
+
+        if self._category_content_kind(item) == "drama":
+            return self.drama_category_items(page=page, page_size=page_size)
+        return self.sound_category_items(item.id, item.title, page=page)
+
+    def sound_category_items(self, category_id: int, title: str = "", page: int = 1) -> list[MediaItem]:
+        html_text = self._get_text("/sound/m", {"id": category_id, "p": max(1, int(page))})
+        return self._sound_items_from_category_html(html_text, title or f"分类 {category_id}")
+
+    def drama_category_items(self, page: int = 1, page_size: int = 20) -> list[MediaItem]:
+        data = self._get(
+            "/dramaapi/filter",
+            {
+                "filters": "0_0_0_0",
+                "order": 1,
+                "page": max(1, int(page)),
+                "page_size": page_size,
+                "type": 3,
+            },
+        )
+        info = data.get("info") or {}
+        if not isinstance(info, dict):
+            return []
+
+        items: list[MediaItem] = []
+        for drama in info.get("Datas") or []:
+            if not isinstance(drama, dict):
+                continue
+            item = self._drama_item(drama, fallback_subtitle="广播剧")
+            if item:
+                items.append(item)
+        return items
+
     def _dedupe_items(self, items: list[MediaItem]) -> list[MediaItem]:
         seen: set[tuple[str, int]] = set()
         result: list[MediaItem] = []
@@ -1399,6 +1484,171 @@ class MaoerApi:
             album_id=album_id,
             raw=sound,
         )
+
+    def _category_item(self, catalog: dict[str, Any], parent_title: str = "") -> MediaItem | None:
+        category_id = self._first_direct_int_value(catalog, ("id", "catalog_id", "catalogId"))
+        if category_id is None:
+            return None
+
+        title = self._first_scalar_value(catalog, ("catalog_name", "name", "title")) or str(category_id)
+        children = catalog.get("children")
+        children_count = len(children) if isinstance(children, list) else 0
+        content_kind = self._category_content_kind_from_raw(catalog)
+
+        parts = [parent_title or "分类"]
+        if children_count:
+            parts.append(f"{children_count} 个子分类")
+        elif content_kind == "drama":
+            parts.append("广播剧")
+        else:
+            parts.append("声音")
+
+        raw = dict(catalog)
+        raw["_content_kind"] = content_kind
+        return MediaItem(
+            kind="category",
+            id=category_id,
+            title=title,
+            subtitle=" / ".join(part for part in parts if part),
+            raw=raw,
+        )
+
+    def _category_content_kind(self, item: MediaItem) -> str:
+        if isinstance(item.raw, dict):
+            kind = _text(item.raw.get("_content_kind")).strip()
+            if kind:
+                return kind
+            return self._category_content_kind_from_raw(item.raw)
+        return "sound"
+
+    @staticmethod
+    def _category_content_kind_from_raw(catalog: dict[str, Any]) -> str:
+        url = _text(catalog.get("url"))
+        path = urlparse(url).path
+        if path.startswith("/mdrama"):
+            return "drama"
+        return "sound"
+
+    def _sound_items_from_category_html(self, html_text: str, category_title: str) -> list[MediaItem]:
+        fragment = self._sound_category_fragment(html_text)
+        blocks = re.split(
+            r"(?=<div\s+class=[\"'][^\"']*\bvw-frontsound-container\b)",
+            fragment,
+            flags=re.IGNORECASE,
+        )
+        items: list[MediaItem] = []
+        seen: set[int] = set()
+        for block in blocks:
+            if "vw-frontsound-container" not in block:
+                continue
+            item = self._sound_item_from_category_block(block, category_title)
+            if item is None or item.id in seen:
+                continue
+            seen.add(item.id)
+            items.append(item)
+
+        if items:
+            return items
+
+        for match in re.finditer(
+            r"<a\b[^>]*href=[\"']/sound/(\d+)[\"'][^>]*>",
+            fragment,
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            sound_id = _to_int(match.group(1))
+            if sound_id is None or sound_id in seen:
+                continue
+            tag = match.group(0)
+            title = self._html_attr(tag, "title") or str(sound_id)
+            item = self._sound_item(
+                {"id": sound_id, "soundstr": title, "catalog_name": category_title},
+                subtitle=category_title,
+            )
+            if item:
+                seen.add(sound_id)
+                items.append(item)
+        return items
+
+    @staticmethod
+    def _sound_category_fragment(html_text: str) -> str:
+        start = html_text.find("vw-subcatalog-contant")
+        if start < 0:
+            return html_text
+        div_start = html_text.rfind("<div", 0, start)
+        if div_start >= 0:
+            start = div_start
+        end_candidates = [
+            html_text.find("<!-- 分页", start),
+            html_text.find("<div class=\"catalogpage\"", start),
+            html_text.find("<div class='catalogpage'", start),
+        ]
+        end_candidates = [candidate for candidate in end_candidates if candidate >= 0]
+        end = min(end_candidates) if end_candidates else len(html_text)
+        return html_text[start:end]
+
+    def _sound_item_from_category_block(self, block: str, category_title: str) -> MediaItem | None:
+        match = re.search(
+            r"<a\b[^>]*href=[\"']/sound/(\d+)[\"'][^>]*>",
+            block,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return None
+
+        sound_id = _to_int(match.group(1))
+        if sound_id is None:
+            return None
+
+        tag = match.group(0)
+        title = (
+            self._html_attr(tag, "title")
+            or self._html_attr(block, "alt")
+            or self._frontsound_title(block)
+            or str(sound_id)
+        )
+        duration = self._frontsound_duration_ms(block)
+        return self._sound_item(
+            {
+                "id": sound_id,
+                "soundstr": title,
+                "duration": duration,
+                "catalog_name": category_title,
+            },
+            subtitle=category_title,
+        )
+
+    @staticmethod
+    def _html_attr(text: str, name: str) -> str:
+        match = re.search(
+            rf"\b{re.escape(name)}\s*=\s*([\"'])(.*?)\1",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return ""
+        return html.unescape(match.group(2)).strip()
+
+    def _frontsound_title(self, block: str) -> str:
+        match = re.search(
+            r"<div\b[^>]*class=[\"'][^\"']*\bvw-frontsound-title\b[^\"']*[\"'][^>]*>(.*?)</div>",
+            block,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return ""
+        return self._html_to_text(match.group(1))
+
+    @staticmethod
+    def _frontsound_duration_ms(block: str) -> int | None:
+        match = re.search(
+            r"<div\b[^>]*class=[\"'][^\"']*\bvw-frontsound-time\b[^\"']*[\"'][^>]*>(.*?)</div>",
+            block,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return None
+        text = re.sub(r"<[^>]+>", "", match.group(1))
+        return _duration_text_ms(html.unescape(text))
 
     def _subscription_drama_item(self, data: dict[str, Any]) -> MediaItem | None:
         item = self._drama_item(data, fallback_subtitle="剧集订阅")

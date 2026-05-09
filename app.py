@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import re
+import sys
 import threading
 import time
 from typing import Callable
@@ -34,6 +35,10 @@ from maoer_api import (
     PurchaseRequired,
 )
 from uia_live_region import ScreenReaderAnnouncer
+from updater import handle_update_cli, run_startup_update_check
+
+
+APP_TITLE = "猫耳FM"
 
 
 def debug_log(message: str) -> None:
@@ -56,6 +61,7 @@ class NavigationState:
     selected_index: int
     page_state: PageState | None
     top_index: int
+    hide_detail_column: bool
 
 
 @dataclass
@@ -865,6 +871,7 @@ class PlaybackFrame(wx.Frame):
     PLAYBACK_RATE_STEP = 0.2
     MIN_PLAYBACK_RATE = 0.5
     MAX_PLAYBACK_RATE = 2.0
+    FINISHED_EPSILON_SECONDS = 0.4
 
     def __init__(
         self,
@@ -872,11 +879,13 @@ class PlaybackFrame(wx.Frame):
         api: MaoerApi,
         player: HiddenBrowserPlayer,
         on_closed: Callable[["PlaybackFrame"], None],
+        on_finished: Callable[["PlaybackFrame", PlaybackInfo], None],
     ) -> None:
         super().__init__(parent, title="", size=(760, 480))
         self.api = api
         self.player = player
         self.on_closed = on_closed
+        self.on_finished = on_finished
         self.playback: PlaybackInfo | None = None
         self.load_generation = 0
         self.read_danmaku_enabled = False
@@ -885,6 +894,7 @@ class PlaybackFrame(wx.Frame):
         self.rate_change_generation = 0
         self.playback_rate = 1.0
         self.requested_playback_rate = 1.0
+        self.finish_notified = False
 
         root = wx.BoxSizer(wx.VERTICAL)
         self.danmaku_canvas = DanmakuCanvas(self)
@@ -909,6 +919,7 @@ class PlaybackFrame(wx.Frame):
         self.SetTitle(playback.title)
         self.playback_rate = 1.0
         self.requested_playback_rate = 1.0
+        self.finish_notified = False
         self.danmaku_canvas.reset("正在加载弹幕...")
         self.danmaku_canvas.set_playback_rate(self.playback_rate)
         self.player.play(playback)
@@ -1112,6 +1123,7 @@ class PlaybackFrame(wx.Frame):
             return
         if status and status.get("ok"):
             position = self._positive_float(status.get("position"))
+            duration = self._positive_float(status.get("duration"))
             paused = bool(status.get("paused"))
             playback_rate = None
             if rate_generation == self.rate_change_generation:
@@ -1119,6 +1131,16 @@ class PlaybackFrame(wx.Frame):
             if playback_rate is not None:
                 self.playback_rate = self._clamp_playback_rate(playback_rate)
                 self.requested_playback_rate = self.playback_rate
+            if self._status_is_finished(status, position, duration):
+                finish_position = duration
+                if finish_position is None and self.playback and self.playback.duration_ms:
+                    finish_position = self.playback.duration_ms / 1000.0
+                if finish_position is not None:
+                    self.danmaku_canvas.sync_position(finish_position, True, self.playback_rate)
+                else:
+                    self.danmaku_canvas.set_paused(True)
+                self._notify_playback_finished()
+                return
             if position is not None:
                 if position > 0 or paused or self.danmaku_canvas.position < 0.75:
                     self.danmaku_canvas.sync_position(position, paused, self.playback_rate)
@@ -1136,6 +1158,28 @@ class PlaybackFrame(wx.Frame):
         self.player.stop()
         self.on_closed(self)
         event.Skip()
+
+    def _status_is_finished(
+        self,
+        status: dict[str, object],
+        position: float | None,
+        duration: float | None,
+    ) -> bool:
+        if status.get("ended"):
+            return True
+        if position is None:
+            return False
+        if duration is None and self.playback and self.playback.duration_ms:
+            duration = self.playback.duration_ms / 1000.0
+        if duration is None or duration <= 0:
+            return False
+        return position >= max(0.0, duration - self.FINISHED_EPSILON_SECONDS)
+
+    def _notify_playback_finished(self) -> None:
+        if self.finish_notified or self.playback is None:
+            return
+        self.finish_notified = True
+        self.on_finished(self, self.playback)
 
     def _set_parent_status(self, message: str) -> None:
         parent = self.GetParent()
@@ -1183,7 +1227,7 @@ class PlaybackFrame(wx.Frame):
 
 class MaoerFrame(wx.Frame):
     def __init__(self) -> None:
-        super().__init__(None, title="猫耳FM", size=(940, 620))
+        super().__init__(None, title=APP_TITLE, size=(940, 620))
         self.api = MaoerApi()
         self.browser_player = HiddenBrowserPlayer(self, cookie=self.api.cookie_header)
         self.active_player: HiddenBrowserPlayer | None = None
@@ -1191,11 +1235,13 @@ class MaoerFrame(wx.Frame):
         self.items: list[MediaItem] = []
         self.current_title = ""
         self.page_state: PageState | None = None
+        self.hide_list_detail_column = False
         self.navigation_stack: list[NavigationState] = []
         self.homepage_state: NavigationState | None = None
         self.comment_windows: list[CommentsFrame] = []
         self.last_mouse_context_menu_at = 0.0
         self.account_logged_in = bool(self.api.cookie_header)
+        self.current_playback_key: tuple[str, int] | None = None
 
         self._build_ui()
         self._build_menu()
@@ -1241,6 +1287,7 @@ class MaoerFrame(wx.Frame):
         self.account_purchased_dramas_menu_id = wx.NewIdRef()
         self.account_logout_menu_id = wx.NewIdRef()
         self.account_exit_menu_id = wx.NewIdRef()
+        self.content_categories_menu_id = wx.NewIdRef()
         self._update_account_menu()
 
     def _update_account_menu(self) -> None:
@@ -1259,6 +1306,10 @@ class MaoerFrame(wx.Frame):
         account_menu.AppendSeparator()
         account_menu.Append(self.account_exit_menu_id, "退出程序(&Q)")
         menu_bar.Append(account_menu, "账号(&A)")
+
+        content_menu = wx.Menu()
+        content_menu.Append(self.content_categories_menu_id, "分类(&C)")
+        menu_bar.Append(content_menu, "内容(&C)")
 
         self.SetMenuBar(menu_bar)
 
@@ -1282,6 +1333,7 @@ class MaoerFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_account_purchased_dramas, id=self.account_purchased_dramas_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_logout, id=self.account_logout_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_exit, id=self.account_exit_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_content_categories, id=self.content_categories_menu_id)
         self.Bind(wx.EVT_CHAR_HOOK, self.on_char_hook)
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
@@ -1325,6 +1377,21 @@ class MaoerFrame(wx.Frame):
             ),
         )
 
+    def on_content_categories(self, _event: wx.Event) -> None:
+        previous_state = self._account_list_previous_state()
+        self._clear_items_for_loading("分类", focus_list=True, hide_detail_column=True)
+        self._run_background(
+            "正在加载分类...",
+            self.api.content_categories,
+            lambda items: self._enter_items(
+                items,
+                "分类",
+                previous_state,
+                focus_list=True,
+                hide_detail_column=True,
+            ),
+        )
+
     def on_account_login(self, _event: wx.Event) -> None:
         dialog = LoginDialog(self, self.api)
         try:
@@ -1355,9 +1422,10 @@ class MaoerFrame(wx.Frame):
             dialog.Destroy()
 
     def _check_in_from_account_dialog(self, button: wx.Button) -> None:
+        dialog = button.GetTopLevelParent()
+        self._focus_account_dialog_content(dialog)
         button.Enable(False)
         self.SetStatusText("正在签到...")
-        dialog = button.GetTopLevelParent()
 
         def runner() -> None:
             try:
@@ -1381,7 +1449,7 @@ class MaoerFrame(wx.Frame):
             else:
                 wx.CallAfter(self._show_check_in_result, result, dialog, updated_account)
             finally:
-                wx.CallAfter(self._safe_enable_window, button, True)
+                wx.CallAfter(self._finish_check_in_from_account_dialog, button, dialog)
 
         threading.Thread(target=runner, daemon=True).start()
 
@@ -1390,6 +1458,20 @@ class MaoerFrame(wx.Frame):
         try:
             if not window.IsBeingDeleted():
                 window.Enable(enabled)
+        except RuntimeError:
+            pass
+
+    def _finish_check_in_from_account_dialog(self, button: wx.Button, dialog: wx.Window | None) -> None:
+        self._safe_enable_window(button, True)
+        self._focus_account_dialog_content(dialog)
+
+    @staticmethod
+    def _focus_account_dialog_content(window: wx.Window | None) -> None:
+        if not isinstance(window, AccountInfoDialog):
+            return
+        try:
+            if not window.IsBeingDeleted():
+                window.content_box.SetFocus()
         except RuntimeError:
             pass
 
@@ -1405,9 +1487,11 @@ class MaoerFrame(wx.Frame):
             message = "您今天已经签到过了，请明天再来哟。"
         if result.fish_count is not None and str(result.fish_count) not in message:
             message = f"{message}\n获得小鱼干：{result.fish_count}"
-        if updated_account is not None and isinstance(parent, AccountInfoDialog):
+        if isinstance(parent, AccountInfoDialog):
             try:
-                if not parent.IsBeingDeleted():
+                if parent.IsBeingDeleted():
+                    parent = None
+                elif updated_account is not None:
                     parent.content_box.SetValue(updated_account.text)
             except RuntimeError:
                 parent = None
@@ -1416,7 +1500,10 @@ class MaoerFrame(wx.Frame):
         wx.MessageBox(message, title, wx.OK | wx.ICON_INFORMATION, message_parent)
         try:
             message_parent.Raise()
-            message_parent.SetFocus()
+            if isinstance(message_parent, AccountInfoDialog):
+                message_parent.content_box.SetFocus()
+            else:
+                message_parent.SetFocus()
         except RuntimeError:
             pass
 
@@ -1462,7 +1549,7 @@ class MaoerFrame(wx.Frame):
         self.browser_player.shutdown()
         self.account_logged_in = False
         self._update_account_menu()
-        self.SetTitle("猫耳FM")
+        self.SetTitle(APP_TITLE)
         self.SetStatusText("已退出登录")
         if self.current_title in {"我的收藏", "剧集订阅", "已购广播剧"}:
             self.load_homepage(focus_list=True)
@@ -1489,7 +1576,7 @@ class MaoerFrame(wx.Frame):
         if not self.account_logged_in:
             self.account_logged_in = True
             self._update_account_menu()
-        self.SetTitle(f"猫耳FM - 登录账号：{nickname}")
+        self.SetTitle(f"{APP_TITLE} - 登录账号：{nickname}")
 
     def _mark_account_logged_out(self, status: str = "") -> None:
         self.api.set_cookie("")
@@ -1497,7 +1584,7 @@ class MaoerFrame(wx.Frame):
         if self.account_logged_in:
             self.account_logged_in = False
             self._update_account_menu()
-        self.SetTitle("猫耳FM")
+        self.SetTitle(APP_TITLE)
         if status:
             self.SetStatusText(status)
 
@@ -1600,22 +1687,67 @@ class MaoerFrame(wx.Frame):
         if width <= 0:
             return
 
+        if self._hide_detail_column():
+            self.list.SetColumnWidth(0, max(120, width - 24))
+            self.list.SetColumnWidth(1, 0)
+            return
+
         author_width = max(160, min(260, width // 3))
         name_width = max(120, width - author_width - 24)
         self.list.SetColumnWidth(0, name_width)
         self.list.SetColumnWidth(1, max(120, width - name_width - 24))
 
     def _update_list_column_headers(self, title: str) -> None:
-        label = "声音数" if title == "我的收藏" else "作者"
+        name_label = "名称"
+        detail_label = "声音数" if title == "我的收藏" else "作者"
+        if self._items_are_categories():
+            name_label = "分类"
+            detail_label = ""
+        elif self._hide_detail_column():
+            detail_label = ""
+        self._set_list_column_header(0, name_label)
+        self._set_list_column_header(1, detail_label)
+
+    def _set_list_column_header(self, column_index: int, label: str) -> None:
         column = wx.ListItem()
         column.SetText(label)
-        self.list.SetColumn(1, column)
+        self.list.SetColumn(column_index, column)
+
+    def _items_are_categories(self) -> bool:
+        return bool(self.items) and all(item.kind == "category" for item in self.items)
+
+    def _hide_detail_column(self) -> bool:
+        return self.hide_list_detail_column or self._items_are_categories()
+
+    def _clear_items_for_loading(
+        self,
+        title: str,
+        focus_list: bool = False,
+        hide_detail_column: bool = False,
+    ) -> None:
+        self.current_title = title
+        self.items = []
+        self.page_state = None
+        self.hide_list_detail_column = hide_detail_column
+        self.list.Freeze()
+        try:
+            self.list.DeleteAllItems()
+            self._set_list_column_header(0, "")
+            self._set_list_column_header(1, "")
+        finally:
+            self.list.Thaw()
+        if focus_list:
+            wx.CallAfter(self._focus_list)
+        self.SetStatusText(f"正在加载{title}...")
 
     def _append_list_item(self, index: int, item: MediaItem) -> None:
         self.list.InsertItem(index, item.title)
         self.list.SetItem(index, 1, self._item_author(item))
 
     def _item_author(self, item: MediaItem) -> str:
+        if self._hide_detail_column():
+            return ""
+
         raw = item.raw
         if isinstance(raw, dict):
             if raw.get("_hide_author"):
@@ -1657,6 +1789,9 @@ class MaoerFrame(wx.Frame):
             return
 
         item = self.items[index]
+        if item.kind == "category":
+            return
+
         can_show_drama_menu = self._can_show_drama_menu(item)
         can_show_comments_menu = self._can_show_comments_menu(item)
         if not can_show_drama_menu and not can_show_comments_menu:
@@ -1742,6 +1877,10 @@ class MaoerFrame(wx.Frame):
         self.open_item(self.items[index])
 
     def open_item(self, item: MediaItem) -> None:
+        if item.kind == "category":
+            self.open_category(item)
+            return
+
         if item.is_collection:
             previous_state = self._navigation_state_snapshot()
             if item.kind == "drama":
@@ -1753,6 +1892,7 @@ class MaoerFrame(wx.Frame):
                         item.title,
                         previous_state,
                         page_state=PageState(1, lambda page: self.api.drama_episodes_page(item.id, page)),
+                        hide_detail_column=self.hide_list_detail_column,
                     ),
                 )
                 return
@@ -1766,6 +1906,7 @@ class MaoerFrame(wx.Frame):
                         item.title,
                         previous_state,
                         page_state=PageState(1, lambda page: self.api.album_sounds_page(item.id, page)),
+                        hide_detail_column=self.hide_list_detail_column,
                     ),
                 )
                 return
@@ -1773,7 +1914,12 @@ class MaoerFrame(wx.Frame):
             self._run_background(
                 f"正在加载: {item.title}",
                 lambda: self.api.collection_items(item),
-                lambda items: self._enter_items(items, item.title, previous_state),
+                lambda items: self._enter_items(
+                    items,
+                    item.title,
+                    previous_state,
+                    hide_detail_column=self.hide_list_detail_column,
+                ),
             )
             return
 
@@ -1781,10 +1927,33 @@ class MaoerFrame(wx.Frame):
             self.show_purchase_required(item.title)
             return
 
+        self._play_sound_item(item)
+
+    def open_category(self, item: MediaItem) -> None:
+        previous_state = self._navigation_state_snapshot()
+        children = self.api.category_children(item)
+        if children:
+            self.page_state = None
+            self._enter_items(
+                children,
+                f"分类: {item.title}",
+                previous_state,
+                focus_list=True,
+                hide_detail_column=True,
+            )
+            return
+
         self._run_background(
-            f"正在获取播放地址: {item.title}",
-            lambda: self.api.playback_info(item),
-            lambda playback: self._play(playback),
+            f"正在加载分类内容: {item.title}",
+            lambda: self.api.category_contents(item, 1),
+            lambda items: self._enter_items(
+                items,
+                item.title,
+                previous_state,
+                focus_list=True,
+                page_state=PageState(1, lambda page: self.api.category_contents(item, page)),
+                hide_detail_column=True,
+            ),
         )
 
     def _set_root_items(
@@ -1807,6 +1976,7 @@ class MaoerFrame(wx.Frame):
             selected_index=self._selected_index(),
             page_state=self.page_state,
             top_index=self._top_index(),
+            hide_detail_column=self.hide_list_detail_column,
         )
         if self.current_title == "首页":
             self.homepage_state = state
@@ -1819,10 +1989,11 @@ class MaoerFrame(wx.Frame):
         previous_state: NavigationState,
         focus_list: bool = False,
         page_state: PageState | None = None,
+        hide_detail_column: bool = False,
     ) -> None:
         self.navigation_stack.append(previous_state)
         self.page_state = page_state
-        self.set_items(items, title, focus_list=focus_list)
+        self.set_items(items, title, focus_list=focus_list, hide_detail_column=hide_detail_column)
 
     def set_items(
         self,
@@ -1831,9 +2002,11 @@ class MaoerFrame(wx.Frame):
         selected_index: int = 0,
         focus_list: bool = False,
         top_index: int | None = None,
+        hide_detail_column: bool = False,
     ) -> None:
         self.current_title = title
         self.items = items
+        self.hide_list_detail_column = hide_detail_column
         self._update_list_column_headers(title)
         self.list.Freeze()
         try:
@@ -1945,7 +2118,12 @@ class MaoerFrame(wx.Frame):
         self.SetStatusText(f"{self.current_title}，共 {len(self.items)} 项")
         wx.CallAfter(self._load_next_page_if_near_bottom)
 
-    def _play(self, playback: PlaybackInfo) -> None:
+    def _play(
+        self,
+        playback: PlaybackInfo,
+        source_key: tuple[str, int] | None = None,
+        source_title: str = "",
+    ) -> None:
         created = False
         if self.player_frame is None:
             self.player_frame = PlaybackFrame(
@@ -1953,6 +2131,7 @@ class MaoerFrame(wx.Frame):
                 self.api,
                 self.browser_player,
                 self._on_player_window_close,
+                self._on_playback_finished,
             )
             created = True
 
@@ -1967,9 +2146,13 @@ class MaoerFrame(wx.Frame):
             self.show_error(str(exc))
             return
 
+        self.current_playback_key = source_key or ("sound", playback.sound_id)
         self.player_frame.Show()
         self.player_frame.Raise()
-        self.SetStatusText(f"正在播放: {playback.title}")
+        prefix = "正在播放"
+        if source_title and source_title != self.current_title:
+            prefix = f"{prefix}({source_title})"
+        self.SetStatusText(f"{prefix}: {playback.title}")
         threading.Thread(target=self.api.add_play_times, args=(playback,), daemon=True).start()
 
     def _on_player_window_close(self, frame: PlaybackFrame) -> None:
@@ -1977,13 +2160,129 @@ class MaoerFrame(wx.Frame):
             self.player_frame = None
         if self.active_player is self.browser_player:
             self.active_player = None
+        self.current_playback_key = None
         self.SetStatusText("已停止播放")
+
+    def _on_playback_finished(self, frame: PlaybackFrame, playback: PlaybackInfo) -> None:
+        if frame is not self.player_frame:
+            return
+        playback_key = ("sound", playback.sound_id)
+        if self.current_playback_key not in (None, playback_key):
+            return
+        self.current_playback_key = playback_key
+        self._play_next_from_current_list(playback_key)
+
+    def _play_next_from_current_list(self, current_key: tuple[str, int]) -> None:
+        if self.current_playback_key != current_key:
+            return
+        if self._index_for_item_key(current_key) is None:
+            self.SetStatusText("播放结束")
+            return
+        next_index = self._next_playable_index(current_key)
+        if next_index is None:
+            self._load_next_page_for_auto_play(current_key)
+            return
+
+        next_item = self.items[next_index]
+        self._select_list_row(next_index)
+        self._play_sound_item(next_item, status_prefix="正在自动播放", auto_current_key=current_key)
+
+    def _load_next_page_for_auto_play(self, current_key: tuple[str, int]) -> None:
+        state = self.page_state
+        if state is None or not state.has_more:
+            self.SetStatusText("已播放到最后一个音频")
+            return
+        if state.loading:
+            self.SetStatusText("正在等待下一页加载")
+            wx.CallLater(1200, self._play_next_from_current_list, current_key)
+            return
+
+        state.loading = True
+        next_page = state.page + 1
+
+        def work() -> list[MediaItem]:
+            try:
+                return state.loader(next_page)
+            finally:
+                state.loading = False
+
+        def done(items: object) -> None:
+            if self.page_state is state:
+                self._append_next_page(state, next_page, items if isinstance(items, list) else [])
+            if self.current_playback_key == current_key:
+                self._play_next_from_current_list(current_key)
+
+        self._run_background(
+            f"正在加载下一页: {self.current_title}",
+            work,
+            done,
+        )
+
+    def _play_sound_item(
+        self,
+        item: MediaItem,
+        status_prefix: str = "正在获取播放地址",
+        auto_current_key: tuple[str, int] | None = None,
+    ) -> None:
+        if item.kind != "sound":
+            if auto_current_key is not None:
+                wx.CallAfter(self._play_next_from_current_list, auto_current_key)
+            return
+        if item.need_pay:
+            if auto_current_key is not None:
+                self._skip_auto_purchase_required(auto_current_key, item)
+            else:
+                self.show_purchase_required(item.title)
+            return
+        source_key = self._item_key(item)
+        source_title = self.current_title
+        self._run_background(
+            f"{status_prefix}: {item.title}",
+            lambda: self.api.playback_info(item),
+            lambda playback: self._play(playback, source_key=source_key, source_title=source_title),
+            on_purchase_required=(
+                (lambda _exc: self._skip_auto_purchase_required(auto_current_key, item))
+                if auto_current_key is not None
+                else None
+            ),
+        )
+
+    def _skip_auto_purchase_required(self, current_key: tuple[str, int], item: MediaItem) -> None:
+        if self.current_playback_key != current_key:
+            return
+        item.need_pay = True
+        self.SetStatusText(f"跳过需要购买的音频: {item.title}")
+        wx.CallAfter(self._play_next_from_current_list, current_key)
+
+    def _next_playable_index(self, current_key: tuple[str, int]) -> int | None:
+        current_index = self._index_for_item_key(current_key)
+        if current_index is None:
+            return None
+        for index in range(current_index + 1, len(self.items)):
+            if self._is_auto_playable_item(self.items[index]):
+                return index
+        return None
+
+    @staticmethod
+    def _is_auto_playable_item(item: MediaItem) -> bool:
+        return item.kind == "sound" and not item.is_collection and not item.need_pay
+
+    def _index_for_item_key(self, key: tuple[str, int]) -> int | None:
+        for index, item in enumerate(self.items):
+            if self._item_key(item) == key:
+                return index
+        return None
+
+    @staticmethod
+    def _item_key(item: MediaItem) -> tuple[str, int]:
+        return (item.kind, item.id)
 
     def _run_background(
         self,
         status: str,
         work: Callable[[], object],
         done: Callable[[object], None],
+        on_purchase_required: Callable[[PurchaseRequired], None] | None = None,
     ) -> None:
         self.SetStatusText(status)
         self.search_button.Enable(False)
@@ -1992,7 +2291,10 @@ class MaoerFrame(wx.Frame):
             try:
                 result = work()
             except PurchaseRequired as exc:
-                wx.CallAfter(self.show_purchase_required, str(exc))
+                if on_purchase_required is not None:
+                    wx.CallAfter(on_purchase_required, exc)
+                else:
+                    wx.CallAfter(self.show_purchase_required, str(exc))
             except DrmUnsupported as exc:
                 wx.CallAfter(self.show_error, str(exc))
             except ApiError as exc:
@@ -2040,7 +2342,13 @@ class MaoerFrame(wx.Frame):
             return False
         state = self.navigation_stack.pop()
         self.page_state = state.page_state
-        self.set_items(state.items, state.title, state.selected_index, top_index=state.top_index)
+        self.set_items(
+            state.items,
+            state.title,
+            state.selected_index,
+            top_index=state.top_index,
+            hide_detail_column=state.hide_detail_column,
+        )
         return True
 
     def _selected_index(self) -> int:
@@ -2101,6 +2409,7 @@ class MaoerFrame(wx.Frame):
         if self.active_player is not None:
             self.active_player.stop()
         self.active_player = None
+        self.current_playback_key = None
         self.SetStatusText("已停止播放")
 
     def _current_player(self) -> HiddenBrowserPlayer | None:
@@ -2120,6 +2429,7 @@ class MaoerFrame(wx.Frame):
             self.player_frame.Destroy()
             self.player_frame = None
         self.active_player = None
+        self.current_playback_key = None
         self.browser_player.shutdown()
         clear_webview2_profile()
         event.Skip()
@@ -2138,11 +2448,21 @@ class MaoerFrame(wx.Frame):
 
 class MaoerApp(wx.App):
     def OnInit(self) -> bool:
+        if not run_startup_update_check():
+            return False
         frame = MaoerFrame()
         frame.Show()
         return True
 
 
-if __name__ == "__main__":
+def main() -> int:
+    update_result = handle_update_cli(sys.argv)
+    if update_result is not None:
+        return update_result
     app = MaoerApp(False)
     app.MainLoop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
