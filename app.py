@@ -25,7 +25,10 @@ from maoer_api import (
     COMMENT_SORT_HOTTEST,
     COMMENT_SORT_NEWEST,
     DANMAKU_MODE_SUBTITLE,
+    DRAMA_PAY_TYPE_EPISODES,
+    DRAMA_PAY_TYPE_WHOLE,
     DanmakuItem,
+    DramaPurchaseInfo,
     DrmUnsupported,
     MaoerApi,
     CommentItem,
@@ -33,6 +36,7 @@ from maoer_api import (
     MediaItem,
     PlaybackInfo,
     PurchaseRequired,
+    SoundPurchaseInfo,
 )
 from uia_live_region import ScreenReaderAnnouncer
 from updater import handle_update_cli, run_startup_update_check
@@ -1747,6 +1751,8 @@ class MaoerFrame(wx.Frame):
     def _item_author(self, item: MediaItem) -> str:
         if self._hide_detail_column():
             return ""
+        if item.kind == "drama_purchase":
+            return ""
 
         raw = item.raw
         if isinstance(raw, dict):
@@ -1877,6 +1883,10 @@ class MaoerFrame(wx.Frame):
         self.open_item(self.items[index])
 
     def open_item(self, item: MediaItem) -> None:
+        if item.kind == "drama_purchase":
+            self._prompt_drama_purchase(item.drama_id or item.id)
+            return
+
         if item.kind == "category":
             self.open_category(item)
             return
@@ -1924,7 +1934,7 @@ class MaoerFrame(wx.Frame):
             return
 
         if item.need_pay:
-            self.show_purchase_required(item.title)
+            self._prompt_sound_purchase(item)
             return
 
         self._play_sound_item(item)
@@ -1955,6 +1965,200 @@ class MaoerFrame(wx.Frame):
                 hide_detail_column=True,
             ),
         )
+
+    def _prompt_drama_purchase(
+        self,
+        drama_id: int,
+        play_after: MediaItem | None = None,
+    ) -> None:
+        self._run_background(
+            "正在获取购买信息...",
+            lambda: self.api.drama_purchase_info(drama_id, refresh=True),
+            lambda info: self._show_drama_purchase_prompt(info, play_after=play_after),
+        )
+
+    def _prompt_sound_purchase(self, item: MediaItem) -> None:
+        if item.kind != "sound":
+            self.show_purchase_required(item.title)
+            return
+
+        self._run_background(
+            "正在获取购买信息...",
+            lambda: self.api.sound_purchase_info(item),
+            lambda info: self._show_sound_purchase_prompt(item, info),
+        )
+
+    def _show_sound_purchase_prompt(self, item: MediaItem, info: object) -> None:
+        if not isinstance(info, SoundPurchaseInfo):
+            self.show_purchase_required(item.title)
+            return
+
+        item.pay_type = info.pay_type
+        item.price = info.price if info.price is not None else item.price
+        item.drama_id = info.drama.drama_id
+        if info.title:
+            item.title = info.title
+
+        if info.pay_type == DRAMA_PAY_TYPE_EPISODES:
+            price = item.price if item.price is not None else info.drama.price
+            if not self._confirm_episode_purchase(item, info.drama, price):
+                self.SetStatusText("已取消购买")
+                return
+
+            self._run_background(
+                f"正在购买单集: {item.title}",
+                lambda: self.api.buy_drama_episode(info.drama.drama_id, item.id),
+                lambda _payload: self._finish_episode_purchase(item, info.drama.drama_id),
+                on_error=self._show_purchase_failure,
+            )
+            return
+
+        if info.pay_type == DRAMA_PAY_TYPE_WHOLE or info.drama.pay_type == DRAMA_PAY_TYPE_WHOLE:
+            self._show_drama_purchase_prompt(info.drama, play_after=item)
+            return
+
+        if info.drama.pay_type != DRAMA_PAY_TYPE_EPISODES:
+            self.show_purchase_required(item.title)
+            return
+
+        price = item.price if item.price is not None else info.drama.price
+        if not self._confirm_episode_purchase(item, info.drama, price):
+            self.SetStatusText("已取消购买")
+            return
+
+        self._run_background(
+            f"正在购买单集: {item.title}",
+            lambda: self.api.buy_drama_episode(info.drama.drama_id, item.id),
+            lambda _payload: self._finish_episode_purchase(item, info.drama.drama_id),
+            on_error=self._show_purchase_failure,
+        )
+
+    def _show_drama_purchase_prompt(
+        self,
+        info: object,
+        play_after: MediaItem | None = None,
+    ) -> None:
+        if not isinstance(info, DramaPurchaseInfo):
+            self.show_purchase_required(play_after.title if play_after else "广播剧")
+            return
+
+        if not info.need_pay:
+            self._finish_drama_purchase(info.drama_id, play_after=play_after, already_owned=True)
+            return
+
+        if not self._confirm_drama_purchase(info):
+            self.SetStatusText("已取消购买")
+            return
+
+        self._run_background(
+            f"正在购买广播剧: {info.title}",
+            lambda: self.api.buy_drama(info.drama_id),
+            lambda _payload: self._finish_drama_purchase(info.drama_id, play_after=play_after),
+            on_error=self._show_purchase_failure,
+        )
+
+    def _confirm_drama_purchase(self, info: DramaPurchaseInfo) -> bool:
+        if info.price is None:
+            message = f"《{info.title}》需要购买后才能播放。\n未获取到价格，是否继续购买本剧？"
+        else:
+            message = f"《{info.title}》需要购买后才能播放。\n是否花 {info.price} 钻石购买本剧？"
+        return self._confirm_purchase(message, "购买广播剧")
+
+    def _confirm_episode_purchase(
+        self,
+        item: MediaItem,
+        info: DramaPurchaseInfo,
+        price: int | None,
+    ) -> bool:
+        if price is None:
+            message = f"《{item.title}》需要购买后才能播放。\n未获取到价格，是否继续购买这一集？"
+        else:
+            message = f"《{item.title}》需要购买后才能播放。\n是否花 {price} 钻石购买这一集？"
+        if info.title:
+            message = f"广播剧：{info.title}\n{message}"
+        return self._confirm_purchase(message, "购买单集")
+
+    def _confirm_purchase(self, message: str, title: str) -> bool:
+        dialog = wx.MessageDialog(
+            self,
+            message,
+            title,
+            wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION,
+        )
+        try:
+            no_button = dialog.FindWindow(wx.ID_NO)
+            if no_button is not None:
+                no_button.SetFocus()
+            return dialog.ShowModal() == wx.ID_YES
+        finally:
+            dialog.Destroy()
+
+    def _finish_drama_purchase(
+        self,
+        drama_id: int,
+        play_after: MediaItem | None = None,
+        already_owned: bool = False,
+    ) -> None:
+        self._mark_drama_purchased_in_items(drama_id)
+        message = "本剧已购买" if already_owned else "购买成功，已解锁本剧"
+        wx.MessageBox(message, "购买成功", wx.OK | wx.ICON_INFORMATION, self)
+        if play_after is not None:
+            play_after.need_pay = False
+            self._play_sound_item(play_after)
+            return
+        self.SetStatusText(message)
+
+    def _finish_episode_purchase(self, item: MediaItem, drama_id: int) -> None:
+        item.need_pay = False
+        self._mark_sound_purchased_in_items(item.id)
+        wx.MessageBox("购买成功，正在播放。", "购买成功", wx.OK | wx.ICON_INFORMATION, self)
+        self.SetStatusText("购买成功，正在播放")
+        self._play_sound_item(item)
+
+    def _show_purchase_failure(self, message: str) -> None:
+        self.SetStatusText("购买失败")
+        text = message.strip()
+        if text == "需要登录":
+            text = "需要登录后才能购买。"
+        elif "余额" in text and "不足" in text:
+            text = "钻石余额不足，无法完成购买。"
+        elif not text:
+            text = "购买失败。"
+        else:
+            text = f"购买失败：{text}"
+        wx.MessageBox(text, "购买失败", wx.OK | wx.ICON_INFORMATION, self)
+
+    def _mark_drama_purchased_in_items(self, drama_id: int) -> None:
+        selected_index = self._selected_index()
+        top_index = self._top_index()
+        changed = False
+        new_items: list[MediaItem] = []
+        for item in self.items:
+            item_drama_id = item.drama_id or (item.id if item.kind == "drama" else None)
+            if item.kind == "drama_purchase" and item_drama_id == drama_id:
+                changed = True
+                continue
+            if item_drama_id == drama_id and item.need_pay:
+                item.need_pay = False
+                changed = True
+            new_items.append(item)
+
+        if not changed:
+            return
+
+        selected_index = max(0, min(selected_index, len(new_items) - 1)) if new_items else 0
+        self.set_items(
+            new_items,
+            self.current_title,
+            selected_index=selected_index,
+            top_index=top_index,
+            hide_detail_column=self.hide_list_detail_column,
+        )
+
+    def _mark_sound_purchased_in_items(self, sound_id: int) -> None:
+        for item in self.items:
+            if item.kind == "sound" and item.id == sound_id:
+                item.need_pay = False
 
     def _set_root_items(
         self,
@@ -2232,7 +2436,7 @@ class MaoerFrame(wx.Frame):
             if auto_current_key is not None:
                 self._skip_auto_purchase_required(auto_current_key, item)
             else:
-                self.show_purchase_required(item.title)
+                self._prompt_sound_purchase(item)
             return
         source_key = self._item_key(item)
         source_title = self.current_title
@@ -2243,7 +2447,7 @@ class MaoerFrame(wx.Frame):
             on_purchase_required=(
                 (lambda _exc: self._skip_auto_purchase_required(auto_current_key, item))
                 if auto_current_key is not None
-                else None
+                else (lambda _exc: self._prompt_sound_purchase(item))
             ),
         )
 
@@ -2283,6 +2487,7 @@ class MaoerFrame(wx.Frame):
         work: Callable[[], object],
         done: Callable[[object], None],
         on_purchase_required: Callable[[PurchaseRequired], None] | None = None,
+        on_error: Callable[[str], None] | None = None,
     ) -> None:
         self.SetStatusText(status)
         self.search_button.Enable(False)
@@ -2300,11 +2505,21 @@ class MaoerFrame(wx.Frame):
             except ApiError as exc:
                 if str(exc) == "需要登录":
                     wx.CallAfter(self._mark_account_logged_out, "需要登录")
-                wx.CallAfter(self.show_error, str(exc))
+                if on_error is not None:
+                    wx.CallAfter(on_error, str(exc))
+                else:
+                    wx.CallAfter(self.show_error, str(exc))
             except (requests.RequestException, ValueError) as exc:
-                wx.CallAfter(self.show_error, str(exc))
+                if on_error is not None:
+                    wx.CallAfter(on_error, str(exc))
+                else:
+                    wx.CallAfter(self.show_error, str(exc))
             except Exception as exc:
-                wx.CallAfter(self.show_error, f"{type(exc).__name__}: {exc}")
+                message = f"{type(exc).__name__}: {exc}"
+                if on_error is not None:
+                    wx.CallAfter(on_error, message)
+                else:
+                    wx.CallAfter(self.show_error, message)
             else:
                 wx.CallAfter(done, result)
             finally:

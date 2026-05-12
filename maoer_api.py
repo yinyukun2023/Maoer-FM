@@ -22,6 +22,8 @@ COMMENT_TARGET_SOUND = 1
 COMMENT_SORT_NEWEST = 1
 COMMENT_SORT_HOTTEST = 3
 DANMAKU_MODE_SUBTITLE = 4
+DRAMA_PAY_TYPE_EPISODES = 1
+DRAMA_PAY_TYPE_WHOLE = 2
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:149.0) "
     "Gecko/20100101 Firefox/149.0"
@@ -53,6 +55,7 @@ class MediaItem:
     duration_ms: int | None = None
     need_pay: bool = False
     pay_type: int | None = None
+    price: int | None = None
     drama_id: int | None = None
     album_id: int | None = None
     raw: dict[str, Any] = field(default_factory=dict)
@@ -105,6 +108,27 @@ class CheckInResult:
     success: bool
     message: str
     fish_count: int | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class DramaPurchaseInfo:
+    drama_id: int
+    title: str
+    pay_type: int | None
+    need_pay: bool
+    price: int | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class SoundPurchaseInfo:
+    sound_id: int
+    title: str
+    pay_type: int | None
+    need_pay: bool
+    drama: DramaPurchaseInfo
+    price: int | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -190,6 +214,7 @@ class MaoerApi:
         self.timeout = timeout
         self.session = requests.Session()
         self._account_info_cache: AccountInfo | None = None
+        self._drama_detail_cache: dict[int, dict[str, Any]] = {}
         self.session.headers.update(
             {
                 "User-Agent": USER_AGENT,
@@ -248,6 +273,32 @@ class MaoerApi:
     def _post(self, path: str, params: dict[str, Any] | None = None) -> None:
         url = path if path.startswith("http") else BASE_URL + path
         self.session.post(url, params=params, timeout=self.timeout)
+
+    def _post_form_api(
+        self,
+        path: str,
+        data: dict[str, Any],
+        referer: str | None = None,
+    ) -> dict[str, Any]:
+        url = path if path.startswith("http") else BASE_URL + path
+        response = self.session.post(
+            url,
+            data=data,
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Referer": referer or BASE_URL + "/",
+                "Origin": BASE_URL,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ApiError("接口返回格式不正确")
+        if payload.get("success") is False:
+            raise ApiError(self._payload_message(payload))
+        return payload
 
     def start_login_captcha(self) -> LoginCaptcha:
         self.session.get(
@@ -371,6 +422,77 @@ class MaoerApi:
             raise ApiError(message)
         return CheckInResult(False, message, self._fish_count_from_text(message), data)
 
+    def drama_purchase_info(self, drama_id: int, refresh: bool = False) -> DramaPurchaseInfo:
+        info = self._drama_detail_data(drama_id, refresh=refresh)
+        drama = info.get("drama") or {}
+        if not isinstance(drama, dict):
+            drama = {}
+        title = _text(drama.get("name") or drama.get("drama_name") or drama.get("title") or drama_id)
+        resolved_drama_id = _to_int(drama.get("id"), int(drama_id)) or int(drama_id)
+        return DramaPurchaseInfo(
+            drama_id=resolved_drama_id,
+            title=title,
+            pay_type=_to_int(drama.get("pay_type")),
+            need_pay=_to_bool(drama.get("need_pay")),
+            price=_to_int(drama.get("price")),
+            raw=drama,
+        )
+
+    def sound_purchase_info(self, item: MediaItem) -> SoundPurchaseInfo:
+        data = self._get("/sound/getsound", {"soundid": item.id})
+        info = data.get("info") or {}
+        sound = info.get("sound") or {}
+        if not isinstance(sound, dict):
+            sound = {}
+
+        drama_id = (
+            _to_int(sound.get("drama_id") or sound.get("dramaid"))
+            or item.drama_id
+            or self._first_int_value(
+                sound,
+                ("drama_id", "dramaId", "radio_drama_id", "radioDramaId", "mdrama_id"),
+            )
+        )
+        if drama_id is None:
+            drama_id = self.item_drama_id(item)
+
+        sound_pay_type = _to_int(sound.get("pay_type"), item.pay_type)
+        sound_price = _to_int(sound.get("price"), item.price)
+        drama = self.drama_purchase_info(drama_id, refresh=True)
+        title = _text(sound.get("soundstr") or sound.get("title") or item.title)
+        return SoundPurchaseInfo(
+            sound_id=item.id,
+            title=title,
+            pay_type=sound_pay_type,
+            need_pay=_to_bool(sound.get("need_pay")) or item.need_pay or bool(sound_pay_type),
+            drama=drama,
+            price=sound_price if sound_price is not None else item.price,
+            raw=sound,
+        )
+
+    def buy_drama(self, drama_id: int) -> dict[str, Any]:
+        drama_id = int(drama_id)
+        payload = self._post_form_api(
+            "/financial/buydrama",
+            {"drama_id": str(drama_id)},
+            referer=f"{BASE_URL}/mdrama/{drama_id}",
+        )
+        self._account_info_cache = None
+        self._drama_detail_cache.pop(drama_id, None)
+        return payload
+
+    def buy_drama_episode(self, drama_id: int, sound_id: int) -> dict[str, Any]:
+        drama_id = int(drama_id)
+        sound_id = int(sound_id)
+        payload = self._post_form_api(
+            "/financial/buydramaepisodes",
+            {"drama_id": str(drama_id), "sound_ids": str(sound_id)},
+            referer=f"{BASE_URL}/mdrama/{drama_id}",
+        )
+        self._account_info_cache = None
+        self._drama_detail_cache.pop(drama_id, None)
+        return payload
+
     def account_info(self, user_id: int | None = None) -> AccountInfo:
         if user_id is None and self._account_info_cache is not None:
             return self._account_info_cache
@@ -433,9 +555,19 @@ class MaoerApi:
             return None
         return _to_int(pagination.get("count"))
 
-    def drama_detail_text(self, drama_id: int) -> str:
+    def _drama_detail_data(self, drama_id: int, refresh: bool = False) -> dict[str, Any]:
+        drama_id = int(drama_id)
+        if not refresh and drama_id in self._drama_detail_cache:
+            return self._drama_detail_cache[drama_id]
         data = self._get("/dramaapi/getdrama", {"drama_id": drama_id})
         info = data.get("info") or {}
+        if not isinstance(info, dict):
+            info = {}
+        self._drama_detail_cache[drama_id] = info
+        return info
+
+    def drama_detail_text(self, drama_id: int) -> str:
+        info = self._drama_detail_data(drama_id)
         drama = info.get("drama") or {}
         episodes = info.get("episodes") or {}
 
@@ -640,6 +772,7 @@ class MaoerApi:
 
     def set_cookie(self, cookie: str) -> None:
         self._account_info_cache = None
+        self._drama_detail_cache.clear()
         self.cookie_header = cookie.strip()
         if self.cookie_header:
             self.session.headers["Cookie"] = self.cookie_header
@@ -1285,13 +1418,18 @@ class MaoerApi:
         raise ApiError(f"不支持的列表类型: {item.kind}")
 
     def drama_episodes(self, drama_id: int) -> list[MediaItem]:
-        data = self._get("/dramaapi/getdrama", {"drama_id": drama_id})
-        info = data.get("info") or {}
+        info = self._drama_detail_data(drama_id)
         drama = info.get("drama") or {}
+        if not isinstance(drama, dict):
+            drama = {}
         drama_name = _text(drama.get("name"))
         episodes = info.get("episodes") or {}
 
         items: list[MediaItem] = []
+        purchase_item = self._drama_purchase_item(drama, drama_id)
+        if purchase_item:
+            items.append(purchase_item)
+
         for group_key, group_label in (
             ("episode", "正剧"),
             ("ft", "花絮"),
@@ -1303,6 +1441,7 @@ class MaoerApi:
                     continue
                 title = _text(episode.get("name") or episode.get("soundstr") or sound_id)
                 pay_type = _to_int(episode.get("pay_type"))
+                price = self._episode_purchase_price(drama, episode, pay_type)
                 items.append(
                     MediaItem(
                         kind="sound",
@@ -1312,6 +1451,7 @@ class MaoerApi:
                         duration_ms=_duration_ms(episode.get("duration")),
                         need_pay=_to_bool(episode.get("need_pay")),
                         pay_type=pay_type,
+                        price=price,
                         drama_id=drama_id,
                         raw=episode,
                     )
@@ -1319,20 +1459,91 @@ class MaoerApi:
         return items
 
     def drama_episodes_page(self, drama_id: int, page: int = 1, page_size: int = 30) -> list[MediaItem]:
+        detail_info = self._drama_detail_data(drama_id)
+        drama = detail_info.get("drama") or {}
+        if not isinstance(drama, dict):
+            drama = {}
+        episode_lookup = self._drama_episode_lookup(detail_info)
         data = self._get(
             "/dramaapi/getdramaepisodedetails",
             {"drama_id": drama_id, "p": page, "page_size": page_size},
         )
         sounds = ((data.get("info") or {}).get("Datas") or [])
         items: list[MediaItem] = []
+        if page == 1:
+            purchase_item = self._drama_purchase_item(drama, drama_id)
+            if purchase_item:
+                items.append(purchase_item)
+
         for sound in sounds:
             if not isinstance(sound, dict):
                 continue
             item = self._sound_item(sound, subtitle="广播剧")
             if item:
                 item.drama_id = drama_id
+                episode = episode_lookup.get(item.id)
+                if episode:
+                    item.need_pay = _to_bool(episode.get("need_pay"))
+                    item.pay_type = _to_int(episode.get("pay_type"))
+                    item.price = self._episode_purchase_price(drama, episode, item.pay_type)
+                    item.raw = {**episode, **item.raw}
                 items.append(item)
         return items
+
+    def _drama_purchase_item(self, drama: dict[str, Any], drama_id: int) -> MediaItem | None:
+        pay_type = _to_int(drama.get("pay_type"))
+        if pay_type != DRAMA_PAY_TYPE_WHOLE or not _to_bool(drama.get("need_pay")):
+            return None
+
+        resolved_drama_id = _to_int(drama.get("id"), int(drama_id)) or int(drama_id)
+        price = _to_int(drama.get("price"))
+        drama_name = _text(drama.get("name") or drama.get("drama_name") or drama.get("title") or resolved_drama_id)
+        title = f"购买本剧（{price} 钻石）" if price is not None else "购买本剧"
+        raw = dict(drama)
+        raw["_purchase_kind"] = "drama"
+        raw["_hide_author"] = True
+        return MediaItem(
+            kind="drama_purchase",
+            id=resolved_drama_id,
+            title=title,
+            subtitle=drama_name,
+            need_pay=True,
+            pay_type=pay_type,
+            price=price,
+            drama_id=resolved_drama_id,
+            raw=raw,
+        )
+
+    def _drama_episode_lookup(self, info: dict[str, Any]) -> dict[int, dict[str, Any]]:
+        episodes = info.get("episodes") or {}
+        if not isinstance(episodes, dict):
+            return {}
+
+        lookup: dict[int, dict[str, Any]] = {}
+        for group in ("episode", "ft", "music"):
+            values = episodes.get(group) or []
+            if not isinstance(values, list):
+                continue
+            for episode in values:
+                if not isinstance(episode, dict):
+                    continue
+                sound_id = _to_int(episode.get("sound_id") or episode.get("id"))
+                if sound_id is not None:
+                    lookup[sound_id] = episode
+        return lookup
+
+    @staticmethod
+    def _episode_purchase_price(
+        drama: dict[str, Any],
+        episode: dict[str, Any],
+        pay_type: int | None,
+    ) -> int | None:
+        price = _to_int(episode.get("price"))
+        if price is not None:
+            return price
+        if pay_type in {DRAMA_PAY_TYPE_EPISODES, DRAMA_PAY_TYPE_WHOLE}:
+            return _to_int(drama.get("price"))
+        return None
 
     def subscribed_dramas(self, page: int = 1, page_size: int = 30) -> list[MediaItem]:
         account = self.account_info()
@@ -1481,6 +1692,7 @@ class MaoerApi:
             duration_ms=_duration_ms(sound.get("duration")),
             need_pay=_to_bool(sound.get("need_pay")),
             pay_type=pay_type,
+            price=_to_int(sound.get("price")),
             album_id=album_id,
             raw=sound,
         )
@@ -1679,6 +1891,7 @@ class MaoerApi:
             title=title or str(drama_id),
             subtitle="剧集订阅",
             pay_type=_to_int(data.get("pay_type")),
+            price=_to_int(data.get("price")),
             raw=data,
         )
 
@@ -1708,6 +1921,7 @@ class MaoerApi:
             title=_text(data.get("name") or data.get("drama_name") or data.get("title") or drama_id),
             subtitle=" / ".join(parts),
             pay_type=_to_int(data.get("pay_type")),
+            price=_to_int(data.get("price")),
             raw=data,
         )
 
@@ -1733,6 +1947,7 @@ class MaoerApi:
             title=_text(drama.get("name") or drama.get("drama_name") or drama.get("title") or drama_id),
             subtitle=subtitle,
             pay_type=_to_int(drama.get("pay_type")),
+            price=_to_int(drama.get("price")),
             raw=drama,
         )
 
