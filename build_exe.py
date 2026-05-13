@@ -32,6 +32,8 @@ UPDATE_PACKAGE_UPLOAD_DIR = UPDATE_PACKAGE_DIR / UPDATE_UPLOAD_DIR_NAME
 UPDATE_MANIFEST_URL = f"https://update.1630.org/maoer-fm/{UPDATE_CONFIG_NAME}"
 UPDATE_DOWNLOAD_BASE_URL = "https://update.1630.org/maoer-fm/updates/"
 UPDATE_TEXT_NAME = "update.txt"
+HOTKEYS_TEXT_NAME = "热键表.txt"
+BUNDLED_TEXT_NAMES = (HOTKEYS_TEXT_NAME, UPDATE_TEXT_NAME)
 SERVER_APP_FILENAME = "Maoer-FM.exe"
 APP_EXE_TARGET = "{app_exe}"
 RELEASE_EXE_PREFIX = "maoer-fm"
@@ -196,7 +198,7 @@ def build_updater_exe(pyinstaller: object) -> None:
 
 
 def update_sources() -> list[dict[str, str | Path]]:
-    return [
+    sources: list[dict[str, str | Path]] = [
         {
             "source": OUTPUT_EXE,
             "server_path": SERVER_APP_FILENAME,
@@ -208,6 +210,15 @@ def update_sources() -> list[dict[str, str | Path]]:
             "target": UPDATER_EXE.name,
         },
     ]
+    for filename in BUNDLED_TEXT_NAMES:
+        sources.append(
+            {
+                "source": ROOT / filename,
+                "server_path": filename,
+                "target": filename,
+            }
+        )
+    return sources
 
 
 def file_entry(source: Path, server_path: str, target: str) -> dict[str, object]:

@@ -177,6 +177,12 @@ def _to_bool(value: Any) -> bool:
     return bool(value)
 
 
+def _optional_bool(data: dict[str, Any], key: str) -> bool | None:
+    if key not in data:
+        return None
+    return _to_bool(data.get(key))
+
+
 def _duration_ms(value: Any) -> int | None:
     duration = _to_int(value)
     if duration is None:
@@ -460,11 +466,14 @@ class MaoerApi:
         sound_price = _to_int(sound.get("price"), item.price)
         drama = self.drama_purchase_info(drama_id, refresh=True)
         title = _text(sound.get("soundstr") or sound.get("title") or item.title)
+        sound_need_pay = _optional_bool(sound, "need_pay")
+        if sound_need_pay is None:
+            sound_need_pay = item.need_pay
         return SoundPurchaseInfo(
             sound_id=item.id,
             title=title,
             pay_type=sound_pay_type,
-            need_pay=_to_bool(sound.get("need_pay")) or item.need_pay or bool(sound_pay_type),
+            need_pay=sound_need_pay,
             drama=drama,
             price=sound_price if sound_price is not None else item.price,
             raw=sound,
@@ -1458,7 +1467,13 @@ class MaoerApi:
                 )
         return items
 
-    def drama_episodes_page(self, drama_id: int, page: int = 1, page_size: int = 30) -> list[MediaItem]:
+    def drama_episodes_page(
+        self,
+        drama_id: int,
+        page: int = 1,
+        page_size: int = 30,
+        force_owned: bool = False,
+    ) -> list[MediaItem]:
         detail_info = self._drama_detail_data(drama_id)
         drama = detail_info.get("drama") or {}
         if not isinstance(drama, dict):
@@ -1470,7 +1485,7 @@ class MaoerApi:
         )
         sounds = ((data.get("info") or {}).get("Datas") or [])
         items: list[MediaItem] = []
-        if page == 1:
+        if page == 1 and not force_owned:
             purchase_item = self._drama_purchase_item(drama, drama_id)
             if purchase_item:
                 items.append(purchase_item)
@@ -1483,10 +1498,12 @@ class MaoerApi:
                 item.drama_id = drama_id
                 episode = episode_lookup.get(item.id)
                 if episode:
-                    item.need_pay = _to_bool(episode.get("need_pay"))
+                    item.need_pay = False if force_owned else _to_bool(episode.get("need_pay"))
                     item.pay_type = _to_int(episode.get("pay_type"))
                     item.price = self._episode_purchase_price(drama, episode, item.pay_type)
                     item.raw = {**episode, **item.raw}
+                elif force_owned:
+                    item.need_pay = False
                 items.append(item)
         return items
 
@@ -1652,7 +1669,7 @@ class MaoerApi:
 
         url = _text(sound.get("soundurl") or sound.get("soundurl_128"))
         if not url:
-            if _to_bool(sound.get("need_pay")) or _to_int(sound.get("pay_type"), 0):
+            if _to_bool(sound.get("need_pay")):
                 raise PurchaseRequired(f"《{title}》需要购买后才能播放。")
 
         return PlaybackInfo(
@@ -1903,9 +1920,10 @@ class MaoerApi:
         if drama_id is None:
             return self._drama_item(data, fallback_subtitle="已购广播剧")
 
+        pay_type = _to_int(data.get("pay_type"))
         parts = ["已购广播剧"]
         suborders_num = _to_int(data.get("suborders_num"))
-        if _to_int(data.get("pay_type")) == 1 and suborders_num is not None:
+        if pay_type == DRAMA_PAY_TYPE_EPISODES and suborders_num is not None:
             parts.append(f"已购 {suborders_num} 集")
 
         episode_count = _to_int(data.get("episode_count"))
@@ -1915,14 +1933,17 @@ class MaoerApi:
         elif newest:
             parts.append(f"更新至 {newest}")
 
+        raw = dict(data)
+        raw["_purchased_drama"] = True
+        raw["_purchased_full_drama"] = pay_type == DRAMA_PAY_TYPE_WHOLE
         return MediaItem(
             kind="drama",
             id=drama_id,
             title=_text(data.get("name") or data.get("drama_name") or data.get("title") or drama_id),
             subtitle=" / ".join(parts),
-            pay_type=_to_int(data.get("pay_type")),
+            pay_type=pay_type,
             price=_to_int(data.get("price")),
-            raw=data,
+            raw=raw,
         )
 
     def _drama_item(self, drama: dict[str, Any], fallback_subtitle: str = "") -> MediaItem | None:

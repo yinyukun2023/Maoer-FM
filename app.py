@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+from pathlib import Path
 import re
 import sys
 import threading
@@ -40,9 +41,19 @@ from maoer_api import (
 )
 from uia_live_region import ScreenReaderAnnouncer
 from updater import handle_update_cli, run_startup_update_check
+from _build_info import APP_VERSION
 
 
 APP_TITLE = "猫耳FM"
+APP_AUTHOR = "欢喜就好"
+HOTKEYS_TEXT_NAME = "热键表.txt"
+UPDATE_TEXT_NAME = "update.txt"
+
+
+def program_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
 
 
 def debug_log(message: str) -> None:
@@ -1292,6 +1303,9 @@ class MaoerFrame(wx.Frame):
         self.account_logout_menu_id = wx.NewIdRef()
         self.account_exit_menu_id = wx.NewIdRef()
         self.content_categories_menu_id = wx.NewIdRef()
+        self.help_hotkeys_menu_id = wx.NewIdRef()
+        self.help_update_log_menu_id = wx.NewIdRef()
+        self.help_about_menu_id = wx.NewIdRef()
         self._update_account_menu()
 
     def _update_account_menu(self) -> None:
@@ -1314,6 +1328,13 @@ class MaoerFrame(wx.Frame):
         content_menu = wx.Menu()
         content_menu.Append(self.content_categories_menu_id, "分类(&C)")
         menu_bar.Append(content_menu, "内容(&C)")
+
+        help_menu = wx.Menu()
+        help_menu.Append(self.help_hotkeys_menu_id, "热键表(&H)")
+        help_menu.Append(self.help_update_log_menu_id, "更新日志(&U)")
+        help_menu.AppendSeparator()
+        help_menu.Append(self.help_about_menu_id, "关于本程序(&A)")
+        menu_bar.Append(help_menu, "帮助(&H)")
 
         self.SetMenuBar(menu_bar)
 
@@ -1338,6 +1359,9 @@ class MaoerFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_account_logout, id=self.account_logout_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_exit, id=self.account_exit_menu_id)
         self.Bind(wx.EVT_MENU, self.on_content_categories, id=self.content_categories_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_help_hotkeys, id=self.help_hotkeys_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_help_update_log, id=self.help_update_log_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_help_about, id=self.help_about_menu_id)
         self.Bind(wx.EVT_CHAR_HOOK, self.on_char_hook)
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
@@ -1395,6 +1419,33 @@ class MaoerFrame(wx.Frame):
                 hide_detail_column=True,
             ),
         )
+
+    def on_help_hotkeys(self, _event: wx.Event) -> None:
+        self._open_text_file("热键表", HOTKEYS_TEXT_NAME)
+
+    def on_help_update_log(self, _event: wx.Event) -> None:
+        self._open_text_file("更新日志", UPDATE_TEXT_NAME)
+
+    def on_help_about(self, _event: wx.Event) -> None:
+        wx.MessageBox(
+            f"{APP_TITLE}版本：{APP_VERSION}\n作者：{APP_AUTHOR}",
+            "关于本程序",
+            wx.OK | wx.ICON_INFORMATION,
+            self,
+        )
+
+    def _open_text_file(self, title: str, filename: str) -> None:
+        path = program_dir() / filename
+        if not path.exists():
+            wx.MessageBox(f"未找到文件：{filename}", title, wx.OK | wx.ICON_ERROR, self)
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            elif not wx.LaunchDefaultApplication(str(path)):
+                raise OSError("系统没有可用的默认打开方式")
+        except OSError:
+            wx.MessageBox(f"无法打开文件：{filename}", title, wx.OK | wx.ICON_ERROR, self)
 
     def on_account_login(self, _event: wx.Event) -> None:
         dialog = LoginDialog(self, self.api)
@@ -1894,14 +1945,18 @@ class MaoerFrame(wx.Frame):
         if item.is_collection:
             previous_state = self._navigation_state_snapshot()
             if item.kind == "drama":
+                force_owned = isinstance(item.raw, dict) and bool(item.raw.get("_purchased_full_drama"))
                 self._run_background(
                     f"正在加载: {item.title}",
-                    lambda: self.api.drama_episodes_page(item.id, 1),
+                    lambda: self.api.drama_episodes_page(item.id, 1, force_owned=force_owned),
                     lambda items: self._enter_items(
                         items,
                         item.title,
                         previous_state,
-                        page_state=PageState(1, lambda page: self.api.drama_episodes_page(item.id, page)),
+                        page_state=PageState(
+                            1,
+                            lambda page: self.api.drama_episodes_page(item.id, page, force_owned=force_owned),
+                        ),
                         hide_detail_column=self.hide_list_detail_column,
                     ),
                 )
@@ -1998,6 +2053,17 @@ class MaoerFrame(wx.Frame):
         item.drama_id = info.drama.drama_id
         if info.title:
             item.title = info.title
+
+        if not info.need_pay and (
+            info.drama.pay_type != DRAMA_PAY_TYPE_WHOLE or not info.drama.need_pay
+        ):
+            item.need_pay = False
+            self._mark_sound_purchased_in_items(item.id)
+            if info.drama.pay_type == DRAMA_PAY_TYPE_WHOLE:
+                self._mark_drama_purchased_in_items(info.drama.drama_id)
+            self.SetStatusText("已购买，正在播放")
+            self._play_sound_item(item)
+            return
 
         if info.pay_type == DRAMA_PAY_TYPE_EPISODES:
             price = item.price if item.price is not None else info.drama.price
