@@ -221,6 +221,7 @@ class MaoerApi:
         self.session = requests.Session()
         self._account_info_cache: AccountInfo | None = None
         self._drama_detail_cache: dict[int, dict[str, Any]] = {}
+        self._purchased_full_drama_ids_cache: set[int] | None = None
         self.session.headers.update(
             {
                 "User-Agent": USER_AGENT,
@@ -404,6 +405,7 @@ class MaoerApi:
         if not cookie:
             raise ApiError("登录成功但没有拿到 Cookie")
         self._account_info_cache = None
+        self._purchased_full_drama_ids_cache = None
         self.cookie_header = cookie
         self.session.headers["Cookie"] = cookie
         return cookie
@@ -488,6 +490,7 @@ class MaoerApi:
         )
         self._account_info_cache = None
         self._drama_detail_cache.pop(drama_id, None)
+        self._purchased_full_drama_ids_cache = None
         return payload
 
     def buy_drama_episode(self, drama_id: int, sound_id: int) -> dict[str, Any]:
@@ -782,6 +785,7 @@ class MaoerApi:
     def set_cookie(self, cookie: str) -> None:
         self._account_info_cache = None
         self._drama_detail_cache.clear()
+        self._purchased_full_drama_ids_cache = None
         self.cookie_header = cookie.strip()
         if self.cookie_header:
             self.session.headers["Cookie"] = self.cookie_header
@@ -1277,7 +1281,7 @@ class MaoerApi:
             except (ApiError, requests.RequestException, ValueError):
                 pass
 
-        return self._dedupe_items(items)
+        return self._mark_purchased_dramas(self._dedupe_items(items))
 
     def _open_homepage_shell(self) -> None:
         try:
@@ -1395,6 +1399,37 @@ class MaoerApi:
             result.append(item)
         return result
 
+    def _mark_purchased_dramas(self, items: list[MediaItem]) -> list[MediaItem]:
+        purchased_ids = self._purchased_full_drama_ids()
+        if not purchased_ids:
+            return items
+
+        for item in items:
+            if item.kind != "drama" or item.id not in purchased_ids:
+                continue
+            raw = dict(item.raw) if isinstance(item.raw, dict) else {}
+            raw["_purchased_drama"] = True
+            raw["_purchased_full_drama"] = True
+            item.raw = raw
+        return items
+
+    def _purchased_full_drama_ids(self) -> set[int]:
+        if not self.cookie_header:
+            return set()
+        if self._purchased_full_drama_ids_cache is not None:
+            return self._purchased_full_drama_ids_cache
+
+        purchased_ids: set[int] = set()
+        try:
+            for item in self.purchased_dramas(page=1, page_size=100):
+                if isinstance(item.raw, dict) and item.raw.get("_purchased_full_drama"):
+                    purchased_ids.add(item.id)
+        except (ApiError, requests.RequestException, ValueError):
+            purchased_ids = set()
+
+        self._purchased_full_drama_ids_cache = purchased_ids
+        return purchased_ids
+
     def search(self, keyword: str, page: int = 1, page_size: int = 30) -> list[MediaItem]:
         keyword = keyword.strip()
         if not keyword:
@@ -1417,7 +1452,7 @@ class MaoerApi:
             if item:
                 items.append(item)
 
-        return items
+        return self._mark_purchased_dramas(items)
 
     def collection_items(self, item: MediaItem) -> list[MediaItem]:
         if item.kind == "drama":
@@ -1613,7 +1648,7 @@ class MaoerApi:
             item = self._subscription_drama_item(drama)
             if item:
                 items.append(item)
-        return items
+        return self._mark_purchased_dramas(items)
 
     def user_favorite_folders(self, user_id: int, page: int = 1, page_size: int = 30) -> list[MediaItem]:
         data = self._get(
