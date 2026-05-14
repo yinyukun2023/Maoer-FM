@@ -260,10 +260,11 @@ def check_for_update() -> UpdateInfo | None:
     if not files:
         raise ValueError("更新配置缺少 files 文件清单")
 
+    if not _is_version_newer(latest_version, APP_VERSION):
+        return None
+
     notes = str(manifest.get("notes") or manifest.get("message") or "").strip()
     changed_files = _changed_update_files(files)
-    if not _is_version_newer(latest_version, APP_VERSION) and not changed_files:
-        return None
     if not changed_files:
         return None
     return UpdateInfo(latest_version, notes, changed_files)

@@ -437,11 +437,15 @@ class MaoerApi:
             drama = {}
         title = _text(drama.get("name") or drama.get("drama_name") or drama.get("title") or drama_id)
         resolved_drama_id = _to_int(drama.get("id"), int(drama_id)) or int(drama_id)
+        pay_type = _to_int(drama.get("pay_type"))
+        need_pay = _to_bool(drama.get("need_pay"))
+        if pay_type == DRAMA_PAY_TYPE_WHOLE and self._is_full_drama_purchased(resolved_drama_id):
+            need_pay = False
         return DramaPurchaseInfo(
             drama_id=resolved_drama_id,
             title=title,
-            pay_type=_to_int(drama.get("pay_type")),
-            need_pay=_to_bool(drama.get("need_pay")),
+            pay_type=pay_type,
+            need_pay=need_pay,
             price=_to_int(drama.get("price")),
             raw=drama,
         )
@@ -453,14 +457,7 @@ class MaoerApi:
         if not isinstance(sound, dict):
             sound = {}
 
-        drama_id = (
-            _to_int(sound.get("drama_id") or sound.get("dramaid"))
-            or item.drama_id
-            or self._first_int_value(
-                sound,
-                ("drama_id", "dramaId", "radio_drama_id", "radioDramaId", "mdrama_id"),
-            )
-        )
+        drama_id = self._raw_drama_id(sound) or item.drama_id or self._raw_drama_id(item.raw)
         if drama_id is None:
             drama_id = self.item_drama_id(item)
 
@@ -471,6 +468,8 @@ class MaoerApi:
         sound_need_pay = _optional_bool(sound, "need_pay")
         if sound_need_pay is None:
             sound_need_pay = item.need_pay
+        if self._is_full_drama_purchased(drama.drama_id):
+            sound_need_pay = False
         return SoundPurchaseInfo(
             sound_id=item.id,
             title=title,
@@ -1404,14 +1403,61 @@ class MaoerApi:
         if not purchased_ids:
             return items
 
+        result: list[MediaItem] = []
         for item in items:
-            if item.kind != "drama" or item.id not in purchased_ids:
+            drama_id = self._item_full_drama_purchase_id(item)
+            if drama_id not in purchased_ids:
+                result.append(item)
                 continue
+
+            if item.kind == "drama_purchase":
+                continue
+
             raw = dict(item.raw) if isinstance(item.raw, dict) else {}
             raw["_purchased_drama"] = True
             raw["_purchased_full_drama"] = True
             item.raw = raw
-        return items
+
+            if item.kind == "sound":
+                item.drama_id = drama_id
+                item.need_pay = False
+            elif item.kind == "drama":
+                item.need_pay = False
+            result.append(item)
+        return result
+
+    def _item_full_drama_purchase_id(self, item: MediaItem) -> int | None:
+        if item.kind in {"drama", "drama_purchase"}:
+            return item.drama_id or item.id
+        if item.kind == "sound":
+            return item.drama_id or self._raw_drama_id(item.raw)
+        return None
+
+    def _raw_drama_id(self, value: Any) -> int | None:
+        if not isinstance(value, dict):
+            return None
+
+        drama_id = self._first_int_value(
+            value,
+            ("drama_id", "dramaId", "dramaid", "radio_drama_id", "radioDramaId", "mdrama_id", "mdramaId"),
+        )
+        if drama_id is not None:
+            return drama_id
+
+        for key in ("drama", "drama_info", "radio_drama", "radioDrama", "mdrama"):
+            nested = value.get(key)
+            if not isinstance(nested, dict):
+                continue
+            drama_id = self._first_direct_int_value(
+                nested,
+                ("id", "drama_id", "dramaId", "dramaid", "radio_drama_id", "radioDramaId", "mdrama_id", "mdramaId"),
+            )
+            if drama_id is not None:
+                return drama_id
+        return None
+
+    def _is_full_drama_purchased(self, drama_id: int | None) -> bool:
+        return drama_id is not None and int(drama_id) in self._purchased_full_drama_ids()
 
     def _purchased_full_drama_ids(self) -> set[int]:
         if not self.cookie_header:
@@ -1421,11 +1467,19 @@ class MaoerApi:
 
         purchased_ids: set[int] = set()
         try:
-            for item in self.purchased_dramas(page=1, page_size=100):
-                if isinstance(item.raw, dict) and item.raw.get("_purchased_full_drama"):
-                    purchased_ids.add(item.id)
+            page_size = 100
+            for page in range(1, 21):
+                page_items = self.purchased_dramas(page=page, page_size=page_size)
+                if not page_items:
+                    break
+                for item in page_items:
+                    if isinstance(item.raw, dict) and item.raw.get("_purchased_full_drama"):
+                        purchased_ids.add(item.id)
+                if len(page_items) < page_size:
+                    break
         except (ApiError, requests.RequestException, ValueError):
-            purchased_ids = set()
+            if not purchased_ids:
+                purchased_ids = set()
 
         self._purchased_full_drama_ids_cache = purchased_ids
         return purchased_ids
@@ -1468,11 +1522,13 @@ class MaoerApi:
             drama = {}
         drama_name = _text(drama.get("name"))
         episodes = info.get("episodes") or {}
+        force_owned = self._is_full_drama_purchased(drama_id)
 
         items: list[MediaItem] = []
-        purchase_item = self._drama_purchase_item(drama, drama_id)
-        if purchase_item:
-            items.append(purchase_item)
+        if not force_owned:
+            purchase_item = self._drama_purchase_item(drama, drama_id)
+            if purchase_item:
+                items.append(purchase_item)
 
         for group_key, group_label in (
             ("episode", "正剧"),
@@ -1493,7 +1549,7 @@ class MaoerApi:
                         title=title,
                         subtitle=f"{drama_name} / {group_label}" if drama_name else group_label,
                         duration_ms=_duration_ms(episode.get("duration")),
-                        need_pay=_to_bool(episode.get("need_pay")),
+                        need_pay=False if force_owned else _to_bool(episode.get("need_pay")),
                         pay_type=pay_type,
                         price=price,
                         drama_id=drama_id,
@@ -1513,6 +1569,7 @@ class MaoerApi:
         drama = detail_info.get("drama") or {}
         if not isinstance(drama, dict):
             drama = {}
+        force_owned = force_owned or self._is_full_drama_purchased(drama_id)
         episode_lookup = self._drama_episode_lookup(detail_info)
         data = self._get(
             "/dramaapi/getdramaepisodedetails",
@@ -1548,6 +1605,8 @@ class MaoerApi:
             return None
 
         resolved_drama_id = _to_int(drama.get("id"), int(drama_id)) or int(drama_id)
+        if self._is_full_drama_purchased(resolved_drama_id):
+            return None
         price = _to_int(drama.get("price"))
         drama_name = _text(drama.get("name") or drama.get("drama_name") or drama.get("title") or resolved_drama_id)
         title = f"购买本剧（{price} 钻石）" if price is not None else "购买本剧"
@@ -1701,17 +1760,19 @@ class MaoerApi:
         info = data.get("info") or {}
         sound = info.get("sound") or {}
         title = _text(sound.get("soundstr") or item.title)
+        drama_id = item.drama_id or self._raw_drama_id(sound) or self._raw_drama_id(item.raw)
+        full_drama_purchased = self._is_full_drama_purchased(drama_id)
 
         url = _text(sound.get("soundurl") or sound.get("soundurl_128"))
         if not url:
-            if _to_bool(sound.get("need_pay")):
+            if _to_bool(sound.get("need_pay")) and not full_drama_purchased:
                 raise PurchaseRequired(f"《{title}》需要购买后才能播放。")
 
         return PlaybackInfo(
             sound_id=item.id,
             title=title,
             url=url,
-            drama_id=item.drama_id,
+            drama_id=drama_id,
             page_url=f"{BASE_URL}/sound/player?id={item.id}",
             drm=self._is_bili_drm_sound(sound),
             duration_ms=_duration_ms(sound.get("duration")) or item.duration_ms,
@@ -1736,15 +1797,20 @@ class MaoerApi:
         if sound_id is None:
             return None
         pay_type = _to_int(sound.get("pay_type"))
+        drama_id = self._raw_drama_id(sound)
+        need_pay = _to_bool(sound.get("need_pay"))
+        if self._is_full_drama_purchased(drama_id):
+            need_pay = False
         return MediaItem(
             kind="sound",
             id=sound_id,
             title=_text(sound.get("soundstr") or sound.get("title") or sound_id),
             subtitle=subtitle,
             duration_ms=_duration_ms(sound.get("duration")),
-            need_pay=_to_bool(sound.get("need_pay")),
+            need_pay=need_pay,
             pay_type=pay_type,
             price=_to_int(sound.get("price")),
+            drama_id=drama_id,
             album_id=album_id,
             raw=sound,
         )
