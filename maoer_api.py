@@ -74,6 +74,7 @@ class PlaybackInfo:
     page_url: str | None = None
     drm: bool = False
     duration_ms: int | None = None
+    subtitle_url: str = ""
 
 
 @dataclass(slots=True)
@@ -704,7 +705,7 @@ class MaoerApi:
             page_size=page_size,
         )
 
-    def sound_danmaku(self, sound_id: int) -> list[DanmakuItem]:
+    def sound_danmaku(self, sound_id: int, subtitle_url: str | None = None) -> list[DanmakuItem]:
         xml_text = self._get_text("/sound/getdm", {"soundid": int(sound_id)})
         try:
             root = ET.fromstring(xml_text)
@@ -729,10 +730,41 @@ class MaoerApi:
                     danmaku_id=parts[7] if len(parts) > 7 else "",
                 )
             )
+
+        if subtitle_url is None:
+            data = self._get("/sound/getsound", {"soundid": int(sound_id)})
+            subtitle_url = _text(((data.get("info") or {}).get("sound") or {}).get("subtitle_url"))
+        if subtitle_url:
+            try:
+                subtitle_data = json.loads(self._get_text(subtitle_url))
+            except json.JSONDecodeError as exc:
+                raise ApiError(f"字幕数据解析失败: {exc}") from exc
+            if not isinstance(subtitle_data, list):
+                raise ApiError("字幕数据格式不正确")
+            for subtitle in subtitle_data:
+                if not isinstance(subtitle, dict):
+                    continue
+                role = _text(subtitle.get("role")).strip()
+                content = _text(subtitle.get("content")).strip()
+                text = f"{role}：{content}" if role and content else role or content
+                if not text:
+                    continue
+                items.append(
+                    DanmakuItem(
+                        time=_to_float(subtitle.get("start_time")) / 1000.0,
+                        text=text,
+                        mode=DANMAKU_MODE_SUBTITLE,
+                        color=_to_int(subtitle.get("color"), 0) or 0,
+                    )
+                )
         return sorted(items, key=lambda item: item.time)
 
-    def sound_subtitles(self, sound_id: int) -> list[DanmakuItem]:
-        return [item for item in self.sound_danmaku(sound_id) if item.mode == DANMAKU_MODE_SUBTITLE]
+    def sound_subtitles(self, sound_id: int, subtitle_url: str | None = None) -> list[DanmakuItem]:
+        return [
+            item
+            for item in self.sound_danmaku(sound_id, subtitle_url=subtitle_url)
+            if item.mode == DANMAKU_MODE_SUBTITLE
+        ]
 
     def comments(
         self,
@@ -1776,6 +1808,7 @@ class MaoerApi:
             page_url=f"{BASE_URL}/sound/player?id={item.id}",
             drm=self._is_bili_drm_sound(sound),
             duration_ms=_duration_ms(sound.get("duration")) or item.duration_ms,
+            subtitle_url=_text(sound.get("subtitle_url")),
         )
 
     def add_play_times(self, playback: PlaybackInfo) -> None:

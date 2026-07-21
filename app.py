@@ -938,14 +938,14 @@ class PlaybackFrame(wx.Frame):
         self.danmaku_canvas.reset("正在加载弹幕...")
         self.danmaku_canvas.set_playback_rate(self.playback_rate)
         self.player.play(playback)
-        self._load_danmaku(playback.sound_id, generation)
+        self._load_danmaku(playback.sound_id, playback.subtitle_url, generation)
         wx.CallLater(500, self._sync_playback_status, generation)
         wx.CallAfter(self.SetFocus)
 
-    def _load_danmaku(self, sound_id: int, generation: int) -> None:
+    def _load_danmaku(self, sound_id: int, subtitle_url: str, generation: int) -> None:
         def runner() -> None:
             try:
-                items = self.api.sound_danmaku(sound_id)
+                items = self.api.sound_danmaku(sound_id, subtitle_url=subtitle_url)
             except (ApiError, requests.RequestException, ValueError) as exc:
                 wx.CallAfter(self._set_danmaku_failed, generation, str(exc))
             except Exception as exc:
