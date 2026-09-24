@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
@@ -17,7 +18,6 @@ class PlayerUnavailable(RuntimeError):
     pass
 
 
-WEBVIEW_AUDIO_PROCESS_NAMES = ("msedgewebview2.exe", "webview2", "missevan.com")
 MIN_PLAYBACK_RATE = 0.5
 MAX_PLAYBACK_RATE = 2.0
 ScriptCallback = Callable[[dict[str, object] | None], None]
@@ -877,12 +877,26 @@ CONTROL_SCRIPT = r"""
       var item = currentMedia();
       setVolume(value);
 
-      if (sound && sound.playState === 0 && typeof sound.play === "function") {
-        sound.play();
-        return result({ok: true, target: "soundDemo"});
-      }
-      if (item && item.paused) {
+      // The site's buttons toggle playback. Never click one when a player is
+      // already available: a fast/cached page may already be playing.
+      if (item) {
+        if (!item.paused && !item.ended) {
+          return result({ok: true, playing: item.currentTime > 0, target: "media"});
+        }
         return result({ok: playMedia(item), target: "media"});
+      }
+      if (sound) {
+        if (sound.playState === 1 && !sound.paused) {
+          return result({ok: true, playing: sound.position > 0, target: "soundDemo"});
+        }
+        if (sound.paused && typeof sound.resume === "function") {
+          sound.resume();
+          return result({ok: true, target: "soundDemo"});
+        }
+        if (typeof sound.play === "function") {
+          sound.play();
+          return result({ok: true, target: "soundDemo"});
+        }
       }
       if (!window.__maoer_hidden_player_clicked_autoplay && click("#centerplaybtn")) {
         window.__maoer_hidden_player_clicked_autoplay = true;
@@ -991,8 +1005,14 @@ class HiddenBrowserPlayer:
         self._cookie_primer_generation = 0
         self._script_callbacks: dict[int, tuple[str, ScriptCallback]] = {}
         self._next_script_callback_id = 1
+        self._autoplay_generation: int | None = None
+        self._autoplay_timer: wx.CallLater | None = None
+        self._system_volume_lock = threading.Lock()
+        self._pending_system_volume: int | None = None
+        self._system_volume_running = False
 
     def play(self, playback: PlaybackInfo) -> None:
+        self._cancel_autoplay_timer()
         page_url = playback.page_url or f"https://www.missevan.com/sound/player?id={playback.sound_id}"
         debug_log(f"play sound_id={playback.sound_id} title={playback.title!r} url={page_url}")
         webview = self._ensure_webview()
@@ -1064,6 +1084,7 @@ class HiddenBrowserPlayer:
         wx.CallLater(1200, self._expire_script_callback, callback_id)
 
     def stop(self) -> None:
+        self._cancel_autoplay_timer()
         if self._webview is None:
             return
         self._suppress_autoplay = True
@@ -1087,8 +1108,7 @@ class HiddenBrowserPlayer:
         return self._volume
 
     def _apply_volume(self, volume: int) -> None:
-        changed = set_current_app_volume(volume, include_process_names=WEBVIEW_AUDIO_PROCESS_NAMES)
-        debug_log(f"apply_volume immediate volume={volume} audio_session_changed={changed}")
+        self._queue_system_volume(volume)
         self._run_control("volume", volume)
         wx.CallLater(250, self._apply_volume_if_current, volume)
         wx.CallLater(900, self._apply_volume_if_current, volume)
@@ -1097,9 +1117,34 @@ class HiddenBrowserPlayer:
         if self._webview is None or volume != self._volume:
             debug_log(f"apply_volume delayed skip requested={volume} current={self._volume} webview={self._webview is not None}")
             return
-        changed = set_current_app_volume(volume, include_process_names=WEBVIEW_AUDIO_PROCESS_NAMES)
-        debug_log(f"apply_volume delayed volume={volume} audio_session_changed={changed}")
+        self._queue_system_volume(volume)
         self._run_control("volume", volume)
+
+    def _queue_system_volume(self, volume: int) -> None:
+        # Core Audio can block while enumerating devices. Coalesce changes on a
+        # worker and let the UI keep processing input and WebView callbacks.
+        with self._system_volume_lock:
+            self._pending_system_volume = volume
+            if self._system_volume_running:
+                return
+            self._system_volume_running = True
+        threading.Thread(target=self._system_volume_worker, daemon=True).start()
+
+    def _system_volume_worker(self) -> None:
+        while True:
+            with self._system_volume_lock:
+                volume = self._pending_system_volume
+                self._pending_system_volume = None
+                if volume is None:
+                    self._system_volume_running = False
+                    return
+            try:
+                # Descendant PIDs include our WebView. Matching every process
+                # called msedgewebview2.exe also changes other applications.
+                changed = set_current_app_volume(volume)
+                debug_log(f"system volume={volume} audio_session_changed={changed}")
+            except Exception as exc:
+                debug_log(f"system volume failed: {type(exc).__name__}: {exc}")
 
     def _ensure_webview(self) -> html2.WebView:
         if self._webview is not None:
@@ -1242,6 +1287,21 @@ class HiddenBrowserPlayer:
         event.Skip()
 
     def _schedule_autoplay(self, generation: int, attempts: int = 12) -> None:
+        if self._autoplay_generation == generation:
+            return
+        if generation != self._load_generation or self._current is None or self._suppress_autoplay:
+            return
+        self._autoplay_generation = generation
+        self._run_control("guard", self._single_sound_guard_options())
+        self._autoplay_step(generation, attempts)
+
+    def _cancel_autoplay_timer(self) -> None:
+        if self._autoplay_timer is not None:
+            self._autoplay_timer.Stop()
+            self._autoplay_timer = None
+
+    def _autoplay_step(self, generation: int, attempts: int) -> None:
+        self._autoplay_timer = None
         if attempts <= 0 or generation != self._load_generation or self._current is None or self._suppress_autoplay:
             debug_log(
                 "autoplay skip "
@@ -1250,11 +1310,16 @@ class HiddenBrowserPlayer:
             )
             return
 
-        changed = set_current_app_volume(self._volume, include_process_names=WEBVIEW_AUDIO_PROCESS_NAMES)
-        debug_log(f"autoplay attempt={13 - attempts} volume={self._volume} audio_session_changed={changed}")
-        self._run_control("guard", self._single_sound_guard_options())
-        self._run_control("autoplay", self._volume)
-        wx.CallLater(800, self._schedule_autoplay, generation, attempts - 1)
+        def done(result: dict[str, object] | None) -> None:
+            if generation != self._load_generation or self._current is None or self._suppress_autoplay:
+                return
+            if result and result.get("ok") and result.get("playing"):
+                self._apply_volume(self._volume)
+                return
+            if attempts > 1:
+                self._autoplay_timer = wx.CallLater(800, self._autoplay_step, generation, attempts - 1)
+
+        self._run_control_callback("autoplay", self._volume, done)
 
     def _single_sound_guard_script(self) -> str:
         return f"{CONTROL_SCRIPT}({json.dumps('guard')}, {json.dumps(self._single_sound_guard_options())});"

@@ -13,7 +13,7 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[(webview2_loader, 'wx')],
-    datas=[],
+    datas=[('assets/startup_mia.wav', 'assets'), ('热键表.txt', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

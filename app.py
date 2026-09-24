@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 import re
@@ -13,6 +13,7 @@ import requests
 import wx
 
 from app_paths import clear_webview2_profile
+from app_settings import AppSettings, load_settings, save_settings
 from browser_player import (
     HiddenBrowserPlayer,
     PlayerUnavailable,
@@ -29,6 +30,7 @@ from maoer_api import (
     DRAMA_PAY_TYPE_EPISODES,
     DRAMA_PAY_TYPE_WHOLE,
     DanmakuItem,
+    DramaFollowResult,
     DramaPurchaseInfo,
     DrmUnsupported,
     MaoerApi,
@@ -39,13 +41,14 @@ from maoer_api import (
     PurchaseRequired,
     SoundPurchaseInfo,
 )
+from startup_sound import play_startup_sound
 from uia_live_region import ScreenReaderAnnouncer
 from updater import handle_update_cli, run_startup_update_check
 from _build_info import APP_VERSION
 
 
 APP_TITLE = "猫耳FM"
-APP_AUTHOR = "欢喜就好"
+APP_AUTHOR = "欢喜就好&谷雨"
 HOTKEYS_TEXT_NAME = "热键表.txt"
 UPDATE_TEXT_NAME = "update.txt"
 
@@ -77,6 +80,7 @@ class NavigationState:
     page_state: PageState | None
     top_index: int
     hide_detail_column: bool
+    opened_drama_id: int | None = None
 
 
 @dataclass
@@ -93,9 +97,9 @@ class CommentWindowState:
     top_index: int
 
 
-class DramaDetailDialog(wx.Dialog):
-    def __init__(self, parent: wx.Window, title: str, content: str) -> None:
-        super().__init__(parent, title=f"广播剧详情 - {title}", size=(660, 480))
+class MediaDetailDialog(wx.Dialog):
+    def __init__(self, parent: wx.Window, title: str, content: str, detail_kind: str) -> None:
+        super().__init__(parent, title=f"{detail_kind} - {title}", size=(660, 480))
         panel = wx.Panel(self)
         root = wx.BoxSizer(wx.VERTICAL)
 
@@ -895,6 +899,8 @@ class PlaybackFrame(wx.Frame):
         player: HiddenBrowserPlayer,
         on_closed: Callable[["PlaybackFrame"], None],
         on_finished: Callable[["PlaybackFrame", PlaybackInfo], None],
+        read_danmaku_default: bool = False,
+        read_subtitle_default: bool = False,
     ) -> None:
         super().__init__(parent, title="", size=(760, 480))
         self.api = api
@@ -903,8 +909,8 @@ class PlaybackFrame(wx.Frame):
         self.on_finished = on_finished
         self.playback: PlaybackInfo | None = None
         self.load_generation = 0
-        self.read_danmaku_enabled = False
-        self.read_subtitle_enabled = False
+        self.read_danmaku_enabled = read_danmaku_default
+        self.read_subtitle_enabled = read_subtitle_default
         self.time_announcement_generation = 0
         self.rate_change_generation = 0
         self.playback_rate = 1.0
@@ -1247,6 +1253,7 @@ class MaoerFrame(wx.Frame):
         self.browser_player = HiddenBrowserPlayer(self, cookie=self.api.cookie_header)
         self.active_player: HiddenBrowserPlayer | None = None
         self.player_frame: PlaybackFrame | None = None
+        self.settings: AppSettings = load_settings()
         self.items: list[MediaItem] = []
         self.current_title = ""
         self.page_state: PageState | None = None
@@ -1257,6 +1264,10 @@ class MaoerFrame(wx.Frame):
         self.last_mouse_context_menu_at = 0.0
         self.account_logged_in = bool(self.api.cookie_header)
         self.current_playback_key: tuple[str, int] | None = None
+        self._vip_catalog_request: object | None = None
+        self._content_feature_request: object | None = None
+        self._opened_drama_id: int | None = None
+        self._publisher_request: object = object()
 
         self._build_ui()
         self._build_menu()
@@ -1273,7 +1284,7 @@ class MaoerFrame(wx.Frame):
         self.list_label = wx.StaticText(panel, label="项目")
         self.list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL | wx.BORDER_SUNKEN)
         self.list.InsertColumn(0, "名称")
-        self.list.InsertColumn(1, "作者")
+        self.list.InsertColumn(1, "发布")
 
         search_row = wx.BoxSizer(wx.HORIZONTAL)
         self.search_label = wx.StaticText(panel, label="搜索")
@@ -1288,8 +1299,11 @@ class MaoerFrame(wx.Frame):
         self.list.SetName("项目")
         self.list.MoveBeforeInTabOrder(self.search_box)
 
+        list_header = wx.BoxSizer(wx.HORIZONTAL)
+        list_header.Add(self.list_label, 0, wx.ALIGN_CENTER_VERTICAL)
+
         root.Add(search_row, 0, wx.EXPAND | wx.ALL, 10)
-        root.Add(self.list_label, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        root.Add(list_header, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         root.Add(self.list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         panel.SetSizer(root)
         self.CreateStatusBar()
@@ -1303,9 +1317,25 @@ class MaoerFrame(wx.Frame):
         self.account_logout_menu_id = wx.NewIdRef()
         self.account_exit_menu_id = wx.NewIdRef()
         self.content_categories_menu_id = wx.NewIdRef()
+        self.content_books_menu_id = wx.NewIdRef()
+        self.content_drama_index_menu_id = wx.NewIdRef()
+        self.content_drama_timeline_menu_id = wx.NewIdRef()
+        self.content_drama_following_menu_id = wx.NewIdRef()
+        self.content_drama_all_menu_id = wx.NewIdRef()
+        self.content_drama_finished_menu_id = wx.NewIdRef()
+        self.content_drama_ongoing_menu_id = wx.NewIdRef()
+        self.content_weekly_menu_id = wx.NewIdRef()
+        self.vip_free_dramas_menu_id = wx.NewIdRef()
+        self.vip_discount_dramas_menu_id = wx.NewIdRef()
+        self.settings_startup_sound_menu_id = wx.NewIdRef()
+        self.settings_subtitle_menu_id = wx.NewIdRef()
+        self.settings_danmaku_menu_id = wx.NewIdRef()
         self.help_hotkeys_menu_id = wx.NewIdRef()
         self.help_update_log_menu_id = wx.NewIdRef()
         self.help_about_menu_id = wx.NewIdRef()
+        self.item_detail_shortcut_id = wx.NewIdRef()
+        self.item_comments_shortcut_id = wx.NewIdRef()
+        self.item_browser_shortcut_id = wx.NewIdRef()
         self._update_account_menu()
 
     def _update_account_menu(self) -> None:
@@ -1327,7 +1357,37 @@ class MaoerFrame(wx.Frame):
 
         content_menu = wx.Menu()
         content_menu.Append(self.content_categories_menu_id, "分类(&C)")
+        content_menu.AppendSeparator()
+        content_menu.Append(self.content_books_menu_id, "听书(&B)")
+        drama_menu = wx.Menu()
+        drama_menu.Append(self.content_drama_index_menu_id, "索引(&I)")
+        drama_menu.Append(self.content_drama_timeline_menu_id, "时间表(&T)")
+        drama_menu.Append(self.content_drama_following_menu_id, "我的追剧(&S)")
+        drama_menu.AppendSeparator()
+        drama_menu.Append(self.content_drama_all_menu_id, "查看全部(&A)")
+        drama_menu.Append(self.content_drama_finished_menu_id, "完结(&F)")
+        drama_menu.Append(self.content_drama_ongoing_menu_id, "未完结(&O)")
+        content_menu.AppendSubMenu(drama_menu, "广播剧(&D)")
+        content_menu.Append(self.content_weekly_menu_id, "精品周更(&W)")
         menu_bar.Append(content_menu, "内容(&C)")
+
+        vip_menu = wx.Menu()
+        vip_menu.Append(self.vip_free_dramas_menu_id, "会员限免剧(&F)")
+        vip_menu.Append(self.vip_discount_dramas_menu_id, "会员折扣剧(&D)")
+        menu_bar.Append(vip_menu, "会员(&V)")
+
+        settings_menu = wx.Menu()
+        settings_menu.AppendCheckItem(self.settings_startup_sound_menu_id, "播放启动音效(&M)").Check(
+            self.settings.startup_sound
+        )
+        settings_menu.AppendSeparator()
+        settings_menu.AppendCheckItem(self.settings_subtitle_menu_id, "默认朗读字幕(&F)").Check(
+            self.settings.read_subtitle
+        )
+        settings_menu.AppendCheckItem(self.settings_danmaku_menu_id, "默认朗读弹幕(&D)").Check(
+            self.settings.read_danmaku
+        )
+        menu_bar.Append(settings_menu, "设置(&S)")
 
         help_menu = wx.Menu()
         help_menu.Append(self.help_hotkeys_menu_id, "热键表(&H)")
@@ -1359,9 +1419,34 @@ class MaoerFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_account_logout, id=self.account_logout_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_exit, id=self.account_exit_menu_id)
         self.Bind(wx.EVT_MENU, self.on_content_categories, id=self.content_categories_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_content_books, id=self.content_books_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_content_drama_index, id=self.content_drama_index_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_content_drama_timeline, id=self.content_drama_timeline_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_content_drama_following, id=self.content_drama_following_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_content_drama_all, id=self.content_drama_all_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_content_drama_finished, id=self.content_drama_finished_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_content_drama_ongoing, id=self.content_drama_ongoing_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_content_weekly, id=self.content_weekly_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_vip_free_dramas, id=self.vip_free_dramas_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_vip_discount_dramas, id=self.vip_discount_dramas_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_setting_changed, id=self.settings_startup_sound_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_setting_changed, id=self.settings_subtitle_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_setting_changed, id=self.settings_danmaku_menu_id)
         self.Bind(wx.EVT_MENU, self.on_help_hotkeys, id=self.help_hotkeys_menu_id)
         self.Bind(wx.EVT_MENU, self.on_help_update_log, id=self.help_update_log_menu_id)
         self.Bind(wx.EVT_MENU, self.on_help_about, id=self.help_about_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_item_detail_shortcut, id=self.item_detail_shortcut_id)
+        self.Bind(wx.EVT_MENU, self.on_item_comments_shortcut, id=self.item_comments_shortcut_id)
+        self.Bind(wx.EVT_MENU, self.on_item_browser_shortcut, id=self.item_browser_shortcut_id)
+        self.SetAcceleratorTable(wx.AcceleratorTable([
+            (modifiers, key, item_id)
+            for key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER)
+            for modifiers, item_id in (
+                (wx.ACCEL_SHIFT, self.item_detail_shortcut_id),
+                (wx.ACCEL_ALT, self.item_comments_shortcut_id),
+                (wx.ACCEL_ALT | wx.ACCEL_SHIFT, self.item_browser_shortcut_id),
+            )
+        ]))
         self.Bind(wx.EVT_CHAR_HOOK, self.on_char_hook)
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
@@ -1420,8 +1505,160 @@ class MaoerFrame(wx.Frame):
             ),
         )
 
+    def on_content_books(self, _event: wx.Event) -> None:
+        self._open_content_feature("books", "听书")
+
+    def on_content_weekly(self, _event: wx.Event) -> None:
+        self._open_content_feature("weekly", "精品周更")
+
+    def on_content_drama_index(self, _event: wx.Event) -> None:
+        self._run_background(
+            "正在加载广播剧索引...",
+            self.api.drama_index_facets,
+            self._show_drama_index_dialog,
+        )
+
+    def _show_drama_index_dialog(self, facets: list[tuple[str, list[tuple[int, str]]]]) -> None:
+        dialog = wx.Dialog(self, title="广播剧索引", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        root = wx.BoxSizer(wx.VERTICAL)
+        root.Add(wx.StaticText(dialog, label="选择筛选条件，可组合使用："), 0, wx.ALL, 12)
+        selectors: list[tuple[wx.Choice, list[tuple[int, str]]]] = []
+        for label, options in facets:
+            row = wx.BoxSizer(wx.HORIZONTAL)
+            row.Add(wx.StaticText(dialog, label=label), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
+            choice = wx.Choice(dialog, choices=[name for _, name in options])
+            choice.SetName(label)
+            choice.SetSelection(next((index for index, (option_id, _) in enumerate(options) if option_id == 0), 0))
+            row.Add(choice, 1, wx.EXPAND)
+            root.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
+            selectors.append((choice, options))
+        buttons = dialog.CreateSeparatedButtonSizer(wx.OK | wx.CANCEL)
+        if buttons is not None:
+            root.Add(buttons, 0, wx.EXPAND | wx.ALL, 12)
+        dialog.SetSizerAndFit(root)
+        dialog.SetMinSize((420, dialog.GetSize().height))
+        if selectors:
+            selectors[0][0].SetFocus()
+        selected: list[tuple[int, str]] | None = None
+        try:
+            if dialog.ShowModal() == wx.ID_OK:
+                selected = [options[choice.GetSelection()] for choice, options in selectors]
+        finally:
+            dialog.Destroy()
+        if selected is None:
+            return
+        filters = "_".join(str(option_id) for option_id, _ in selected)
+        labels = [name for option_id, name in selected if option_id != 0]
+        title = "广播剧 · 索引" + ("：" + " / ".join(labels) if labels else "")
+        self._open_content_feature(
+            "drama_index_results",
+            title,
+            loader=lambda page: self.api.drama_filter_items(filters, page),
+        )
+
+    def on_content_drama_timeline(self, _event: wx.Event) -> None:
+        self._open_content_feature("drama_timeline", "广播剧 · 时间表")
+
+    def on_content_drama_following(self, _event: wx.Event) -> None:
+        self._open_content_feature("drama_following", "广播剧 · 我的追剧")
+
+    def on_content_drama_all(self, _event: wx.Event) -> None:
+        self._open_content_feature("drama_all", "广播剧 · 查看全部")
+
+    def on_content_drama_finished(self, _event: wx.Event) -> None:
+        self._open_content_feature("drama_finished", "广播剧 · 完结")
+
+    def on_content_drama_ongoing(self, _event: wx.Event) -> None:
+        self._open_content_feature("drama_ongoing", "广播剧 · 未完结")
+
+    def _open_content_feature(
+        self,
+        kind: str,
+        title: str,
+        loader: Callable[[int], list[MediaItem]] | None = None,
+    ) -> None:
+        previous_state = self._navigation_state_snapshot()
+        previous_items = self.items
+        request = self._content_feature_request = object()
+        load_page = loader or (lambda page: self.api.content_feature_items(kind, page))
+
+        def loaded(items: list[MediaItem]) -> None:
+            if self._content_feature_request is not request or self.items is not previous_items:
+                return
+            self._enter_items(
+                items,
+                title,
+                previous_state,
+                focus_list=True,
+                page_state=PageState(
+                    1,
+                    load_page,
+                    has_more=bool(items) and kind not in {"weekly", "drama_timeline"},
+                ),
+            )
+
+        self._run_background(
+            f"正在加载{title}...",
+            lambda: load_page(1),
+            loaded,
+        )
+
+    def on_vip_free_dramas(self, _event: wx.Event) -> None:
+        self._open_vip_dramas("free", "会员限免剧")
+
+    def on_vip_discount_dramas(self, _event: wx.Event) -> None:
+        self._open_vip_dramas("discount", "会员折扣剧")
+
+    def _open_vip_dramas(self, kind: str, title: str) -> None:
+        previous_state = self._navigation_state_snapshot()
+        previous_items = self.items
+        request = self._vip_catalog_request = object()
+
+        def loaded(items: list[MediaItem]) -> None:
+            if self._vip_catalog_request is not request or self.items is not previous_items:
+                return
+            self._enter_items(
+                items,
+                title,
+                previous_state,
+                focus_list=True,
+                page_state=PageState(1, lambda page: self.api.vip_dramas(kind, page), has_more=bool(items)),
+            )
+
+        self._run_background(
+            f"正在加载{title}...",
+            lambda: self.api.vip_dramas(kind, 1),
+            loaded,
+        )
+
+    def on_setting_changed(self, event: wx.CommandEvent) -> None:
+        setting = {
+            int(self.settings_startup_sound_menu_id): ("startup_sound", "启动音效"),
+            int(self.settings_subtitle_menu_id): ("read_subtitle", "字幕朗读"),
+            int(self.settings_danmaku_menu_id): ("read_danmaku", "弹幕朗读"),
+        }.get(event.GetId())
+        if setting is None:
+            return
+        name, label = setting
+        enabled = event.IsChecked()
+        updated = replace(self.settings, **{name: enabled})
+        try:
+            save_settings(updated)
+        except OSError as exc:
+            self.GetMenuBar().FindItemById(event.GetId()).Check(getattr(self.settings, name))
+            self.show_error(f"保存设置失败：{exc}")
+            return
+
+        self.settings = updated
+        if self.player_frame is not None:
+            if name == "read_subtitle":
+                self.player_frame.read_subtitle_enabled = enabled
+            elif name == "read_danmaku":
+                self.player_frame.read_danmaku_enabled = enabled
+        self.SetStatusText(f"{label}已{'开启' if enabled else '关闭'}，设置已保存")
+
     def on_help_hotkeys(self, _event: wx.Event) -> None:
-        self._open_text_file("热键表", HOTKEYS_TEXT_NAME)
+        self._open_text_file("热键表", HOTKEYS_TEXT_NAME, bundled=True)
 
     def on_help_update_log(self, _event: wx.Event) -> None:
         self._open_text_file("更新日志", UPDATE_TEXT_NAME)
@@ -1434,8 +1671,9 @@ class MaoerFrame(wx.Frame):
             self,
         )
 
-    def _open_text_file(self, title: str, filename: str) -> None:
-        path = program_dir() / filename
+    def _open_text_file(self, title: str, filename: str, bundled: bool = False) -> None:
+        directory = Path(__file__).resolve().parent if bundled else program_dir()
+        path = directory / filename
         if not path.exists():
             wx.MessageBox(f"未找到文件：{filename}", title, wx.OK | wx.ICON_ERROR, self)
             return
@@ -1754,7 +1992,13 @@ class MaoerFrame(wx.Frame):
 
     def _update_list_column_headers(self, title: str) -> None:
         name_label = "名称"
-        detail_label = "声音数" if title == "我的收藏" else "作者"
+        detail_label = "声音数" if title == "我的收藏" else "发布"
+        if title in {"精品周更", "广播剧 · 时间表"}:
+            name_label = "更新日 · 剧名"
+        if title == "广播剧 · 时间表":
+            detail_label = "最新更新"
+        if title in {"会员限免剧", "会员折扣剧"}:
+            detail_label = "会员权益"
         if self._items_are_categories():
             name_label = "分类"
             detail_label = ""
@@ -1780,6 +2024,8 @@ class MaoerFrame(wx.Frame):
         focus_list: bool = False,
         hide_detail_column: bool = False,
     ) -> None:
+        self._opened_drama_id = None
+        self._publisher_request = object()
         self.current_title = title
         self.items = []
         self.page_state = None
@@ -1796,38 +2042,73 @@ class MaoerFrame(wx.Frame):
         self.SetStatusText(f"正在加载{title}...")
 
     def _append_list_item(self, index: int, item: MediaItem) -> None:
-        self.list.InsertItem(index, item.title)
-        self.list.SetItem(index, 1, self._item_author(item))
+        self.list.InsertItem(index, self._display_item_title(item))
+        self.list.SetItem(index, 1, self._item_publisher(item))
 
-    def _item_author(self, item: MediaItem) -> str:
+    def _display_item_title(self, item: MediaItem) -> str:
+        title = item.title
+        if self.current_title in {"精品周更", "广播剧 · 时间表"} and isinstance(item.raw, dict):
+            day_key = "_weekly_day_label" if self.current_title == "精品周更" else "_timeline_day_label"
+            day = item.raw.get(day_key)
+            if isinstance(day, str) and day:
+                title = f"{day} · {title}"
+        if self._opened_drama_id is not None and item.kind == "sound" and item.need_pay:
+            raw = item.raw if isinstance(item.raw, dict) else {}
+            title += "（限免）" if raw.get("_member_vip_limited_free") else "（付费）"
+        return title
+
+    def _item_publisher(self, item: MediaItem) -> str:
         if self._hide_detail_column():
             return ""
         if item.kind == "drama_purchase":
             return ""
 
+        if self.current_title == "广播剧 · 时间表" and isinstance(item.raw, dict):
+            newest = self._raw_text_value(item.raw, ("newest",))
+            return newest or "更新内容未标注"
+
         raw = item.raw
         if isinstance(raw, dict):
-            if raw.get("_hide_author"):
+            if raw.get("_hide_author") and self.current_title in {"我的收藏", "会员限免剧", "会员折扣剧"}:
                 return item.subtitle
+            return self._raw_text_value(raw, ("_publisher_name", "username", "user_name"))
+        return ""
 
-            author = self._raw_text_value(
-                raw,
-                ("author", "author_name", "username", "user_name", "uname", "nickname", "nick_name"),
-            )
-            if author:
-                return author
+    def _uses_publisher_column(self) -> bool:
+        return (
+            not self._hide_detail_column()
+            and self.current_title not in {"我的收藏", "会员限免剧", "会员折扣剧", "广播剧 · 时间表"}
+        )
 
-            for key in ("user", "member", "owner", "creator", "profile"):
-                nested = raw.get(key)
-                if isinstance(nested, dict):
-                    author = self._raw_text_value(
-                        nested,
-                        ("name", "username", "user_name", "uname", "nickname", "nick_name"),
-                    )
-                    if author:
-                        return author
+    def _start_publisher_resolution(self, items: list[MediaItem]) -> None:
+        if not self._uses_publisher_column():
+            return
+        pending = [item for item in items if item.kind in {"sound", "drama", "album"} and not self._item_publisher(item)]
+        if not pending:
+            return
+        token = self._publisher_request
 
-        return item.subtitle
+        def runner() -> None:
+            for item in pending:
+                if self._publisher_request is not token:
+                    return
+                try:
+                    name = self.api.publisher_name_for_item(item)
+                except (ApiError, requests.RequestException, ValueError):
+                    continue
+                if isinstance(name, str) and name.strip():
+                    wx.CallAfter(self._apply_resolved_publisher, item, name.strip(), token)
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _apply_resolved_publisher(self, item: MediaItem, name: str, token: object) -> None:
+        if self._publisher_request is not token:
+            return
+        for index, current in enumerate(self.items):
+            if current is item:
+                item.raw = {**item.raw, "_publisher_name": name}
+                self.list.SetItem(index, 1, name)
+                return
 
     @staticmethod
     def _raw_text_value(raw: dict[str, object], keys: tuple[str, ...]) -> str:
@@ -1849,20 +2130,30 @@ class MaoerFrame(wx.Frame):
         if item.kind == "category":
             return
 
-        can_show_drama_menu = self._can_show_drama_menu(item)
+        can_show_item_menu = self._can_show_item_menu(item)
         can_show_comments_menu = self._can_show_comments_menu(item)
-        if not can_show_drama_menu and not can_show_comments_menu:
+        if not can_show_item_menu and not can_show_comments_menu:
             return
 
         menu = wx.Menu()
         open_id = wx.NewIdRef()
         detail_id = wx.NewIdRef()
         comments_id = wx.NewIdRef()
-        if can_show_drama_menu:
+        purchase_id = wx.NewIdRef()
+        follow_id = wx.NewIdRef()
+        purchase_label = self._drama_purchase_menu_label(item)
+        if can_show_item_menu:
             menu.Append(open_id, "用网页打开")
-            menu.Append(detail_id, "查看广播剧详情")
+            menu.Append(detail_id, "查看音频简介" if item.kind == "sound" else "查看广播剧详情")
+        if item.kind == "drama":
+            menu.AppendSeparator()
+            if purchase_label is not None:
+                menu.Append(purchase_id, purchase_label)
+            follow_label = "登录后追剧" if not self.api.cookie_header else self._drama_follow_menu_label(item)
+            follow_entry = menu.Append(follow_id, follow_label)
+            follow_entry.Enable(bool(self.api.cookie_header))
         if can_show_comments_menu:
-            if can_show_drama_menu:
+            if can_show_item_menu:
                 menu.AppendSeparator()
             menu.Append(comments_id, "查看评论")
 
@@ -1871,42 +2162,69 @@ class MaoerFrame(wx.Frame):
         finally:
             menu.Destroy()
 
-        if can_show_drama_menu and choice == int(open_id):
-            self.open_drama_in_browser(item)
-        elif can_show_drama_menu and choice == int(detail_id):
-            self.show_drama_detail(item)
+        if can_show_item_menu and choice == int(open_id):
+            self.open_item_in_browser(item)
+        elif can_show_item_menu and choice == int(detail_id):
+            if item.kind == "sound":
+                self.show_sound_intro(item)
+            else:
+                self.show_drama_detail(item)
+        elif item.kind == "drama" and purchase_label is not None and choice == int(purchase_id):
+            self._prompt_drama_purchase(item.id)
+        elif item.kind == "drama" and choice == int(follow_id):
+            self._follow_drama_from_work_menu(item)
         elif can_show_comments_menu and choice == int(comments_id):
             self.show_comments(item)
 
-    def _can_show_drama_menu(self, item: MediaItem) -> bool:
-        return item.kind in {"drama", "sound"} or item.drama_id is not None
+    @staticmethod
+    def _drama_purchase_menu_label(item: MediaItem) -> str | None:
+        if item.kind != "drama" or item.pay_type != DRAMA_PAY_TYPE_WHOLE:
+            return None
+        raw = item.raw if isinstance(item.raw, dict) else {}
+        if raw.get("_purchased_full_drama") or ("need_pay" in raw and not item.need_pay):
+            return None
+        return "购买本剧"
+
+    @staticmethod
+    def _drama_follow_menu_label(item: MediaItem) -> str:
+        raw = item.raw if isinstance(item.raw, dict) else {}
+        followed = str(raw.get("like", "")).strip().lower() in {"1", "true"}
+        return "取消追剧" if followed else "追剧"
+
+    def _can_show_item_menu(self, item: MediaItem) -> bool:
+        return item.kind in {"drama", "sound"}
 
     def _can_show_comments_menu(self, item: MediaItem) -> bool:
         return item.kind == "sound"
 
-    def open_drama_in_browser(self, item: MediaItem) -> None:
-        self._run_background(
-            f"正在打开广播剧: {item.title}",
-            lambda: self.api.item_drama_id(item),
-            lambda drama_id: self._launch_drama_url(item, int(drama_id)),
-        )
-
-    def _launch_drama_url(self, item: MediaItem, drama_id: int) -> None:
-        url = f"{BASE_URL}/mdrama/{drama_id}"
-        if item.kind == "drama" and item.pay_type is not None:
-            url += f"?pay_type={item.pay_type}"
+    def open_item_in_browser(self, item: MediaItem) -> None:
+        if item.kind == "sound":
+            url = f"{BASE_URL}/sound/player?id={item.id}"
+        elif item.kind == "drama":
+            url = f"{BASE_URL}/mdrama/{item.id}"
+            if item.pay_type is not None:
+                url += f"?pay_type={item.pay_type}"
+        else:
+            return
         if not wx.LaunchDefaultBrowser(url):
             self.show_error("无法打开浏览器")
+
+    def show_sound_intro(self, item: MediaItem) -> None:
+        self._run_background(
+            f"正在加载音频简介: {item.title}",
+            lambda: self.api.sound_intro_text(item.id),
+            lambda content: self._show_item_detail_dialog(item, str(content), "音频简介"),
+        )
 
     def show_drama_detail(self, item: MediaItem) -> None:
         self._run_background(
             f"正在加载广播剧详情: {item.title}",
-            lambda: self.api.drama_detail_text(self.api.item_drama_id(item)),
-            lambda content: self._show_drama_detail_dialog(item, str(content)),
+            lambda: self.api.drama_detail_text(item.id),
+            lambda content: self._show_item_detail_dialog(item, str(content), "广播剧详情"),
         )
 
-    def _show_drama_detail_dialog(self, item: MediaItem, content: str) -> None:
-        dialog = DramaDetailDialog(self, item.title, content)
+    def _show_item_detail_dialog(self, item: MediaItem, content: str, detail_kind: str) -> None:
+        dialog = MediaDetailDialog(self, item.title, content, detail_kind)
         try:
             dialog.ShowModal()
         finally:
@@ -1958,6 +2276,7 @@ class MaoerFrame(wx.Frame):
                             lambda page: self.api.drama_episodes_page(item.id, page, force_owned=force_owned),
                         ),
                         hide_detail_column=self.hide_list_detail_column,
+                        opened_drama_id=item.id,
                     ),
                 )
                 return
@@ -1988,7 +2307,7 @@ class MaoerFrame(wx.Frame):
             )
             return
 
-        if item.need_pay:
+        if item.need_pay and item.kind != "sound":
             self._prompt_sound_purchase(item)
             return
 
@@ -2125,9 +2444,9 @@ class MaoerFrame(wx.Frame):
 
     def _confirm_drama_purchase(self, info: DramaPurchaseInfo) -> bool:
         if info.price is None:
-            message = f"《{info.title}》需要购买后才能播放。\n未获取到价格，是否继续购买本剧？"
+            message = f"《{info.title}》未获取到价格，是否购买本剧？"
         else:
-            message = f"《{info.title}》需要购买后才能播放。\n是否花 {info.price} 钻石购买本剧？"
+            message = f"《{info.title}》价格为 {info.price} 钻石，是否购买？"
         return self._confirm_purchase(message, "购买广播剧")
 
     def _confirm_episode_purchase(
@@ -2137,9 +2456,9 @@ class MaoerFrame(wx.Frame):
         price: int | None,
     ) -> bool:
         if price is None:
-            message = f"《{item.title}》需要购买后才能播放。\n未获取到价格，是否继续购买这一集？"
+            message = f"《{item.title}》未获取到价格，是否购买这一集？"
         else:
-            message = f"《{item.title}》需要购买后才能播放。\n是否花 {price} 钻石购买这一集？"
+            message = f"《{item.title}》价格为 {price} 钻石，是否购买这一集？"
         if info.title:
             message = f"广播剧：{info.title}\n{message}"
         return self._confirm_purchase(message, "购买单集")
@@ -2204,10 +2523,25 @@ class MaoerFrame(wx.Frame):
             if item.kind == "drama_purchase" and item_drama_id == drama_id:
                 changed = True
                 continue
-            if item_drama_id == drama_id and item.need_pay:
+            if item_drama_id == drama_id:
+                if item.need_pay or not item.raw.get("_purchased_full_drama"):
+                    changed = True
                 item.need_pay = False
-                changed = True
+                item.raw = {**item.raw, "_purchased_full_drama": True}
             new_items.append(item)
+
+        for state in self.navigation_stack:
+            for item in state.items:
+                item_drama_id = item.drama_id or (item.id if item.kind == "drama" else None)
+                if item_drama_id == drama_id:
+                    item.need_pay = False
+                    item.raw = {**item.raw, "_purchased_full_drama": True}
+        if self.homepage_state is not None:
+            for item in self.homepage_state.items:
+                item_drama_id = item.drama_id or (item.id if item.kind == "drama" else None)
+                if item_drama_id == drama_id:
+                    item.need_pay = False
+                    item.raw = {**item.raw, "_purchased_full_drama": True}
 
         if not changed:
             return
@@ -2219,12 +2553,15 @@ class MaoerFrame(wx.Frame):
             selected_index=selected_index,
             top_index=top_index,
             hide_detail_column=self.hide_list_detail_column,
+            opened_drama_id=self._opened_drama_id,
         )
 
     def _mark_sound_purchased_in_items(self, sound_id: int) -> None:
-        for item in self.items:
+        for index, item in enumerate(self.items):
             if item.kind == "sound" and item.id == sound_id:
                 item.need_pay = False
+                item.raw = {**item.raw, "_purchased_sound": True}
+                self.list.SetItem(index, 0, self._display_item_title(item))
 
     def _set_root_items(
         self,
@@ -2247,6 +2584,7 @@ class MaoerFrame(wx.Frame):
             page_state=self.page_state,
             top_index=self._top_index(),
             hide_detail_column=self.hide_list_detail_column,
+            opened_drama_id=self._opened_drama_id,
         )
         if self.current_title == "首页":
             self.homepage_state = state
@@ -2260,10 +2598,17 @@ class MaoerFrame(wx.Frame):
         focus_list: bool = False,
         page_state: PageState | None = None,
         hide_detail_column: bool = False,
+        opened_drama_id: int | None = None,
     ) -> None:
         self.navigation_stack.append(previous_state)
         self.page_state = page_state
-        self.set_items(items, title, focus_list=focus_list, hide_detail_column=hide_detail_column)
+        self.set_items(
+            items,
+            title,
+            focus_list=focus_list,
+            hide_detail_column=hide_detail_column,
+            opened_drama_id=opened_drama_id,
+        )
 
     def set_items(
         self,
@@ -2273,10 +2618,13 @@ class MaoerFrame(wx.Frame):
         focus_list: bool = False,
         top_index: int | None = None,
         hide_detail_column: bool = False,
+        opened_drama_id: int | None = None,
     ) -> None:
         self.current_title = title
         self.items = items
         self.hide_list_detail_column = hide_detail_column
+        self._opened_drama_id = opened_drama_id
+        self._publisher_request = object()
         self._update_list_column_headers(title)
         self.list.Freeze()
         try:
@@ -2295,8 +2643,64 @@ class MaoerFrame(wx.Frame):
         if focus_list:
             wx.CallAfter(self._focus_list)
         self.SetStatusText(f"{title}，共 {len(items)} 项")
+        self._start_publisher_resolution(items)
         if self.page_state is not None:
             wx.CallAfter(self._load_next_page_if_near_bottom)
+
+    def _follow_drama_from_work_menu(self, item: MediaItem) -> None:
+        cookie = self.api.cookie_header
+        if not cookie:
+            self.show_error("需要登录后才能追剧")
+            return
+        drama_id = item.id
+        self._run_background(
+            f"正在查询追剧状态: {item.title}",
+            lambda: self.api.drama_follow_status(drama_id),
+            lambda followed: self._confirm_work_menu_follow(item, bool(followed), cookie),
+        )
+
+    def _confirm_work_menu_follow(self, item: MediaItem, followed: bool, cookie: str) -> None:
+        if self.api.cookie_header != cookie:
+            self.show_error("登录账号已变化，请重新追剧")
+            return
+        if followed and wx.MessageBox(
+            "确定取消追剧吗？",
+            "取消追剧",
+            wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION,
+            self,
+        ) != wx.YES:
+            return
+
+        target = not followed
+
+        def work() -> DramaFollowResult:
+            if self.api.cookie_header != cookie:
+                raise ApiError("登录账号已变化，请重新追剧")
+            return self.api.set_drama_follow_result(item.id, follow=target)
+
+        self._run_background(
+            "正在追剧..." if target else "正在取消追剧...",
+            work,
+            lambda result: self._finish_work_menu_follow(item, result, target, cookie),
+        )
+
+    def _finish_work_menu_follow(
+        self, item: MediaItem, result: DramaFollowResult, target: bool, cookie: str,
+    ) -> None:
+        if self.api.cookie_header != cookie:
+            return
+        if result.followed != target:
+            self.SetStatusText("服务端追剧状态未改变，请稍后重试")
+            return
+        item.raw = {**item.raw, "like": int(result.followed)}
+        message = result.message.strip() or ("已加入追剧列表" if target else "已移出追剧列表")
+        self.SetStatusText(message)
+        wx.MessageBox(
+            message,
+            "追剧成功" if target else "取消追剧",
+            wx.OK | wx.ICON_INFORMATION,
+            self,
+        )
 
     def _top_index(self) -> int:
         try:
@@ -2386,6 +2790,7 @@ class MaoerFrame(wx.Frame):
         if previous_selection != -1:
             self._select_list_row(previous_selection)
         self.SetStatusText(f"{self.current_title}，共 {len(self.items)} 项")
+        self._start_publisher_resolution(new_items)
         wx.CallAfter(self._load_next_page_if_near_bottom)
 
     def _play(
@@ -2402,6 +2807,8 @@ class MaoerFrame(wx.Frame):
                 self.browser_player,
                 self._on_player_window_close,
                 self._on_playback_finished,
+                read_danmaku_default=self.settings.read_danmaku,
+                read_subtitle_default=self.settings.read_subtitle,
             )
             created = True
 
@@ -2498,12 +2905,6 @@ class MaoerFrame(wx.Frame):
             if auto_current_key is not None:
                 wx.CallAfter(self._play_next_from_current_list, auto_current_key)
             return
-        if item.need_pay:
-            if auto_current_key is not None:
-                self._skip_auto_purchase_required(auto_current_key, item)
-            else:
-                self._prompt_sound_purchase(item)
-            return
         source_key = self._item_key(item)
         source_title = self.current_title
         self._run_background(
@@ -2513,14 +2914,24 @@ class MaoerFrame(wx.Frame):
             on_purchase_required=(
                 (lambda _exc: self._skip_auto_purchase_required(auto_current_key, item))
                 if auto_current_key is not None
-                else (lambda _exc: self._prompt_sound_purchase(item))
+                else (lambda _exc: self._on_manual_purchase_required(item))
             ),
         )
+
+    def _on_manual_purchase_required(self, item: MediaItem) -> None:
+        item.need_pay = True
+        index = self._index_for_item_key(self._item_key(item))
+        if index is not None:
+            self.list.SetItem(index, 0, self._display_item_title(item))
+        self._prompt_sound_purchase(item)
 
     def _skip_auto_purchase_required(self, current_key: tuple[str, int], item: MediaItem) -> None:
         if self.current_playback_key != current_key:
             return
         item.need_pay = True
+        index = self._index_for_item_key(self._item_key(item))
+        if index is not None:
+            self.list.SetItem(index, 0, self._display_item_title(item))
         self.SetStatusText(f"跳过需要购买的音频: {item.title}")
         wx.CallAfter(self._play_next_from_current_list, current_key)
 
@@ -2596,24 +3007,56 @@ class MaoerFrame(wx.Frame):
     def on_account_exit(self, _event: wx.CommandEvent) -> None:
         self.Close()
 
+    def _selected_shortcut_item(self) -> MediaItem | None:
+        if self.FindFocus() is not self.list:
+            return None
+        index = self._selected_index()
+        if 0 <= index < len(self.items):
+            return self.items[index]
+        return None
+
+    def on_item_detail_shortcut(self, _event: wx.CommandEvent) -> None:
+        item = self._selected_shortcut_item()
+        if item is None or not self._can_show_item_menu(item):
+            return
+        if item.kind == "sound":
+            self.show_sound_intro(item)
+        else:
+            self.show_drama_detail(item)
+
+    def on_item_comments_shortcut(self, _event: wx.CommandEvent) -> None:
+        item = self._selected_shortcut_item()
+        if item is not None and self._can_show_comments_menu(item):
+            self.show_comments(item)
+
+    def on_item_browser_shortcut(self, _event: wx.CommandEvent) -> None:
+        item = self._selected_shortcut_item()
+        if item is not None and self._can_show_item_menu(item):
+            self.open_item_in_browser(item)
+
     def on_char_hook(self, event: wx.KeyEvent) -> None:
         if self.FindFocus() is self.list:
             key = event.GetKeyCode()
             if key == wx.WXK_MENU or (key == wx.WXK_F10 and event.ShiftDown()):
                 self._show_selected_item_menu(wx.Point(10, 10))
                 return
+            if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+                if event.GetModifiers() in (wx.MOD_SHIFT, wx.MOD_ALT, wx.MOD_ALT | wx.MOD_SHIFT):
+                    # Let the frame accelerator consume the key before the native list control.
+                    event.Skip()
+                    return
+                index = self._selected_index()
+                if 0 <= index < len(self.items):
+                    item = self.items[index]
+                    if event.GetModifiers() == 0:
+                        self.open_item(item)
+                        return
 
         if event.GetKeyCode() == wx.WXK_BACK and self.FindFocus() is not self.search_box:
             if self.current_title.startswith("搜索"):
                 self.load_homepage(focus_list=self.FindFocus() is self.list)
                 return
             if self.go_back():
-                return
-
-        if event.GetKeyCode() == wx.WXK_RETURN and self.FindFocus() is self.list:
-            index = self._selected_index()
-            if index != -1 and index < len(self.items):
-                self.open_item(self.items[index])
                 return
 
         event.Skip()
@@ -2629,6 +3072,7 @@ class MaoerFrame(wx.Frame):
             state.selected_index,
             top_index=state.top_index,
             hide_detail_column=state.hide_detail_column,
+            opened_drama_id=state.opened_drama_id,
         )
         return True
 
@@ -2698,7 +3142,7 @@ class MaoerFrame(wx.Frame):
 
     def show_purchase_required(self, message: str) -> None:
         if not message.startswith("《"):
-            message = f"《{message}》需要购买后才能播放。"
+            message = f"《{message}》为付费内容。"
         wx.MessageBox(message, "需要购买", wx.OK | wx.ICON_INFORMATION, self)
 
     def show_error(self, message: str) -> None:
@@ -2706,6 +3150,7 @@ class MaoerFrame(wx.Frame):
         wx.MessageBox(message or "未知错误", "错误", wx.OK | wx.ICON_ERROR, self)
 
     def on_close(self, event: wx.CloseEvent) -> None:
+        self._publisher_request = object()
         if self.player_frame is not None:
             self.player_frame.Destroy()
             self.player_frame = None
@@ -2733,6 +3178,8 @@ class MaoerApp(wx.App):
             return False
         frame = MaoerFrame()
         frame.Show()
+        if frame.settings.startup_sound:
+            play_startup_sound()
         return True
 
 

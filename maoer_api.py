@@ -5,7 +5,7 @@ import html
 import os
 import re
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from pathlib import Path
 import time
@@ -18,6 +18,9 @@ from app_paths import cookie_path
 
 
 BASE_URL = "https://www.missevan.com"
+APP_API_URL = "https://app.missevan.com"
+# Official VIP recommend-blocks module IDs; not price or playback entitlements.
+VIP_DRAMA_MODULES = {"free": 400, "discount": 401}
 COMMENT_TARGET_SOUND = 1
 COMMENT_SORT_NEWEST = 1
 COMMENT_SORT_HOTTEST = 3
@@ -110,6 +113,19 @@ class CheckInResult:
     message: str
     fish_count: int | None = None
     raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class VipInfo:
+    active: bool
+    description: str
+    end_time: int | None = None
+
+
+@dataclass(slots=True)
+class DramaFollowResult:
+    followed: bool
+    message: str = ""
 
 
 @dataclass(slots=True)
@@ -222,7 +238,11 @@ class MaoerApi:
         self.session = requests.Session()
         self._account_info_cache: AccountInfo | None = None
         self._drama_detail_cache: dict[int, dict[str, Any]] = {}
+        self._publisher_by_user_id: dict[int, str] = {}
+        self._publisher_by_item: dict[tuple[str, int], str] = {}
         self._purchased_full_drama_ids_cache: set[int] | None = None
+        self._member_vip_active_cache: bool | None = None
+        self._vip_drama_max_pages: dict[str, int] = {}
         self.session.headers.update(
             {
                 "User-Agent": USER_AGENT,
@@ -289,19 +309,28 @@ class MaoerApi:
         referer: str | None = None,
     ) -> dict[str, Any]:
         url = path if path.startswith("http") else BASE_URL + path
+        parsed_url = urlparse(url)
+        request_origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
         response = self.session.post(
             url,
             data=data,
             headers={
                 "Accept": "application/json, text/plain, */*",
-                "Referer": referer or BASE_URL + "/",
-                "Origin": BASE_URL,
+                "Referer": referer or request_origin + "/",
+                "Origin": request_origin,
                 "Content-Type": "application/x-www-form-urlencoded",
             },
             timeout=self.timeout,
         )
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError:
+            response.raise_for_status()
+            raise
+        if not response.ok:
+            if isinstance(payload, dict):
+                raise ApiError(self._payload_message(payload))
+            response.raise_for_status()
         if not isinstance(payload, dict):
             raise ApiError("接口返回格式不正确")
         if payload.get("success") is False:
@@ -407,6 +436,7 @@ class MaoerApi:
             raise ApiError("登录成功但没有拿到 Cookie")
         self._account_info_cache = None
         self._purchased_full_drama_ids_cache = None
+        self._member_vip_active_cache = None
         self.cookie_header = cookie
         self.session.headers["Cookie"] = cookie
         return cookie
@@ -430,6 +460,68 @@ class MaoerApi:
         if message == "需要登录":
             raise ApiError(message)
         return CheckInResult(False, message, self._fish_count_from_text(message), data)
+
+    @classmethod
+    def _check_vip_response(cls, payload: dict[str, Any]) -> None:
+        # VIP endpoints may use either the app's code=0 or success/info envelope.
+        if payload.get("success") is True:
+            return
+        if payload.get("success") is False or _to_int(payload.get("code")) != 0:
+            raise ApiError(cls._payload_message(payload))
+
+    def vip_info(self) -> VipInfo:
+        if not self.cookie_header:
+            raise ApiError("需要登录")
+        payload = self._get_json_allow_failure(APP_API_URL + "/x/vip/user-info")
+        self._check_vip_response(payload)
+        data = payload.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("vip_info"), dict):
+            raise ApiError("没有拿到会员状态，请稍后重试")
+        info = data["vip_info"]
+        return VipInfo(
+            active=_to_int(info.get("status")) == 1,
+            description=_text(info.get("text")),
+            end_time=_to_int(info.get("end_time")),
+        )
+
+    def vip_dramas(self, kind: str, page: int = 1) -> list[MediaItem]:
+        if kind not in VIP_DRAMA_MODULES:
+            raise ValueError("未知的会员剧目录")
+        page = max(1, int(page))
+        if page == 1:
+            self._vip_drama_max_pages.pop(kind, None)
+        elif page > self._vip_drama_max_pages.get(kind, page):
+            return []
+        module_id = VIP_DRAMA_MODULES[kind]
+        payload = self._get_json_allow_failure(
+            "/theatre/module-details", {"module_id": module_id, "page": page}
+        )
+        self._check_vip_response(payload)
+        info = payload.get("info")
+        if not isinstance(info, dict) or _to_int(info.get("id")) != module_id:
+            raise ApiError("没有拿到会员剧目录，请稍后重试")
+        elements = info.get("elements")
+        dramas = elements.get("Datas") if isinstance(elements, dict) else None
+        if not isinstance(dramas, list):
+            raise ApiError("会员剧目录返回格式不正确")
+        pagination = elements.get("pagination")
+        if isinstance(pagination, dict):
+            max_page = _to_int(pagination.get("maxpage"))
+            if max_page is not None and max_page >= 0:
+                self._vip_drama_max_pages[kind] = max_page
+        label = "会员限免（会员畅听）" if kind == "free" else "会员折扣（价格以详情为准）"
+        items: list[MediaItem] = []
+        seen: set[int] = set()
+        for drama in dramas:
+            if not isinstance(drama, dict):
+                continue
+            item = self._drama_item(dict(drama), fallback_subtitle=label)
+            if item is not None and item.id not in seen:
+                seen.add(item.id)
+                item.raw["_hide_author"] = True
+                items.append(item)
+        # Catalog membership and is_subscribe do not imply ownership or free playback.
+        return self._mark_purchased_dramas(items)
 
     def drama_purchase_info(self, drama_id: int, refresh: bool = False) -> DramaPurchaseInfo:
         info = self._drama_detail_data(drama_id, refresh=refresh)
@@ -491,6 +583,7 @@ class MaoerApi:
         self._account_info_cache = None
         self._drama_detail_cache.pop(drama_id, None)
         self._purchased_full_drama_ids_cache = None
+        self._member_vip_active_cache = None
         return payload
 
     def buy_drama_episode(self, drama_id: int, sound_id: int) -> dict[str, Any]:
@@ -541,10 +634,21 @@ class MaoerApi:
             if fans_count is not None:
                 display_info["fansNum"] = fans_count
 
+        account_text = self._account_info_text(display_info)
+        if user_id is None and self.cookie_header:
+            try:
+                vip = self.vip_info()
+                if vip.active and vip.end_time and vip.end_time > 0:
+                    expiry = datetime.fromtimestamp(vip.end_time).strftime("%Y-%m-%d %H:%M")
+                    account_text += f"\n会员到期时间：{expiry}"
+            except (ApiError, requests.RequestException, OSError, OverflowError, ValueError):
+                # VIP details are optional; account information must remain usable.
+                pass
+
         account_info = AccountInfo(
             user_id=resolved_user_id,
             nickname=nickname,
-            text=self._account_info_text(display_info),
+            text=account_text,
             raw=display_info,
         )
         if user_id is None:
@@ -578,6 +682,147 @@ class MaoerApi:
         self._drama_detail_cache[drama_id] = info
         return info
 
+    def drama_follow_status(self, drama_id: int) -> bool:
+        if not self.cookie_header:
+            raise ApiError("需要登录")
+        info = self._drama_detail_data(drama_id, refresh=True)
+        if "like" not in info:
+            raise ApiError("广播剧详情没有返回追剧状态")
+        like = _to_int(info["like"])
+        if like is None:
+            raise ApiError("广播剧追剧状态格式不正确")
+        return like > 0
+
+    def set_drama_follow(self, drama_id: int, follow: bool) -> bool:
+        return self.set_drama_follow_result(drama_id, follow).followed
+
+    def set_drama_follow_result(self, drama_id: int, follow: bool) -> DramaFollowResult:
+        if not self.cookie_header:
+            raise ApiError("需要登录")
+        response = self._post_form_api(
+            "/dramaapi/subscribe",
+            {"drama_id": int(drama_id), "type": 1 if follow else 0},
+            referer=f"{BASE_URL}/mdrama/{int(drama_id)}",
+        )
+        if response.get("success") is not True:
+            raise ApiError(self._payload_message(response))
+        info = response.get("info")
+        message = _text(info.get("msg")) if isinstance(info, dict) else ""
+        return DramaFollowResult(self.drama_follow_status(drama_id), message)
+
+    def publisher_name_for_item(self, item: MediaItem) -> str:
+        """Return only the account that uploaded this item, never creative credits."""
+        if item.kind not in {"sound", "drama", "album"}:
+            return ""
+        raw = item.raw if isinstance(item.raw, dict) else {}
+        name = _text(raw.get("_publisher_name") or raw.get("username") or raw.get("user_name")).strip()
+        user_id = _to_int(raw.get("user_id"))
+        if name:
+            if user_id:
+                self._publisher_by_user_id[user_id] = name
+            return name
+
+        key = (item.kind, item.id)
+        cached = self._publisher_by_item.get(key)
+        if cached:
+            return cached
+        if user_id and user_id in self._publisher_by_user_id:
+            name = self._publisher_by_user_id[user_id]
+        else:
+            try:
+                if item.kind == "sound":
+                    _owner_id, name = self._sound_publisher_identity(item.id)
+                elif item.kind == "drama":
+                    name = self._drama_publisher_name(item.id)
+                else:
+                    data = self._get("/sound/soundalllist", {"albumid": item.id})
+                    album = (data.get("info") or {}).get("album") or {}
+                    album_id = _to_int(album.get("id")) if isinstance(album, dict) else None
+                    name = _text(album.get("username")).strip() if isinstance(album, dict) and album_id in {None, item.id} else ""
+                    album_user_id = _to_int(album.get("user_id")) if isinstance(album, dict) else None
+                    if album_user_id and name:
+                        self._publisher_by_user_id[album_user_id] = name
+            except (ApiError, requests.RequestException, ValueError, TypeError):
+                return ""
+        if name:
+            self._publisher_by_item[key] = name
+        return name
+
+    def _sound_publisher_identity(self, sound_id: int) -> tuple[int | None, str]:
+        data = self._get("/sound/getsound", {"soundid": sound_id})
+        info = data.get("info") or {}
+        if not isinstance(info, dict):
+            return None, ""
+        sound = info.get("sound") or {}
+        user = info.get("user") or {}
+        if not isinstance(sound, dict):
+            return None, ""
+        if not isinstance(user, dict):
+            user = {}
+        returned_id = _to_int(sound.get("id"))
+        if returned_id is not None and returned_id != sound_id:
+            return None, ""
+        owner_id = _to_int(sound.get("user_id"))
+        user_id = _to_int(user.get("id"))
+        if owner_id and user_id and owner_id != user_id:
+            return None, ""
+        publisher_id = owner_id or user_id
+        user_name = user.get("username") if user_id and (not owner_id or owner_id == user_id) else None
+        name = _text(user_name or sound.get("username")).strip()
+        if publisher_id and name:
+            self._publisher_by_user_id[publisher_id] = name
+        return publisher_id, name
+
+    def _drama_publisher_name(self, drama_id: int, info: dict[str, Any] | None = None) -> str:
+        key = ("drama", int(drama_id))
+        if key in self._publisher_by_item:
+            return self._publisher_by_item[key]
+        try:
+            info = info if info is not None else self._drama_detail_data(drama_id)
+            drama = info.get("drama") or {}
+            if not isinstance(drama, dict):
+                return ""
+            user_id = _to_int(drama.get("user_id"))
+            if not user_id:
+                return ""
+            cached = self._publisher_by_user_id.get(user_id)
+            if cached:
+                self._publisher_by_item[key] = cached
+                return cached
+
+            episodes = info.get("episodes") or {}
+            sound_ids: list[int] = []
+            if isinstance(episodes, dict):
+                for group in ("episode", "ft", "music"):
+                    for episode in episodes.get(group) or []:
+                        if isinstance(episode, dict):
+                            sound_id = _to_int(episode.get("sound_id"))
+                            if sound_id and sound_id not in sound_ids:
+                                sound_ids.append(sound_id)
+                        if len(sound_ids) >= 5:
+                            break
+                    if len(sound_ids) >= 5:
+                        break
+            if not sound_ids:
+                data = self._get("/person/getusersound", {"user_id": user_id, "page": 1, "page_size": 1})
+                user_sounds = data.get("info") or {}
+                rows = (user_sounds.get("Datas") or []) if isinstance(user_sounds, dict) else []
+                if rows and isinstance(rows[0], dict):
+                    sound_id = _to_int(rows[0].get("id"))
+                    if sound_id:
+                        sound_ids.append(sound_id)
+            for sound_id in sound_ids:
+                try:
+                    owner_id, name = self._sound_publisher_identity(sound_id)
+                except (ApiError, requests.RequestException, ValueError):
+                    continue
+                if owner_id == user_id and name:
+                    self._publisher_by_item[key] = name
+                    return name
+        except (ApiError, requests.RequestException, ValueError, TypeError):
+            pass
+        return ""
+
     def drama_detail_text(self, drama_id: int) -> str:
         info = self._drama_detail_data(drama_id)
         drama = info.get("drama") or {}
@@ -587,7 +832,7 @@ class MaoerApi:
         self._append_field(lines, "名称", drama.get("name"))
         self._append_field(lines, "ID", drama.get("id") or drama_id)
         self._append_field(lines, "分类", drama.get("catalog_name") or drama.get("catalog"))
-        self._append_field(lines, "作者", drama.get("author"))
+        self._append_field(lines, "发布", self._drama_publisher_name(drama_id, info))
         self._append_field(lines, "原作", drama.get("original_author") or drama.get("origin_author"))
         self._append_field(lines, "状态", drama.get("status_name") or drama.get("status"))
         self._append_field(lines, "最新", drama.get("newest"))
@@ -621,6 +866,17 @@ class MaoerApi:
 
         return "\n".join(lines).strip() or "没有拿到广播剧详情"
 
+    def sound_intro_text(self, sound_id: int) -> str:
+        data = self._get("/sound/getsound", {"soundid": sound_id})
+        info = data.get("info") or {}
+        sound = info.get("sound") if isinstance(info, dict) else None
+        if not isinstance(sound, dict) or not sound:
+            raise ApiError("没有拿到音频资料")
+        returned_id = _to_int(sound.get("id"))
+        if returned_id is not None and returned_id != sound_id:
+            raise ApiError("音频资料与所选条目不一致")
+        return self._html_to_text(sound.get("intro")) or "该音频暂无简介"
+
     def _drama_cv_lines(self, info: dict[str, Any]) -> list[str]:
         cvs = info.get("cvs")
         if not isinstance(cvs, list):
@@ -651,6 +907,10 @@ class MaoerApi:
                 ).strip()
             if not cv_name:
                 cv_name = _text(item.get("cv_name") or item.get("cv") or item.get("name")).strip()
+
+            group = _text(cv_info.get("group")).strip() if isinstance(cv_info, dict) else ""
+            if cv_name:
+                cv_name = f"{cv_name}（{group or '无'}）"
 
             if character and cv_name:
                 line = f"{character}：{cv_name}"
@@ -817,6 +1077,7 @@ class MaoerApi:
         self._account_info_cache = None
         self._drama_detail_cache.clear()
         self._purchased_full_drama_ids_cache = None
+        self._member_vip_active_cache = None
         self.cookie_header = cookie.strip()
         if self.cookie_header:
             self.session.headers["Cookie"] = self.cookie_header
@@ -1320,19 +1581,26 @@ class MaoerApi:
         except requests.RequestException:
             pass
 
-    def _homepage_drama_sections(self) -> list[MediaItem]:
+    def _homepage_drama_sections(self, section_label: str = "", show_weekday: bool = False) -> list[MediaItem]:
+        today = datetime.now().date()
         data = self._get("/dramaapi/summerdrama")
         groups = data.get("info") or []
         items: list[MediaItem] = []
         for index, group in enumerate(groups):
             if not isinstance(group, list):
                 continue
-            section = self._homepage_drama_section_label(index)
+            section = section_label or self._homepage_drama_section_label(index)
             for drama in group:
                 if not isinstance(drama, dict):
                     continue
                 item = self._drama_item(drama, fallback_subtitle=section)
                 if item:
+                    if show_weekday:
+                        day = today + timedelta(days=index - 1)
+                        label = f"周{'一二三四五六日'[day.weekday()]}"
+                        if index < 3:
+                            label += f"（{('昨天', '今天', '明天')[index]}）"
+                        item.raw["_weekly_day_label"] = label
                     items.append(item)
         return items
 
@@ -1365,6 +1633,104 @@ class MaoerApi:
             item = self._category_item(catalog)
             if item:
                 items.append(item)
+        return items
+
+    def content_feature_items(self, kind: str, page: int = 1) -> list[MediaItem]:
+        page = max(1, int(page))
+        if kind == "books":
+            return self.sound_category_items(6, "听书", page=page)
+        if kind == "weekly":
+            return self._homepage_drama_sections("精品周更", show_weekday=True) if page == 1 else []
+        if kind == "drama_timeline":
+            return self.drama_timeline_items() if page == 1 else []
+        if kind == "drama_following":
+            if not self.cookie_header:
+                raise ApiError("请先登录后查看我的追剧")
+            try:
+                return self.subscribed_dramas(page)
+            except ApiError as exc:
+                if "需要登录" in str(exc):
+                    raise ApiError("登录已失效，请先在“账号”菜单退出登录，再重新登录后查看我的追剧") from exc
+                raise
+        drama_filters = {
+            "drama_all": "0_0_0_0",
+            "drama_finished": "2_0_0_0",
+            "drama_ongoing": "1_0_0_0",
+        }
+        if kind in drama_filters:
+            return self.drama_filter_items(drama_filters[kind], page)
+        raise ValueError("未知的内容栏目")
+
+    def drama_index_facets(self) -> list[tuple[str, list[tuple[int, str]]]]:
+        payload = self._get("/dramaapi/tag", {"type": 1})
+        info = payload.get("info")
+        groups = info.get("index") if isinstance(info, dict) else None
+        if not isinstance(groups, list) or len(groups) != 4:
+            raise ApiError("广播剧索引返回格式不正确")
+
+        facets: list[tuple[str, list[tuple[int, str]]]] = []
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("items"), list):
+                raise ApiError("广播剧索引返回格式不正确")
+            label = _text(group.get("label")).strip()
+            options: list[tuple[int, str]] = []
+            for option in group["items"]:
+                if not isinstance(option, dict):
+                    continue
+                option_id = _to_int(option.get("id"))
+                option_name = _text(option.get("name")).strip()
+                if option_id is not None and option_name:
+                    options.append((option_id, option_name))
+            if not label or not options:
+                raise ApiError("广播剧索引返回格式不正确")
+            facets.append((label, options))
+        return facets
+
+    def drama_filter_items(self, filters: str, page: int = 1) -> list[MediaItem]:
+        if not re.fullmatch(r"\d+_\d+_\d+_\d+", filters):
+            raise ValueError("无效的广播剧筛选条件")
+        payload = self._get(
+            "/dramaapi/filter",
+            {
+                "type": 1,
+                "filters": filters,
+                "order": 1,
+                "page": max(1, int(page)),
+                "page_size": 20,
+            },
+        )
+        info = payload.get("info")
+        dramas = info.get("Datas") if isinstance(info, dict) else None
+        if not isinstance(dramas, list):
+            raise ApiError("广播剧列表返回格式不正确")
+        items: list[MediaItem] = []
+        for drama in dramas:
+            if isinstance(drama, dict):
+                item = self._drama_item(drama, fallback_subtitle="广播剧")
+                if item is not None:
+                    items.append(item)
+        return items
+
+    def drama_timeline_items(self) -> list[MediaItem]:
+        payload = self._get("/dramaapi/timeline")
+        info = payload.get("info")
+        groups = info.get("recent") if isinstance(info, dict) else None
+        if not isinstance(groups, list):
+            raise ApiError("广播剧时间表返回格式不正确")
+        items: list[MediaItem] = []
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("dramas"), list):
+                continue
+            day = _text(group.get("time")).strip()
+            alias = _text(group.get("alias")).strip()
+            label = f"{day}（{alias}）" if alias else day
+            for drama in group["dramas"]:
+                if not isinstance(drama, dict):
+                    continue
+                item = self._drama_item(drama, fallback_subtitle=label)
+                if item is not None:
+                    item.raw["_timeline_day_label"] = label
+                    items.append(item)
         return items
 
     def category_children(self, item: MediaItem) -> list[MediaItem]:
@@ -1557,10 +1923,6 @@ class MaoerApi:
         force_owned = self._is_full_drama_purchased(drama_id)
 
         items: list[MediaItem] = []
-        if not force_owned:
-            purchase_item = self._drama_purchase_item(drama, drama_id)
-            if purchase_item:
-                items.append(purchase_item)
 
         for group_key, group_label in (
             ("episode", "正剧"),
@@ -1588,6 +1950,7 @@ class MaoerApi:
                         raw=episode,
                     )
                 )
+        self._mark_member_vip_limited_episodes(items)
         return items
 
     def drama_episodes_page(
@@ -1609,10 +1972,6 @@ class MaoerApi:
         )
         sounds = ((data.get("info") or {}).get("Datas") or [])
         items: list[MediaItem] = []
-        if page == 1 and not force_owned:
-            purchase_item = self._drama_purchase_item(drama, drama_id)
-            if purchase_item:
-                items.append(purchase_item)
 
         for sound in sounds:
             if not isinstance(sound, dict):
@@ -1629,7 +1988,15 @@ class MaoerApi:
                 elif force_owned:
                     item.need_pay = False
                 items.append(item)
+        self._mark_member_vip_limited_episodes(items)
         return items
+
+    def _mark_member_vip_limited_episodes(self, items: list[MediaItem]) -> None:
+        candidates = [item for item in items if item.need_pay and self._is_vip_limited_sound(item.raw)]
+        if not candidates or not self._is_member_vip_active():
+            return
+        for item in candidates:
+            item.raw = {**item.raw, "_member_vip_limited_free": True}
 
     def _drama_purchase_item(self, drama: dict[str, Any], drama_id: int) -> MediaItem | None:
         pay_type = _to_int(drama.get("pay_type"))
@@ -1785,20 +2152,26 @@ class MaoerApi:
         return self.album_sounds(album_id)[start:end]
 
     def playback_info(self, item: MediaItem) -> PlaybackInfo:
-        if item.need_pay:
-            raise PurchaseRequired(f"《{item.title}》需要购买后才能播放。")
-
         data = self._get("/sound/getsound", {"soundid": item.id})
         info = data.get("info") or {}
         sound = info.get("sound") or {}
+        if not isinstance(sound, dict):
+            sound = {}
         title = _text(sound.get("soundstr") or item.title)
         drama_id = item.drama_id or self._raw_drama_id(sound) or self._raw_drama_id(item.raw)
         full_drama_purchased = self._is_full_drama_purchased(drama_id)
+        vip_limited = self._is_vip_limited_sound(item.raw) or self._is_vip_limited_sound(sound)
+        member_vip = vip_limited and self._is_member_vip_active()
+        can_play_paid = full_drama_purchased or member_vip
+
+        purchased_sound = isinstance(item.raw, dict) and bool(item.raw.get("_purchased_sound"))
+        if (item.need_pay or _to_bool(sound.get("need_pay"))) and not (can_play_paid or purchased_sound):
+            raise PurchaseRequired(f"《{title}》为付费内容。")
 
         url = _text(sound.get("soundurl") or sound.get("soundurl_128"))
         if not url:
-            if _to_bool(sound.get("need_pay")) and not full_drama_purchased:
-                raise PurchaseRequired(f"《{title}》需要购买后才能播放。")
+            if _to_bool(sound.get("need_pay")) and not (can_play_paid or purchased_sound):
+                raise PurchaseRequired(f"《{title}》为付费内容。")
 
         return PlaybackInfo(
             sound_id=item.id,
@@ -1810,6 +2183,42 @@ class MaoerApi:
             duration_ms=_duration_ms(sound.get("duration")) or item.duration_ms,
             subtitle_url=_text(sound.get("subtitle_url")),
         )
+
+    @staticmethod
+    def _is_vip_limited_sound(sound: Any) -> bool:
+        if not isinstance(sound, dict):
+            return False
+        for key in ("vip", "is_vip", "isVip", "vip_free", "is_vip_free"):
+            if key in sound and _to_bool(sound.get(key)):
+                return True
+        return False
+
+    def _is_member_vip_active(self) -> bool:
+        if not getattr(self, "cookie_header", ""):
+            return False
+        cached = getattr(self, "_member_vip_active_cache", None)
+        if cached is not None:
+            return cached
+
+        try:
+            data = self._get("/x/vip/subscribe-info")
+        except (ApiError, requests.RequestException, ValueError):
+            active = False
+        else:
+            payload = data.get("data") or {}
+            vip_info = payload.get("user_vip_info") if isinstance(payload, dict) else None
+            if not isinstance(vip_info, dict):
+                vip_info = {}
+            status = _to_int(vip_info.get("status"))
+            active = status == 1
+            if status is None:
+                for key in ("is_vip", "isVip", "vip", "active", "valid"):
+                    if key in vip_info:
+                        active = _to_bool(vip_info.get(key))
+                        break
+
+        self._member_vip_active_cache = active
+        return active
 
     def add_play_times(self, playback: PlaybackInfo) -> None:
         params: dict[str, Any] = {"sound_id": playback.sound_id}
@@ -2041,6 +2450,7 @@ class MaoerApi:
             id=drama_id,
             title=title or str(drama_id),
             subtitle="剧集订阅",
+            need_pay=_to_bool(data.get("need_pay")),
             pay_type=_to_int(data.get("pay_type")),
             price=_to_int(data.get("price")),
             raw=data,
@@ -2101,6 +2511,7 @@ class MaoerApi:
             id=drama_id,
             title=_text(drama.get("name") or drama.get("drama_name") or drama.get("title") or drama_id),
             subtitle=subtitle,
+            need_pay=_to_bool(drama.get("need_pay")),
             pay_type=_to_int(drama.get("pay_type")),
             price=_to_int(drama.get("price")),
             raw=drama,

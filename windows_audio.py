@@ -65,6 +65,23 @@ def set_current_app_volume(volume: int | float, include_process_names: Iterable[
     comtypes = objects["comtypes"]
     try:
         comtypes.CoInitialize()
+    except Exception as exc:
+        debug_log(f"set_volume COM initialization failed: {type(exc).__name__}: {exc}")
+        return False
+    try:
+        return _set_device_volume(objects, target_pids, names, level)
+    finally:
+        comtypes.CoUninitialize()
+
+
+def _set_device_volume(
+    objects: dict[str, object],
+    target_pids: set[int],
+    names: set[str],
+    level: float,
+) -> bool:
+    comtypes = objects["comtypes"]
+    try:
         enumerator = comtypes.CoCreateInstance(
             objects["CLSID_MMDeviceEnumerator"],
             objects["IMMDeviceEnumerator"],

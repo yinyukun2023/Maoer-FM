@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['D:\\program\\猫尔fm\\updater_entry.py'],
+    ['D:/git/maoer-fm/updater_entry.py'],
     pathex=[],
     binaries=[],
     datas=[],
