@@ -386,7 +386,7 @@ CONTROL_SCRIPT = r"""
       if (!isFinite(rate) || rate <= 0) {
         rate = 1;
       }
-      return Math.max(0.5, Math.min(2, Math.round(rate * 10) / 10));
+      return Math.max(0.5, Math.min(2, Math.round(rate * 100) / 100));
     }
 
     function applyMediaPlaybackRate(target, rate) {
@@ -909,6 +909,32 @@ CONTROL_SCRIPT = r"""
       return result({ok: !!sound || !!item, target: "waiting"});
     }
 
+    function resumePlayback() {
+      // Explicit play, never a toggle. Also leaves volume and rate intact.
+      var sound = demo();
+      if (sound) {
+        if (sound.playState === 1 && !sound.paused) {
+          return result({ok: true});
+        }
+        if (sound.paused && typeof sound.resume === "function") {
+          sound.resume();
+          return result({ok: true});
+        }
+        if (typeof sound.play === "function") {
+          sound.play();
+          return result({ok: true});
+        }
+      }
+      var item = currentMedia();
+      if (item) {
+        if (!item.paused && !item.ended) {
+          return result({ok: true});
+        }
+        return result({ok: playMedia(item)});
+      }
+      return result({ok: false, error: "no-player"});
+    }
+
     if (action === "autoplay" || action === "play") {
       return autoplay();
     }
@@ -949,6 +975,14 @@ CONTROL_SCRIPT = r"""
       var item = currentMedia();
       var next = currentPositionMs(item, sound) + (Number(value) || 0) * 1000;
       return setPosition(next);
+    }
+
+    if (action === "seek_to") {
+      return setPosition((Number(value) || 0) * 1000);
+    }
+
+    if (action === "resume") {
+      return resumePlayback();
     }
 
     if (action === "pause") {
@@ -997,6 +1031,7 @@ class HiddenBrowserPlayer:
         self._webview: html2.WebView | None = None
         self._current: PlaybackInfo | None = None
         self._load_generation = 0
+        self._seek_generation = 0
         self._page_loaded = False
         self._paused = False
         self._suppress_autoplay = False
@@ -1012,6 +1047,7 @@ class HiddenBrowserPlayer:
         self._system_volume_running = False
 
     def play(self, playback: PlaybackInfo) -> None:
+        self._seek_generation += 1
         self._cancel_autoplay_timer()
         page_url = playback.page_url or f"https://www.missevan.com/sound/player?id={playback.sound_id}"
         debug_log(f"play sound_id={playback.sound_id} title={playback.title!r} url={page_url}")
@@ -1041,7 +1077,59 @@ class HiddenBrowserPlayer:
         wx.CallLater(2500, self._schedule_autoplay, self._load_generation)
 
     def seek(self, seconds: int) -> None:
+        self._seek_generation += 1
         self._run_control("seek", seconds)
+
+    def seek_to(self, seconds: float, callback: ScriptCallback, *, resume: bool = False) -> None:
+        self._seek_generation += 1
+        generation = self._seek_generation
+        if not resume:
+            self._run_control_callback("seek_to", seconds, callback)
+            return
+        self._suppress_autoplay = True
+        self._cancel_autoplay_timer()
+
+        def current() -> bool:
+            return generation == self._seek_generation
+
+        def resume_failed(sought, status=None):
+            self._paused = bool(status.get("paused")) if status and status.get("ok") else True
+            callback({**sought, "paused": self._paused, "resume_error": True})
+
+        def confirm(sought, attempts=8):
+            if not current():
+                callback(None)
+                return
+            def checked(status):
+                if not current():
+                    callback(None)
+                    return
+                if status and status.get("ok") and status.get("paused") is False and not status.get("ended"):
+                    self._paused = False
+                    callback({**sought, "paused": False})
+                elif attempts:
+                    wx.CallLater(150, confirm, sought, attempts - 1)
+                else:
+                    resume_failed(sought, status)
+            self.status(checked)
+
+        def sought(result):
+            if not current():
+                callback(None)
+                return
+            if not result or not result.get("ok"):
+                callback(result)
+                return
+            def resumed(response):
+                if not current():
+                    callback(None)
+                elif not response or not response.get("ok"):
+                    resume_failed(result)
+                else:
+                    confirm(result)
+            self._run_control_callback("resume", None, resumed)
+
+        self._run_control_callback("seek_to", seconds, sought)
 
     def set_playback_rate(self, rate: float, callback: ScriptCallback) -> None:
         rate = self._clamp_playback_rate(rate)
@@ -1062,6 +1150,7 @@ class HiddenBrowserPlayer:
         return self._change_volume(-step)
 
     def toggle_pause(self) -> bool:
+        self._seek_generation += 1
         self._suppress_autoplay = True
         self._paused = not self._paused
         self._run_control("pause")
@@ -1084,6 +1173,7 @@ class HiddenBrowserPlayer:
         wx.CallLater(1200, self._expire_script_callback, callback_id)
 
     def stop(self) -> None:
+        self._seek_generation += 1
         self._cancel_autoplay_timer()
         if self._webview is None:
             return
@@ -1179,11 +1269,31 @@ class HiddenBrowserPlayer:
             webview.RemoveAllUserScripts()
         except Exception:
             pass
+        webview.AddUserScript(self._hide_embedded_page_from_screen_readers_script(), html2.WEBVIEW_INJECT_AT_DOCUMENT_START)
         webview.AddUserScript(self._single_sound_guard_script(), html2.WEBVIEW_INJECT_AT_DOCUMENT_START)
         webview.AddUserScript(self._volume_bootstrap_script(), html2.WEBVIEW_INJECT_AT_DOCUMENT_START)
         cookie_script = self._cookie_script()
         if cookie_script:
             webview.AddUserScript(cookie_script, html2.WEBVIEW_INJECT_AT_DOCUMENT_START)
+
+    @staticmethod
+    def _hide_embedded_page_from_screen_readers_script() -> str:
+        # This 1x1 offscreen WebView is only an audio transport. Its own
+        # changing captions must not reach the screen reader independently of
+        # PlaybackFrame's F / Ctrl+F subtitle announcements.
+        return """(function(){
+  function hide() {
+    if (document.documentElement && document.documentElement.getAttribute('aria-hidden') !== 'true') {
+      document.documentElement.setAttribute('aria-hidden', 'true');
+    }
+    if (document.body && document.body.getAttribute('aria-hidden') !== 'true') {
+      document.body.setAttribute('aria-hidden', 'true');
+    }
+  }
+  hide();
+  document.addEventListener('DOMContentLoaded', hide);
+  new MutationObserver(hide).observe(document, {childList: true, subtree: true, attributes: true, attributeFilter: ['aria-hidden']});
+})();"""
 
     def _prepare_environment(self) -> None:
         os.environ.setdefault("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--autoplay-policy=no-user-gesture-required")
@@ -1452,7 +1562,7 @@ class HiddenBrowserPlayer:
             value = float(rate)
         except (TypeError, ValueError):
             value = 1.0
-        value = round(value, 1)
+        value = round(value, 2)
         return max(MIN_PLAYBACK_RATE, min(MAX_PLAYBACK_RATE, value))
 
     @staticmethod

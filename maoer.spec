@@ -13,7 +13,7 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[(webview2_loader, 'wx')],
-    datas=[('assets/startup_mia.wav', 'assets'), ('热键表.txt', '.')],
+    datas=[('assets/startup_mia.wav', 'assets'), ('热键表.txt', '.'), ('tolk_x86', 'tolk_x86')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

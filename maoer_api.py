@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import html
 import os
 import re
@@ -90,6 +91,8 @@ class DanmakuItem:
     created_at: str = ""
     user_id: str = ""
     danmaku_id: str = ""
+    role: str = ""
+    content: str = ""
 
 
 @dataclass(slots=True)
@@ -105,6 +108,17 @@ class AccountInfo:
     nickname: str
     text: str
     raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class PublisherProfile:
+    user_id: int
+    name: str
+    followers: int | None
+    following: int | None
+    bio: str
+    followed: bool | None = None
+    followed_cookie: str | None = field(default=None, repr=False)
 
 
 @dataclass(slots=True)
@@ -228,6 +242,19 @@ def _duration_text_ms(value: Any) -> int | None:
 
 def _text(value: Any) -> str:
     return "" if value is None else str(value)
+
+
+_SUBTITLE_ROLE_PREFIX = re.compile(r"^([^：:\r\n]{1,30})\s*[：:]\s*(.*)$", re.DOTALL)
+
+
+def _strip_repeated_subtitle_role(role: str, content: str) -> str:
+    """Remove speaker labels repeated at the start of subtitle content."""
+    if not role or not content:
+        return content
+    prefix = re.compile(rf"^{re.escape(role)}\s*[：:]\s*")
+    while match := prefix.match(content):
+        content = content[match.end():]
+    return content
 
 
 class MaoerApi:
@@ -675,12 +702,24 @@ class MaoerApi:
         drama_id = int(drama_id)
         if not refresh and drama_id in self._drama_detail_cache:
             return self._drama_detail_cache[drama_id]
+        cookie = self.cookie_header
         data = self._get("/dramaapi/getdrama", {"drama_id": drama_id})
         info = data.get("info") or {}
         if not isinstance(info, dict):
             info = {}
-        self._drama_detail_cache[drama_id] = info
+        if self.cookie_header == cookie:
+            self._drama_detail_cache[drama_id] = info
         return info
+
+    def cached_drama_follow_status(self, drama_id: int) -> bool | None:
+        """Return a known status without I/O; unknown is different from not followed."""
+        if not self.cookie_header:
+            return None
+        info = self._drama_detail_cache.get(int(drama_id))
+        if not isinstance(info, dict) or "like" not in info:
+            return None
+        like = _to_int(info["like"])
+        return like > 0 if like is not None else None
 
     def drama_follow_status(self, drama_id: int) -> bool:
         if not self.cookie_header:
@@ -772,6 +811,60 @@ class MaoerApi:
         if publisher_id and name:
             self._publisher_by_user_id[publisher_id] = name
         return publisher_id, name
+
+    def publisher_profile_for_item(self, item: MediaItem) -> PublisherProfile:
+        """Resolve the uploader's account, not an actor or original author."""
+        if item.kind == "sound":
+            user_id, _name = self._sound_publisher_identity(item.id)
+        elif item.kind == "drama":
+            info = self._drama_detail_data(item.id)
+            drama = info.get("drama") or {}
+            user_id = _to_int(drama.get("user_id")) if isinstance(drama, dict) else None
+        else:
+            raise ApiError("当前项目没有发布者资料")
+        if not user_id:
+            raise ApiError("没有找到该作品的发布者")
+
+        return self.publisher_profile(user_id)
+
+    def publisher_profile(self, user_id: int) -> PublisherProfile:
+        user_id = int(user_id)
+        if user_id <= 0:
+            raise ApiError("用户 ID 无效")
+        payload = self._get("/account/userinfo", {"user_id": user_id})
+        profile = payload.get("info") or {}
+        if payload.get("success") is not True or not isinstance(profile, dict):
+            raise ApiError(self._payload_message(payload))
+        if _to_int(profile.get("id")) != user_id:
+            raise ApiError("发布者资料与所选作品不一致")
+        name = _text(profile.get("username") or profile.get("nickname")).strip()
+        if not name:
+            raise ApiError("没有拿到发布者名称")
+        self._publisher_by_user_id[user_id] = name
+        followed_value = _to_int(profile.get("followed")) if self.cookie_header else None
+        return PublisherProfile(
+            user_id=user_id,
+            name=name,
+            followers=self._first_direct_int_value(profile, ("fansnum", "fansNum")),
+            following=self._first_direct_int_value(profile, ("follownum", "followNum")),
+            bio=self._html_to_text(profile.get("userintro") or profile.get("intro")),
+            followed=bool(followed_value) if followed_value is not None else None,
+            followed_cookie=self.cookie_header or None,
+        )
+
+    def set_publisher_follow(self, user_id: int, follow: bool) -> str:
+        if not self.cookie_header:
+            raise ApiError("请先登录")
+        payload = self._post_form_api(
+            "/person/ChangeAttention",
+            {"attentionid": int(user_id), "type": 1 if follow else 0},
+            referer=f"{BASE_URL}/{int(user_id)}",
+        )
+        if payload.get("success") is not True:
+            raise ApiError(self._payload_message(payload))
+        info = payload.get("info")
+        message = _text(info.get("msg") or info.get("message")) if isinstance(info, dict) else _text(info)
+        return message.strip() or ("关注成功" if follow else "取消关注成功")
 
     def _drama_publisher_name(self, drama_id: int, info: dict[str, Any] | None = None) -> str:
         key = ("drama", int(drama_id))
@@ -950,6 +1043,17 @@ class MaoerApi:
             raise ApiError("没有找到这个声音所属的广播剧")
         return drama_id
 
+    def drama_for_sound(self, sound_id: int) -> MediaItem:
+        payload = self._get("/dramaapi/getdramabysound", {"sound_id": int(sound_id)})
+        info = payload.get("info") or {}
+        drama = info.get("drama") if isinstance(info, dict) else None
+        if not isinstance(drama, dict):
+            raise ApiError("该音频没有关联的剧集")
+        item = self._drama_item(drama)
+        if item is None:
+            raise ApiError("该音频没有关联的剧集")
+        return self._mark_purchased_dramas([item])[0]
+
     def sound_comments(
         self,
         sound_id: int,
@@ -966,11 +1070,14 @@ class MaoerApi:
         )
 
     def sound_danmaku(self, sound_id: int, subtitle_url: str | None = None) -> list[DanmakuItem]:
-        xml_text = self._get_text("/sound/getdm", {"soundid": int(sound_id)})
+        xml_error: Exception | None = None
         try:
+            xml_text = self._get_text("/sound/getdm", {"soundid": int(sound_id)})
             root = ET.fromstring(xml_text)
-        except ET.ParseError as exc:
-            raise ApiError(f"弹幕数据解析失败: {exc}") from exc
+        except (ApiError, requests.RequestException, ET.ParseError) as exc:
+            # An unavailable comment feed must not block independent captions.
+            xml_error = exc
+            root = ET.Element("i")
 
         items: list[DanmakuItem] = []
         for element in root.findall(".//d"):
@@ -978,11 +1085,20 @@ class MaoerApi:
             if not text:
                 continue
             parts = (element.get("p") or "").split(",")
+            mode = (_to_int(parts[1], 0) or 0) if len(parts) > 1 else 0
+            if mode == DANMAKU_MODE_SUBTITLE:
+                speaker = _SUBTITLE_ROLE_PREFIX.match(text)
+                if speaker:
+                    role = speaker.group(1).strip()
+                    content = speaker.group(2).strip()
+                    clean_content = _strip_repeated_subtitle_role(role, content)
+                    if clean_content != content:
+                        text = f"{role}：{clean_content}" if clean_content else role
             items.append(
                 DanmakuItem(
                     time=_to_float(parts[0]) if len(parts) > 0 else 0.0,
                     text=text,
-                    mode=(_to_int(parts[1], 0) or 0) if len(parts) > 1 else 0,
+                    mode=mode,
                     size=(_to_int(parts[2], 0) or 0) if len(parts) > 2 else 0,
                     color=(_to_int(parts[3], 0) or 0) if len(parts) > 3 else 0,
                     created_at=self._danmaku_time(parts[4]) if len(parts) > 4 else "",
@@ -992,32 +1108,57 @@ class MaoerApi:
             )
 
         if subtitle_url is None:
-            data = self._get("/sound/getsound", {"soundid": int(sound_id)})
-            subtitle_url = _text(((data.get("info") or {}).get("sound") or {}).get("subtitle_url"))
+            try:
+                data = self._get("/sound/getsound", {"soundid": int(sound_id)})
+                subtitle_url = _text(((data.get("info") or {}).get("sound") or {}).get("subtitle_url"))
+            except (ApiError, requests.RequestException):
+                subtitle_url = ""
+
+        captions: list[DanmakuItem] = []
         if subtitle_url:
             try:
-                subtitle_data = json.loads(self._get_text(subtitle_url))
-            except json.JSONDecodeError as exc:
-                raise ApiError(f"字幕数据解析失败: {exc}") from exc
-            if not isinstance(subtitle_data, list):
-                raise ApiError("字幕数据格式不正确")
-            for subtitle in subtitle_data:
-                if not isinstance(subtitle, dict):
-                    continue
-                role = _text(subtitle.get("role")).strip()
-                content = _text(subtitle.get("content")).strip()
-                text = f"{role}：{content}" if role and content else role or content
-                if not text:
-                    continue
-                items.append(
-                    DanmakuItem(
-                        time=_to_float(subtitle.get("start_time")) / 1000.0,
-                        text=text,
-                        mode=DANMAKU_MODE_SUBTITLE,
-                        color=_to_int(subtitle.get("color"), 0) or 0,
-                    )
-                )
+                captions = self._parse_independent_subtitles(json.loads(self._get_text(subtitle_url)))
+            except (ApiError, requests.RequestException, json.JSONDecodeError):
+                # Missing, empty, invalid or inaccessible independent captions
+                # select the whole XML track, never a per-line mixed fallback.
+                pass
+        if captions:
+            items = [item for item in items if item.mode != DANMAKU_MODE_SUBTITLE]
+            items.extend(captions)
+        elif xml_error is not None:
+            raise ApiError(f"没有可用的独立字幕，弹幕式字幕加载失败: {xml_error}") from xml_error
         return sorted(items, key=lambda item: item.time)
+
+    @staticmethod
+    def _parse_independent_subtitles(data: object) -> list[DanmakuItem]:
+        if not isinstance(data, list):
+            return []
+        captions: list[DanmakuItem] = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            start = row.get("start_time")
+            if isinstance(start, bool):
+                continue
+            try:
+                seconds = float(start) / 1000.0
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(seconds) or seconds < 0:
+                continue
+            role, content = row.get("role") or "", row.get("content") or ""
+            if not isinstance(role, str) or not isinstance(content, str):
+                continue
+            role = role.strip()
+            content = _strip_repeated_subtitle_role(role, content.strip())
+            text = f"{role}：{content}" if role and content else role or content
+            if not text:
+                continue
+            captions.append(DanmakuItem(
+                time=seconds, text=text, mode=DANMAKU_MODE_SUBTITLE,
+                color=_to_int(row.get("color"), 0) or 0, role=role, content=content,
+            ))
+        return captions
 
     def sound_subtitles(self, sound_id: int, subtitle_url: str | None = None) -> list[DanmakuItem]:
         return [
@@ -1906,6 +2047,40 @@ class MaoerApi:
 
         return self._mark_purchased_dramas(items)
 
+    def playback_history(self) -> list[MediaItem]:
+        """Return the account's sound history; the endpoint has no playback position."""
+        if not self.cookie_header:
+            raise ApiError("请先登录")
+        payload = self._get("/mperson/gethistory")
+        if payload.get("success") is not True:
+            raise ApiError(self._payload_message(payload))
+        groups = payload.get("info")
+        if not isinstance(groups, list):
+            raise ApiError("没有拿到播放历史")
+
+        items: list[MediaItem] = []
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            date = _text(group.get("time"))
+            sounds = group.get("sound")
+            if not isinstance(sounds, list):
+                continue
+            for sound in sounds:
+                if not isinstance(sound, dict):
+                    continue
+                sound_id = _to_int(sound.get("id"))
+                if sound_id is None or sound_id <= 0:
+                    continue
+                title = _text(sound.get("soundstr")) or f"声音 {sound_id}"
+                items.append(MediaItem(
+                    kind="sound",
+                    id=sound_id,
+                    title=title,
+                    raw={"_history_date": date},
+                ))
+        return items
+
     def collection_items(self, item: MediaItem) -> list[MediaItem]:
         if item.kind == "drama":
             return self.drama_episodes(item.id)
@@ -2058,8 +2233,32 @@ class MaoerApi:
     def subscribed_dramas(self, page: int = 1, page_size: int = 30) -> list[MediaItem]:
         account = self.account_info()
         if account.user_id is None:
-            raise ApiError("没有拿到账号用户 ID，无法加载剧集订阅")
+            raise ApiError("没有拿到账号用户 ID，无法加载我的追剧")
         return self.user_subscribed_dramas(account.user_id, page=page, page_size=page_size)
+
+    def followed_accounts(self, page: int = 1, page_size: int = 30) -> list[MediaItem]:
+        if not self.cookie_header:
+            raise ApiError("请先登录")
+        account = self.account_info()
+        if account.user_id is None:
+            raise ApiError("没有拿到账号用户 ID，无法加载我的关注")
+        payload = self._get(
+            "/person/getuserattention",
+            {"type": 0, "user_id": account.user_id, "p": page, "page_size": page_size},
+        )
+        if payload.get("success") is not True:
+            raise ApiError(self._payload_message(payload))
+        info = payload.get("info") or {}
+        rows = (info.get("Datas") or []) if isinstance(info, dict) else []
+        items: list[MediaItem] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            user_id = _to_int(row.get("id"))
+            name = _text(row.get("username")).strip()
+            if user_id and name:
+                items.append(MediaItem(kind="publisher_account", id=user_id, title=name, raw=row))
+        return items
 
     def purchased_dramas(self, page: int = 1, page_size: int = 30) -> list[MediaItem]:
         try:
@@ -2107,6 +2306,46 @@ class MaoerApi:
             if item:
                 items.append(item)
         return self._mark_purchased_dramas(items)
+
+    def publisher_dramas(
+        self, profile: PublisherProfile, page: int = 1, page_size: int = 30,
+    ) -> list[MediaItem]:
+        payload = self._get(
+            "/dramaapi/getuserdramas",
+            {"user_id": profile.user_id, "page": page, "page_size": page_size},
+        )
+        if payload.get("success") is not True:
+            raise ApiError(self._payload_message(payload))
+        info = payload.get("info") or {}
+        rows = (info.get("Datas") or []) if isinstance(info, dict) else []
+        items: list[MediaItem] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            item = self._drama_item({**row, "user_id": profile.user_id, "_publisher_name": profile.name})
+            if item:
+                items.append(item)
+        return self._mark_purchased_dramas(items)
+
+    def publisher_sounds(
+        self, profile: PublisherProfile, page: int = 1, page_size: int = 30,
+    ) -> list[MediaItem]:
+        payload = self._get(
+            "/person/getusersound",
+            {"user_id": profile.user_id, "page": page, "page_size": page_size},
+        )
+        if payload.get("success") is not True:
+            raise ApiError(self._payload_message(payload))
+        info = payload.get("info") or {}
+        rows = (info.get("Datas") or []) if isinstance(info, dict) else []
+        items: list[MediaItem] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            item = self._sound_item({**row, "user_id": profile.user_id, "_publisher_name": profile.name})
+            if item:
+                items.append(item)
+        return items
 
     def user_favorite_folders(self, user_id: int, page: int = 1, page_size: int = 30) -> list[MediaItem]:
         data = self._get(
@@ -2423,14 +2662,14 @@ class MaoerApi:
         return _duration_text_ms(html.unescape(text))
 
     def _subscription_drama_item(self, data: dict[str, Any]) -> MediaItem | None:
-        item = self._drama_item(data, fallback_subtitle="剧集订阅")
+        item = self._drama_item(data, fallback_subtitle="我的追剧")
         if item:
             return item
 
         for key in ("drama", "drama_info", "radio_drama", "radioDrama", "mdrama"):
             drama = data.get(key)
             if isinstance(drama, dict):
-                item = self._drama_item(drama, fallback_subtitle="剧集订阅")
+                item = self._drama_item(drama, fallback_subtitle="我的追剧")
                 if item:
                     return item
 
@@ -2449,7 +2688,7 @@ class MaoerApi:
             kind="drama",
             id=drama_id,
             title=title or str(drama_id),
-            subtitle="剧集订阅",
+            subtitle="我的追剧",
             need_pay=_to_bool(data.get("need_pay")),
             pay_type=_to_int(data.get("pay_type")),
             price=_to_int(data.get("price")),

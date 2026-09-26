@@ -5,6 +5,8 @@ import os
 from functools import lru_cache
 from typing import Any
 
+from tolk_bridge import TolkBridge
+
 
 EVENT_OBJECT_LIVEREGIONCHANGED = 0x8019
 OBJID_CLIENT_DWORD = ctypes.c_ulong(-4).value
@@ -19,14 +21,21 @@ def debug_log(message: str) -> None:
 
 
 class ScreenReaderAnnouncer:
-    def __init__(self, live_region: Any) -> None:
+    def __init__(self, live_region: Any, *, native_only: bool = False) -> None:
         self.live_region = live_region
         self._live_region_ready = False
         self._failed = os.name != "nt"
+        # Form validation belongs to the reader's native UI feedback, not
+        # the application's direct subtitle/speech channel.
+        self._tolk = None if native_only else TolkBridge()
 
     def announce(self, message: str) -> bool:
         text = " ".join((message or "").split())
-        if not text or self._failed:
+        if not text:
+            return False
+        if self._tolk is not None and self._tolk.speak(text):
+            return True
+        if self._failed:
             return False
 
         try:
@@ -45,6 +54,10 @@ class ScreenReaderAnnouncer:
             debug_log(f"announce failed: {type(exc).__name__}: {exc}")
             self._failed = True
             return False
+
+    def close(self) -> None:
+        if self._tolk is not None:
+            self._tolk.close()
 
     def _handle(self) -> int:
         handle = int(self.live_region.GetHandle())

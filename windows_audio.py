@@ -87,35 +87,31 @@ def _set_device_volume(
             objects["IMMDeviceEnumerator"],
             objects["CLSCTX_ALL"],
         )
-        device = enumerator.GetDefaultAudioEndpoint(0, 1)
-        manager = device.Activate(
-            objects["IAudioSessionManager2"]._iid_,
-            objects["CLSCTX_ALL"],
-            None,
-        ).QueryInterface(objects["IAudioSessionManager2"])
-        session_enum = manager.GetSessionEnumerator()
-        count = session_enum.GetCount()
+        devices = enumerator.EnumAudioEndpoints(0, 1)
     except Exception as exc:
         debug_log(f"set_volume enumerate failed: {type(exc).__name__}: {exc}")
         return False
 
     table = _process_table()
     sessions = []
-    for index in range(count):
+    for device_index in range(devices.GetCount()):
         try:
-            session = session_enum.GetSession(index)
-            control2 = session.QueryInterface(objects["IAudioSessionControl2"])
-            pid = int(control2.GetProcessId())
-            metadata = _session_metadata(session, control2)
+            device = devices.Item(device_index)
+            manager = device.Activate(objects["IAudioSessionManager2"]._iid_, objects["CLSCTX_ALL"], None).QueryInterface(objects["IAudioSessionManager2"])
+            session_enum = manager.GetSessionEnumerator()
         except Exception as exc:
-            debug_log(f"session index={index} read failed: {type(exc).__name__}: {exc}")
+            debug_log(f"device index={device_index} read failed: {type(exc).__name__}: {exc}")
             continue
-        process_name = table.get(pid, (0, ""))[1]
-        debug_log(
-            f"session index={index} pid={pid} process={process_name or '<unknown>'} "
-            f"metadata={metadata[:180]!r}"
-        )
-        sessions.append((pid, process_name, metadata, session))
+        for index in range(session_enum.GetCount()):
+            try:
+                session = session_enum.GetSession(index)
+                control2 = session.QueryInterface(objects["IAudioSessionControl2"])
+                pid = int(control2.GetProcessId())
+                metadata = _session_metadata(session, control2)
+            except Exception as exc:
+                debug_log(f"session index={index} read failed: {type(exc).__name__}: {exc}")
+                continue
+            sessions.append((pid, table.get(pid, (0, ""))[1], metadata, session))
 
     changed = _set_session_volumes(sessions, target_pids, names, objects, level)
     debug_log(f"set_volume changed={changed}")
@@ -233,6 +229,9 @@ def _audio_interfaces() -> dict[str, object]:
     class IMMDeviceEnumerator(IUnknown):
         pass
 
+    class IMMDeviceCollection(IUnknown):
+        pass
+
     class IAudioSessionEnumerator(IUnknown):
         pass
 
@@ -259,6 +258,17 @@ def _audio_interfaces() -> dict[str, object]:
             (["in"], c_void_p, "pActivationParams"),
             (["out"], POINTER(POINTER(IUnknown)), "ppInterface"),
         ),
+        COMMETHOD([], HRESULT, "OpenPropertyStore", (["in"], DWORD, "access"),
+                  (["out"], POINTER(POINTER(IUnknown)), "store")),
+        COMMETHOD([], HRESULT, "GetId", (["out"], POINTER(c_wchar_p), "id")),
+        COMMETHOD([], HRESULT, "GetState", (["out"], POINTER(DWORD), "state")),
+    ]
+
+    IMMDeviceCollection._iid_ = GUID("{0BD7A1BE-7A1A-44DB-8397-C0A3A3E64746}")
+    IMMDeviceCollection._methods_ = [
+        COMMETHOD([], HRESULT, "GetCount", (["out"], POINTER(DWORD), "count")),
+        COMMETHOD([], HRESULT, "Item", (["in"], DWORD, "index"),
+                  (["out"], POINTER(POINTER(IMMDevice)), "device")),
     ]
 
     IMMDeviceEnumerator._iid_ = GUID("{A95664D2-9614-4F35-A746-DE8DB63617E6}")
@@ -269,7 +279,7 @@ def _audio_interfaces() -> dict[str, object]:
             "EnumAudioEndpoints",
             (["in"], c_int, "dataFlow"),
             (["in"], DWORD, "dwStateMask"),
-            (["out"], POINTER(c_void_p), "ppDevices"),
+            (["out"], POINTER(POINTER(IMMDeviceCollection)), "ppDevices"),
         ),
         COMMETHOD(
             [],

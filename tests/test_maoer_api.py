@@ -1,14 +1,165 @@
 import json
 import unittest
 from datetime import datetime
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import requests
 
-from maoer_api import BASE_URL, ApiError, DANMAKU_MODE_SUBTITLE, MaoerApi, MediaItem, PurchaseRequired
+from maoer_api import AccountInfo, BASE_URL, ApiError, DANMAKU_MODE_SUBTITLE, MaoerApi, MediaItem, PublisherProfile, PurchaseRequired
 
 
 SUBTITLE_URL = "https://static.example/subtitle.json"
+
+
+class PublisherNavigationTests(unittest.TestCase):
+    def test_followed_accounts_come_from_signed_in_account(self):
+        api = MaoerApi(cookie="test-cookie")
+        api.account_info = Mock(return_value=AccountInfo(123, "我", ""))
+        api._get = Mock(return_value={"success": True, "info": {"Datas": [
+            {"id": 10452520, "username": "三米造事务所", "attention": 1},
+        ]}})
+
+        items = api.followed_accounts(page=2)
+
+        api._get.assert_called_once_with("/person/getuserattention", {
+            "type": 0, "user_id": 123, "p": 2, "page_size": 30,
+        })
+        self.assertEqual([(item.kind, item.id, item.title) for item in items],
+                         [("publisher_account", 10452520, "三米造事务所")])
+
+    def test_followed_accounts_require_login(self):
+        api = MaoerApi(cookie="")
+        api._get = Mock()
+        with self.assertRaisesRegex(ApiError, "请先登录"):
+            api.followed_accounts()
+        api._get.assert_not_called()
+
+    def test_sound_opens_only_its_actual_drama(self):
+        api = MaoerApi(cookie="")
+        api._get = Mock(return_value={"success": True, "info": {
+            "drama": {"id": 94733, "name": "灯花笑 上季", "user_id": 10452520,
+                      "username": "三米造事务所", "author": "千山茶客"},
+        }})
+
+        item = api.drama_for_sound(13042654)
+
+        api._get.assert_called_once_with("/dramaapi/getdramabysound", {"sound_id": 13042654})
+        self.assertEqual((item.kind, item.id, item.title), ("drama", 94733, "灯花笑 上季"))
+        self.assertEqual(item.raw["username"], "三米造事务所")
+
+    def test_standalone_sound_reports_no_drama(self):
+        api = MaoerApi(cookie="")
+        api._get = Mock(return_value={"success": True, "info": {}})
+        with self.assertRaisesRegex(ApiError, "没有关联的剧集"):
+            api.drama_for_sound(123)
+
+    def test_sound_publisher_uses_uploader_account(self):
+        api = MaoerApi(cookie="")
+        api._get = Mock(side_effect=[
+            {"info": {"sound": {"id": 13042654, "user_id": 10452520,
+                                  "username": "三米造事务所"},
+                      "user": {"id": 10452520, "username": "三米造事务所"}}},
+            {"success": True, "info": {"id": 10452520, "username": "三米造事务所",
+                                       "fansnum": 0, "follownum": 1,
+                                       "userintro": "<p>同名微博：三米造事务所</p>"}},
+        ])
+
+        profile = api.publisher_profile_for_item(MediaItem(kind="sound", id=13042654, title="预告"))
+
+        self.assertEqual(profile.user_id, 10452520)
+        self.assertEqual(profile.name, "三米造事务所")
+        self.assertEqual((profile.followers, profile.following), (0, 1))
+        self.assertEqual(profile.bio, "同名微博：三米造事务所")
+
+    def test_profile_preloads_follow_status_and_follow_action_uses_official_type(self):
+        api = MaoerApi(cookie="test-cookie")
+        api._get = Mock(return_value={"success": True, "info": {
+            "id": 10452520, "username": "三米造事务所", "fansnum": 3,
+            "follownum": 1, "followed": 1,
+        }})
+        api._post_form_api = Mock(side_effect=[
+            {"success": True, "info": "取消关注成功"},
+            {"success": True, "info": "关注成功"},
+        ])
+
+        profile = api.publisher_profile(10452520)
+        cancel_message = api.set_publisher_follow(profile.user_id, False)
+        follow_message = api.set_publisher_follow(profile.user_id, True)
+
+        self.assertTrue(profile.followed)
+        self.assertEqual((cancel_message, follow_message), ("取消关注成功", "关注成功"))
+        self.assertEqual(api._post_form_api.call_args_list[0].args[1],
+                         {"attentionid": 10452520, "type": 0})
+        self.assertEqual(api._post_form_api.call_args_list[1].args[1],
+                         {"attentionid": 10452520, "type": 1})
+
+    def test_drama_publisher_is_not_original_author(self):
+        api = MaoerApi(cookie="")
+        api._get = Mock(side_effect=[
+            {"info": {"drama": {"id": 94733, "user_id": 10452520, "author": "千山茶客"}}},
+            {"success": True, "info": {"id": 10452520, "username": "三米造事务所",
+                                       "fansnum": 194648, "follownum": 1, "userintro": "简介"}},
+        ])
+
+        profile = api.publisher_profile_for_item(MediaItem(kind="drama", id=94733, title="灯花笑"))
+
+        self.assertEqual(profile.name, "三米造事务所")
+
+    def test_publisher_lists_use_published_works_not_followed_works(self):
+        api = MaoerApi(cookie="")
+        profile = PublisherProfile(10452520, "三米造事务所", 100, 1, "简介")
+        api._get = Mock(side_effect=[
+            {"success": True, "info": {"Datas": [{"id": 94733, "name": "灯花笑 上季"}]}},
+            {"success": True, "info": {"Datas": [{"id": 13042654, "soundstr": "预告·归路"}]}},
+        ])
+
+        dramas = api.publisher_dramas(profile, page=2)
+        sounds = api.publisher_sounds(profile, page=2)
+
+        self.assertEqual(api._get.call_args_list[0].args[0], "/dramaapi/getuserdramas")
+        self.assertEqual(api._get.call_args_list[1].args[0], "/person/getusersound")
+        self.assertEqual([item.id for item in dramas], [94733])
+        self.assertEqual([item.id for item in sounds], [13042654])
+        self.assertEqual(dramas[0].raw["_publisher_name"], profile.name)
+        self.assertEqual(sounds[0].raw["_publisher_name"], profile.name)
+
+
+class PlaybackHistoryTests(unittest.TestCase):
+    def test_account_history_preserves_dates_order_and_sound_ids(self):
+        api = MaoerApi(cookie="test-cookie")
+        api._get = Mock(return_value={
+            "success": True,
+            "info": [
+                {"time": "今天", "sound": [
+                    {"id": 12, "soundstr": "第一集"},
+                    {"id": 13, "soundstr": "第二集"},
+                ]},
+                {"time": "昨天", "sound": [{"id": 9, "soundstr": "旧音频"}]},
+            ],
+        })
+
+        items = api.playback_history()
+
+        api._get.assert_called_once_with("/mperson/gethistory")
+        self.assertEqual([(item.kind, item.id, item.title) for item in items], [
+            ("sound", 12, "第一集"),
+            ("sound", 13, "第二集"),
+            ("sound", 9, "旧音频"),
+        ])
+        self.assertEqual([item.raw["_history_date"] for item in items], ["今天", "今天", "昨天"])
+        self.assertNotIn("position", items[0].raw)
+
+    def test_history_requires_login_and_rejects_failed_response(self):
+        api = MaoerApi(cookie="")
+        api._get = Mock()
+        with self.assertRaisesRegex(ApiError, "请先登录"):
+            api.playback_history()
+        api._get.assert_not_called()
+
+        api = MaoerApi(cookie="test-cookie")
+        api._get = Mock(return_value={"success": False, "info": "需要登录"})
+        with self.assertRaisesRegex(ApiError, "需要登录"):
+            api.playback_history()
 
 
 class AccountMembershipTests(unittest.TestCase):
@@ -123,6 +274,213 @@ class FakeMemberPlaybackApi(MaoerApi):
 
 
 class SubtitleCompatibilityTests(unittest.TestCase):
+    def test_json_display_segments_are_not_rewritten_using_xml_evidence(self):
+        api = MaoerApi(cookie="")
+        xml = '<i><d p="587.42,4,25,0">露西：宝贝，是我把你累着了吗？</d></i>'
+        data = json.dumps([
+            {"start_time": 586520, "end_time": 587270, "role": "露西", "content": "宝贝 是我把你累着了吗？"},
+            {"start_time": 587270, "end_time": 589025, "role": "系统", "content": "系统的文字"},
+            {"start_time": 587270, "end_time": 589025, "role": "露西", "content": "宝贝 是我把你累着了吗？"},
+        ])
+        with patch.object(api, "_get_text", side_effect=lambda path, params=None: xml if path == "/sound/getdm" else data):
+            items = api.sound_danmaku(123, subtitle_url=SUBTITLE_URL)
+        self.assertEqual([item.time for item in items], [586.52, 587.27, 587.27])
+
+    def test_continuous_same_json_words_remain_when_xml_has_two_distinct_utterances(self):
+        api = MaoerApi(cookie="")
+        xml = '<i><d p="1.1,4,25,0">甲：你到底有没有听见</d><d p="3.1,4,25,0">甲：你到底有没有听见</d></i>'
+        data = json.dumps([
+            {"start_time": 1000, "end_time": 3000, "role": "甲", "content": "你到底有没有听见"},
+            {"start_time": 3000, "end_time": 5000, "role": "甲", "content": "你到底有没有听见"},
+        ])
+        with patch.object(api, "_get_text", side_effect=lambda path, params=None: xml if path == "/sound/getdm" else data):
+            items = api.sound_danmaku(123, subtitle_url=SUBTITLE_URL)
+        self.assertEqual([item.time for item in items], [1, 3])
+
+    def test_missing_json_end_times_are_not_evidence_of_continuous_display(self):
+        api = MaoerApi(cookie="")
+        xml = '<i><d p="1.1,4,25,0">甲：你到底有没有听见</d></i>'
+        data = json.dumps([
+            {"start_time": 1000, "role": "甲", "content": "你到底有没有听见"},
+            {"start_time": 3000, "role": "甲", "content": "你到底有没有听见"},
+        ])
+        with patch.object(api, "_get_text", side_effect=lambda path, params=None: xml if path == "/sound/getdm" else data):
+            items = api.sound_danmaku(123, subtitle_url=SUBTITLE_URL)
+        self.assertEqual([item.time for item in items], [1, 3])
+
+    def test_scene_copies_and_xml_only_later_repeat_are_not_added_to_json_track(self):
+        api = MaoerApi(cookie="")
+        for scene in ("【酒吧】", "【酒店 宴会厅彩排现场】"):
+            with self.subTest(scene=scene):
+                xml = f'<i><d p="100,4,25,0">{scene}</d><d p="300,4,25,0">{scene}</d></i>'
+                data = json.dumps([{"start_time": 108500, "end_time": 110000, "content": scene}])
+                with patch.object(api, "_get_text", side_effect=lambda path, params=None: xml if path == "/sound/getdm" else data):
+                    items = api.sound_danmaku(123, subtitle_url=SUBTITLE_URL)
+                self.assertEqual([item.time for item in items], [108.5])
+
+    def test_json_continuation_does_not_import_xml_contributor_or_content(self):
+        api = MaoerApi(cookie="")
+        xml = '<i><d p="463.22,4,25,0,0,0,3586609">竟然觉得她今晚看着还挺顺眼的</d></i>'
+        data = '[{"start_time":463187,"end_time":466634,"role":"栾念","content":"竟然觉得她今晚看着还挺顺眼"}]'
+        with patch.object(api, "_get_text", side_effect=lambda path, params=None: xml if path == "/sound/getdm" else data):
+            items = api.sound_danmaku(123, subtitle_url=SUBTITLE_URL)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].user_id, "")
+        self.assertEqual(items[0].text, "栾念：竟然觉得她今晚看着还挺顺眼")
+        self.assertEqual(items[0].role, "栾念")
+
+    def test_other_xml_roles_and_changed_meaning_do_not_supplement_json(self):
+        api = MaoerApi(cookie="")
+        for text in ("乙：今天晚上的晚会大家都参加的", "甲：今天晚上的晚会大家都不参加", "今天晚上的晚会大家都参加的好多啊"):
+            with self.subTest(text=text):
+                xml = f'<i><d p="1.2,4,25,0">{text}</d></i>'
+                data = '[{"start_time":1000,"end_time":3000,"role":"甲","content":"今天晚上的晚会大家都参加"}]'
+                with patch.object(api, "_get_text", side_effect=lambda path, params=None: xml if path == "/sound/getdm" else data):
+                    items = api.sound_danmaku(123, subtitle_url=SUBTITLE_URL)
+                self.assertEqual([item.text for item in items], ["甲：今天晚上的晚会大家都参加"])
+
+    def test_short_role_labelled_caption_merges_despite_small_source_timing_drift(self):
+        api = MaoerApi(cookie="")
+        for role, content, start, end, xml_time in (
+            ("栾念", "嗯？", 778269, 779992, 778.79),
+            ("尚之桃", "……", 2119256, 2122000, 2119.79),
+            ("甲", "好", 1000, 3000, 1.7),
+            ("尚之桃", "可以呀 其实我们是第一次做这么大的项目", 154063, 157000, 153.5),
+            ("姜澜", "当然啊", 280152, 282000, 279.43),
+            ("甲", "好", 1700, 3000, 1.0),
+        ):
+            with self.subTest(role=role):
+                xml = f'<i><d p="{xml_time},4,25,0">{role}：{content}</d></i>'
+                data = json.dumps([{"start_time": start, "end_time": end, "role": role, "content": content}])
+                with patch.object(api, "_get_text", side_effect=lambda path, params=None: xml if path == "/sound/getdm" else data):
+                    items = api.sound_danmaku(9100588, subtitle_url=SUBTITLE_URL)
+                self.assertEqual([(item.time, item.text) for item in items], [(start / 1000, f"{role}：{content}")])
+
+    def test_short_xml_lines_are_excluded_regardless_of_role_or_timing(self):
+        api = MaoerApi(cookie="")
+        for text in ("嗯？", "乙：嗯？"):
+            with self.subTest(text=text):
+                xml = f'<i><d p="1.65,4,25,0">{text}</d></i>'
+                data = '[{"start_time":1000,"end_time":3000,"role":"甲","content":"嗯？"}]'
+                with patch.object(api, "_get_text", side_effect=lambda path, params=None: xml if path == "/sound/getdm" else data):
+                    items = api.sound_danmaku(123, subtitle_url=SUBTITLE_URL)
+                self.assertEqual([item.text for item in items], ["甲：嗯？"])
+
+    def test_xml_response_order_does_not_change_selected_json(self):
+        api = MaoerApi(cookie="")
+        data = '[{"start_time":1000,"end_time":3000,"role":"甲","content":"嗯？"}]'
+        for times in ((1.55, 1.70), (1.70, 1.55)):
+            with self.subTest(times=times):
+                xml = '<i>' + ''.join(f'<d p="{time},4,25,0">甲：嗯？</d>' for time in times) + '</i>'
+                with patch.object(api, "_get_text", side_effect=lambda path, params=None: xml if path == "/sound/getdm" else data):
+                    items = api.sound_danmaku(123, subtitle_url=SUBTITLE_URL)
+                self.assertEqual([item.time for item in items], [1.0])
+
+    def test_split_xml_captions_do_not_repeat_a_complete_json_line(self) -> None:
+        api = MaoerApi(cookie="")
+        xml = (
+            '<i><d p="151.02,4,25,0,0,0,10283562,1">陆驿站：你这几天还好吗？</d>'
+            '<d p="152.61,4,25,0,0,0,10283562,2">难过？生气？</d>'
+            '<d p="153.20,4,25,0,0,0,10283562,3">【开门声】</d></i>'
+        )
+        json_subtitles = json.dumps([{
+            "start_time": 150560, "end_time": 154770, "role": "陆驿站",
+            "content": "你这几天还好吗？难过？生气？",
+        }], ensure_ascii=False)
+        with patch.object(api, "_get_text", side_effect=lambda path, params=None: xml if path == "/sound/getdm" else json_subtitles):
+            items = api.sound_danmaku(7741548, subtitle_url=SUBTITLE_URL)
+
+        self.assertEqual([(item.time, item.text) for item in items], [
+            (150.56, "陆驿站：你这几天还好吗？难过？生气？"),
+        ])
+
+    def test_nearby_punctuation_variant_is_one_subtitle(self) -> None:
+        api = MaoerApi(cookie="")
+        xml = '<i><d p="148.14,4,25,0,0,0,4034642,1">白柳：嗯，差不多是这样</d></i>'
+        json_subtitles = json.dumps([{
+            "start_time": 147740, "end_time": 150000, "role": "白柳",
+            "content": "嗯 差不多是这样",
+        }], ensure_ascii=False)
+        with patch.object(api, "_get_text", side_effect=lambda path, params=None: xml if path == "/sound/getdm" else json_subtitles):
+            items = api.sound_danmaku(7741548, subtitle_url=SUBTITLE_URL)
+
+        self.assertEqual([item.text for item in items], ["白柳：嗯 差不多是这样"])
+
+    def test_separate_xml_repeated_line_does_not_supplement_json(self) -> None:
+        api = MaoerApi(cookie="")
+        xml = (
+            '<i><d p="1.1,4,25,0,0,0,1,1">陆驿站：你这几天还好吗？</d>'
+            '<d p="3.0,4,25,0,0,0,1,2">陆驿站：你这几天还好吗？</d></i>'
+        )
+        json_subtitles = json.dumps([{
+            "start_time": 1000, "end_time": 3500, "role": "陆驿站",
+            "content": "你这几天还好吗？",
+        }], ensure_ascii=False)
+        with patch.object(api, "_get_text", side_effect=lambda path, params=None: xml if path == "/sound/getdm" else json_subtitles):
+            items = api.sound_danmaku(123, subtitle_url=SUBTITLE_URL)
+
+        self.assertEqual([(item.time, item.text) for item in items], [
+            (1.0, "陆驿站：你这几天还好吗？"),
+        ])
+
+    def test_xml_content_only_merges_with_nearby_structured_dialogue(self) -> None:
+        api = MaoerApi(cookie="")
+        xml = '<i><d p="1.0,4,25,0">你好</d><d p="3.0,4,25,0">你好</d></i>'
+        json_subtitles = '[{"start_time":1250,"role":"甲","content":"你好"}]'
+        with patch.object(api, "_get_text", side_effect=lambda path, params=None: xml if path == "/sound/getdm" else json_subtitles):
+            items = api.sound_danmaku(123, subtitle_url=SUBTITLE_URL)
+
+        self.assertEqual([(item.time, item.text) for item in items],
+                         [(1.25, "甲：你好")])
+        self.assertEqual((items[0].role, items[0].content), ("甲", "你好"))
+
+    def test_overlapping_sources_use_json_and_exclude_xml_only_repeat(self) -> None:
+        api = MaoerApi(cookie="")
+        xml = (
+            '<i><d p="1.0,4,25,0">甲:你好</d>'
+            '<d p="3.0,4,25,0">甲：你好</d></i>'
+        )
+        json_subtitles = '[{"start_time":1250,"role":"甲","content":"你好"}]'
+        with patch.object(api, "_get_text", side_effect=lambda path, params=None: xml if path == "/sound/getdm" else json_subtitles):
+            items = api.sound_danmaku(123, subtitle_url=SUBTITLE_URL)
+
+        self.assertEqual([(item.time, item.text) for item in items],
+                         [(1.25, "甲：你好")])
+        self.assertEqual((items[0].role, items[0].content), ("甲", "你好"))
+
+    def test_json_content_already_containing_speaker_is_not_doubled(self) -> None:
+        api = MaoerApi(cookie="")
+        xml = '<i><d p="1.0,4,25,0">陆驿站：你这几天还好吗？</d></i>'
+        json_subtitles = '[{"start_time":1250,"role":"陆驿站","content":"陆驿站：你这几天还好吗？"}]'
+        with patch.object(api, "_get_text", side_effect=lambda path, params=None: xml if path == "/sound/getdm" else json_subtitles):
+            items = api.sound_danmaku(7741548, subtitle_url=SUBTITLE_URL)
+
+        self.assertEqual([(item.time, item.text) for item in items],
+                         [(1.25, "陆驿站：你这几天还好吗？")])
+        self.assertEqual((items[0].role, items[0].content), ("陆驿站", "你这几天还好吗？"))
+
+    def test_speaker_prefix_normalisation_handles_other_roles_and_colons(self) -> None:
+        api = MaoerApi(cookie="")
+        json_subtitles = json.dumps([
+            {"start_time": 1000, "role": "白柳", "content": "白柳: 你在这里啊"},
+            {"start_time": 2000, "role": "裴云暎", "content": "裴云暎：裴云暎：我知道了"},
+            {"start_time": 3000, "role": "陆驿站", "content": "白柳：你这几天还好吗？"},
+        ], ensure_ascii=False)
+        with patch.object(api, "_get_text", side_effect=lambda path, params=None: "<i/>" if path == "/sound/getdm" else json_subtitles):
+            items = api.sound_danmaku(123, subtitle_url=SUBTITLE_URL)
+
+        self.assertEqual([item.text for item in items], [
+            "白柳：你在这里啊", "裴云暎：我知道了", "陆驿站：白柳：你这几天还好吗？",
+        ])
+
+    def test_legacy_xml_subtitle_with_repeated_speaker_is_readable_once(self) -> None:
+        api = MaoerApi(cookie="")
+        xml = '<i><d p="1.0,4,25,0">陆驿站：陆驿站：你这几天还好吗？</d></i>'
+        with patch.object(api, "_get_text", return_value=xml):
+            items = api.sound_danmaku(7741548, subtitle_url="")
+
+        self.assertEqual([item.text for item in items], ["陆驿站：你这几天还好吗？"])
+
     def test_loads_independent_json_subtitles(self) -> None:
         api = FakeSubtitleApi()
 
@@ -132,6 +490,8 @@ class SubtitleCompatibilityTests(unittest.TestCase):
         self.assertEqual([item.time for item in items], [0.5, 1.25, 2.5])
         self.assertEqual([item.mode for item in items], [DANMAKU_MODE_SUBTITLE, DANMAKU_MODE_SUBTITLE, 1])
         self.assertEqual(items[1].color, 1122867)
+        self.assertEqual([(item.role, item.content) for item in items[:2]],
+                         [("", "旁白"), ("甲", "你好")])
         self.assertEqual(api.requested_paths, ["/sound/getdm", SUBTITLE_URL])
 
     def test_playback_info_preserves_subtitle_url(self) -> None:
@@ -308,6 +668,18 @@ class SoundIntroTests(unittest.TestCase):
 
 
 class DramaFollowTests(unittest.TestCase):
+    def test_cached_follow_status_reuses_authenticated_detail_without_request(self):
+        api = MaoerApi(cookie="test-cookie")
+        api._get = Mock()
+        api._drama_detail_cache[12] = {"like": 1}
+        self.assertTrue(api.cached_drama_follow_status(12))
+        api._drama_detail_cache[12] = {"like": 0}
+        self.assertFalse(api.cached_drama_follow_status(12))
+        api._get.assert_not_called()
+
+        api.set_cookie("another-cookie")
+        self.assertIsNone(api.cached_drama_follow_status(12))
+
     def test_status_reads_account_specific_detail_without_using_cache(self):
         api = MaoerApi(cookie="test-cookie")
         api._drama_detail_cache[12] = {"like": 0}

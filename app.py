@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import os
+import math
 from pathlib import Path
 import re
 import sys
@@ -13,7 +14,11 @@ import requests
 import wx
 
 from app_paths import clear_webview2_profile
-from app_settings import AppSettings, load_settings, save_settings
+from audio_output import AudioOutputRouter, SYSTEM_OUTPUT
+from app_settings import (
+    AppSettings, SubtitleFilterPreset, SubtitleFilterRules, default_filter_presets,
+    load_settings, save_settings,
+)
 from browser_player import (
     HiddenBrowserPlayer,
     PlayerUnavailable,
@@ -38,6 +43,7 @@ from maoer_api import (
     CommentPage,
     MediaItem,
     PlaybackInfo,
+    PublisherProfile,
     PurchaseRequired,
     SoundPurchaseInfo,
 )
@@ -51,6 +57,92 @@ APP_TITLE = "猫耳FM"
 APP_AUTHOR = "欢喜就好&谷雨"
 HOTKEYS_TEXT_NAME = "热键表.txt"
 UPDATE_TEXT_NAME = "update.txt"
+NON_DIALOGUE_SUBTITLE_ROLES = frozenset({
+    "旁白", "报幕", "音效", "音乐", "背景音乐", "环境音", "动作", "场景", "提示", "提示音", "系统", "说明", "解说", "画外音",
+})
+NON_DIALOGUE_SUBTITLE_CONTENT = re.compile(
+    r"^(?:\s*(?:（[^（）]+）|\([^()]+\)|【[^【】]+】|\[[^\[\]]+\]|<[^<>]+>)\s*)+$"
+)
+SUBTITLE_ROLE_PREFIX = re.compile(r"^\s*([^：:\r\n]{1,30})\s*[：:]\s*(\S[\s\S]*)$")
+STORY_BARRAGE_SUBTITLE_ROLE = re.compile(r"弹幕\d*")
+SUBTITLE_OS_MARKER = re.compile(r"(?:[（(]\s*OS\s*[）)]|[【\[]\s*OS\s*[】\]])", re.IGNORECASE)
+SUBTITLE_OS_ROLE_SUFFIX = re.compile(r"(?<=[\u3400-\u9fff])\s*OS$|(?<=\s)OS$", re.IGNORECASE)
+NON_DIALOGUE_ANNOUNCEMENT_PREFIX = re.compile(
+    r"^(?:本(?:作品|剧|广播剧|节目)\s*由|[（(【\[]\s*(?:报幕|旁白|解说)\s*[）)】\]])"
+)
+SUBTITLE_CONTINUATION_MAX_GAP = 8.0
+
+
+def is_character_dialogue_subtitle(item: DanmakuItem) -> bool:
+    # A whole bracketed caption is a scene/action cue, even if the JSON
+    # provider split an internal colon into role and content.
+    if NON_DIALOGUE_SUBTITLE_CONTENT.fullmatch(item.text.strip()):
+        return False
+    role = item.role.strip()
+    content = item.content.strip()
+    if not role or not content:
+        match = SUBTITLE_ROLE_PREFIX.fullmatch(item.text.strip())
+        if match:
+            role, content = match.group(1).strip(), match.group(2).strip()
+    return bool(
+        role and content
+        and role not in NON_DIALOGUE_SUBTITLE_ROLES
+        and not NON_DIALOGUE_SUBTITLE_CONTENT.fullmatch(content)
+        and not NON_DIALOGUE_ANNOUNCEMENT_PREFIX.match(content)
+    )
+
+
+def is_story_barrage_subtitle(item: DanmakuItem) -> bool:
+    role = item.role.strip()
+    if not role:
+        match = SUBTITLE_ROLE_PREFIX.fullmatch(item.text.strip())
+        role = match.group(1).strip() if match else ""
+    return bool(STORY_BARRAGE_SUBTITLE_ROLE.fullmatch(role))
+
+
+def mark_dialogue_continuations(items: list[DanmakuItem]) -> list[DanmakuItem]:
+    """Classify unlabelled XML caption lines without altering their spoken text."""
+    marked: list[DanmakuItem] = []
+    # XML subtitle contributor IDs are not speaker IDs: one contributor may
+    # caption several actors. Track the last *explicit* role for each
+    # contributor so interleaved lines do not break a speaker's continuation.
+    speaker_by_submitter: dict[str, tuple[str, float]] = {}
+    for item in sorted(items, key=lambda entry: entry.time):
+        if item.mode != DANMAKU_MODE_SUBTITLE:
+            marked.append(item)
+            continue
+
+        text = item.text.strip()
+        if NON_DIALOGUE_SUBTITLE_CONTENT.fullmatch(text):
+            speaker_by_submitter.clear()
+            marked.append(item)
+            continue
+        role = item.role.strip()
+        content = item.content.strip()
+        if not role or not content:
+            explicit = SUBTITLE_ROLE_PREFIX.fullmatch(text)
+            if explicit:
+                role, content = explicit.group(1).strip(), explicit.group(2).strip()
+
+        if role and content:
+            if is_character_dialogue_subtitle(item):
+                if item.user_id:
+                    speaker_by_submitter[item.user_id] = (role, item.time)
+            elif role in NON_DIALOGUE_SUBTITLE_ROLES or NON_DIALOGUE_ANNOUNCEMENT_PREFIX.match(content):
+                speaker_by_submitter.clear()
+            elif item.user_id:
+                speaker_by_submitter.pop(item.user_id, None)
+        elif item.user_id and item.user_id in speaker_by_submitter:
+            speaker, last_time = speaker_by_submitter[item.user_id]
+            if 0 <= item.time - last_time <= SUBTITLE_CONTINUATION_MAX_GAP:
+                # Preserve the original text for full-reading mode.
+                item = replace(item, role=speaker, content=text)
+                speaker_by_submitter[item.user_id] = (speaker, item.time)
+            else:
+                speaker_by_submitter.pop(item.user_id, None)
+
+        marked.append(item)
+    return marked
 
 
 def program_dir() -> Path:
@@ -129,6 +221,215 @@ class MediaDetailDialog(wx.Dialog):
             self.EndModal(wx.ID_CLOSE)
             return
         event.Skip()
+
+
+class SubtitleFilterRulesDialog(wx.Dialog):
+    DIALOGUE_MODES = ("mute", "role")
+
+    def __init__(self, parent: wx.Window, presets: tuple[SubtitleFilterPreset, ...], slot: int) -> None:
+        super().__init__(parent, title="字幕过滤规则", size=(620, 680),
+                         style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        # Convert the retired choice only in this dialog's draft. Cancel
+        # leaves the saved settings and the caller's presets untouched.
+        self.presets = [
+            replace(preset, rules=replace(preset.rules, dialogue_mode="role"))
+            if preset.rules.dialogue_mode == "full" or preset.rules.speaker_transitions_only
+            else preset
+            for preset in presets
+        ]
+        self.current_slot = slot
+        panel = wx.Panel(self)
+        self.panel = panel
+        layout = wx.BoxSizer(wx.VERTICAL)
+
+        hint = wx.StaticText(panel, label=(
+            "仅在过滤模式生效；字幕朗读开启后，播放窗口按主键盘 1～0 切换方案。\n"
+            "切换方案会保留本次编辑；点击保存后统一生效，取消则放弃本次编辑。"
+        ))
+        layout.Add(hint, 0, wx.ALL, 10)
+
+        preset_row = wx.BoxSizer(wx.HORIZONTAL)
+        preset_row.Add(wx.StaticText(panel, label="当前方案"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        self.preset_choice = wx.Choice(panel, choices=[
+            f"{(index + 1) % 10}：{preset.name}" for index, preset in enumerate(self.presets)
+        ])
+        self.preset_choice.SetName("当前过滤方案")
+        self.preset_choice.SetSelection(slot)
+        preset_row.Add(self.preset_choice, 1, wx.EXPAND)
+        self.add_button = wx.Button(panel, label="新增方案")
+        preset_row.Add(self.add_button, 0, wx.LEFT, 8)
+        self.restore_default_button = wx.Button(panel, label="恢复默认")
+        preset_row.Add(self.restore_default_button, 0, wx.LEFT, 8)
+        layout.Add(preset_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        layout.Add(wx.StaticText(panel, label="方案名称"), 0, wx.LEFT | wx.RIGHT, 10)
+        self.preset_name = wx.TextCtrl(panel)
+        self.preset_name.SetName("方案名称")
+        layout.Add(self.preset_name, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        self.dialogue_mode = wx.RadioBox(
+            panel, label="人物对话", choices=["人物对话：不朗读", "人物对话：只读角色名"],
+            majorDimension=2, style=wx.RA_SPECIFY_COLS,
+        )
+        self.dialogue_mode.SetName("人物对话")
+        layout.Add(self.dialogue_mode, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        self.speaker_transitions_only = wx.CheckBox(
+            panel, label="有声书模式：旁白与角色只读名称，切换时播报",
+        )
+        self.story_barrage = wx.CheckBox(panel, label="过滤剧情弹幕字幕")
+        self.os_body = wx.CheckBox(panel, label="朗读 OS 提示（只读角色名和 OS，不读正文）")
+        self.info_label_only = wx.CheckBox(panel, label="下列信息标签只读名称，不读正文")
+        for control in (self.speaker_transitions_only, self.story_barrage,
+                        self.os_body, self.info_label_only):
+            layout.Add(control, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        self.info_labels_label = wx.StaticText(panel, label="信息标签（每行一个；默认：系统、提示音）")
+        layout.Add(self.info_labels_label, 0, wx.LEFT | wx.RIGHT, 10)
+        self.info_labels = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.BORDER_SUNKEN)
+        self.info_labels.SetName("信息标签，每行一个")
+        layout.Add(self.info_labels, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        keyword_label = wx.StaticText(panel, label="自定义过滤词（每行一个；命中后整条字幕不朗读）")
+        self.keywords = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.BORDER_SUNKEN)
+        self.keywords.SetName("自定义过滤词，每行一个，命中后整条字幕不朗读")
+        layout.Add(keyword_label, 0, wx.LEFT | wx.RIGHT, 10)
+        layout.Add(self.keywords, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        button_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.help_button = wx.Button(panel, label="规则说明")
+        button_row.Add(self.help_button, 0)
+        button_row.AddStretchSpacer(1)
+        buttons = wx.StdDialogButtonSizer()
+        ok_button = wx.Button(panel, wx.ID_OK, label="保存")
+        cancel_button = wx.Button(panel, wx.ID_CANCEL, label="取消")
+        ok_button.SetDefault()
+        buttons.AddButton(ok_button)
+        buttons.AddButton(cancel_button)
+        buttons.Realize()
+        button_row.Add(buttons, 0)
+        layout.Add(button_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        panel.SetSizer(layout)
+        self._load_slot(slot)
+        self._update_preset_buttons()
+        self.preset_choice.Bind(wx.EVT_CHOICE, self._on_slot_changed)
+        self.add_button.Bind(wx.EVT_BUTTON, self._add_preset)
+        self.restore_default_button.Bind(wx.EVT_BUTTON, self._restore_defaults)
+        self.dialogue_mode.Bind(wx.EVT_RADIOBOX, self._on_dialogue_mode_changed)
+        self.speaker_transitions_only.Bind(wx.EVT_CHECKBOX, self._on_book_mode_changed)
+        self.info_label_only.Bind(wx.EVT_CHECKBOX, self._update_rule_controls)
+        self.help_button.Bind(wx.EVT_BUTTON, self._show_rule_help)
+        self.preset_choice.SetFocus()
+
+    @staticmethod
+    def _lines(value: str) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(word for line in value.splitlines() if (word := line.strip())))
+
+    def _load_slot(self, slot: int) -> None:
+        preset = self.presets[slot]
+        rules = preset.rules
+        self.preset_name.SetValue(preset.name)
+        self.dialogue_mode.SetSelection(self.DIALOGUE_MODES.index(rules.dialogue_mode))
+        self.speaker_transitions_only.SetValue(rules.speaker_transitions_only)
+        self.story_barrage.SetValue(rules.story_barrage)
+        self.os_body.SetValue(rules.os_body)
+        self.info_label_only.SetValue(rules.info_label_only)
+        self.info_labels.SetValue("\n".join(rules.info_labels))
+        self.keywords.SetValue("\n".join(rules.keywords))
+        self._update_rule_controls()
+
+    def _store_current_slot(self) -> None:
+        slot = self.current_slot
+        name = self.preset_name.GetValue().strip() or self.presets[slot].name
+        dialogue_mode = self.DIALOGUE_MODES[self.dialogue_mode.GetSelection()]
+        rules = SubtitleFilterRules(
+            dialogue_mode=dialogue_mode,
+            speaker_transitions_only=self.speaker_transitions_only.GetValue() and dialogue_mode == "role",
+            story_barrage=self.story_barrage.GetValue(),
+            os_body=self.os_body.GetValue(),
+            info_label_only=self.info_label_only.GetValue(),
+            info_labels=self._lines(self.info_labels.GetValue()),
+            keywords=self._lines(self.keywords.GetValue()),
+        )
+        self.presets[slot] = SubtitleFilterPreset(name, rules)
+        self.preset_choice.SetString(slot, f"{(slot + 1) % 10}：{name}")
+
+    def _on_dialogue_mode_changed(self, _event: wx.CommandEvent) -> None:
+        if self.DIALOGUE_MODES[self.dialogue_mode.GetSelection()] == "mute":
+            self.speaker_transitions_only.SetValue(False)
+
+    def _on_book_mode_changed(self, _event: wx.CommandEvent) -> None:
+        if self.speaker_transitions_only.GetValue():
+            self.dialogue_mode.SetSelection(self.DIALOGUE_MODES.index("role"))
+
+    def _update_rule_controls(self, _event: wx.CommandEvent | None = None) -> None:
+        enabled = self.info_label_only.GetValue()
+        self.info_labels.Enable(enabled)
+        self.info_labels_label.Enable(enabled)
+
+    def _show_rule_help(self, _event: wx.CommandEvent) -> None:
+        content = (
+            "人物对话：可选择不朗读，或只读角色名。需要完整朗读字幕时，请在播放窗口关闭过滤模式。\n\n"
+            "有声书模式：自动选择只读角色名。旁白、角色仅在切换时播报名称，正文、场景和动作说明不读；"
+            "报幕、制作信息仍保留。将人物对话改为不朗读时，会同时关闭有声书模式。\n\n"
+            "OS：勾选后，每次出现 OS 标记会读角色名和 OS，不读正文；同一角色也会提示。"
+            "取消勾选后，整段 OS 完全不读，包括没有重复标注 OS 或角色名的连续字幕。"
+            "遇到明确的普通角色、旁白或报幕标签后，恢复该方案的正常规则。"
+            "广播剧、有声书和自定义方案均适用；关闭过滤模式后仍完整朗读字幕。\n\n"
+            "剧情弹幕：指字幕中写成弹幕、弹幕1等的剧情内容，与普通听众弹幕的朗读开关不同。\n\n"
+            "信息标签：勾选后只读系统、提示音等标签，不读其正文。每行填写一个标签。"
+            "取消勾选后，标签列表暂时停用，已填写内容会保留。\n\n"
+            "自定义过滤词：每行填写一个词，命中的整条字幕都不朗读。重复词和空白行会在保存时整理。"
+            "过滤词、剧情弹幕的过滤优先于 OS 提示。\n\n"
+            "方案管理：最多保存十套方案；前两套可恢复默认。新增后可直接编辑方案名称。"
+            "切换方案保留本次编辑；保存会保存全部方案，取消或按 Esc 不保存。"
+            "旧配置的完整朗读选项会在保存后改为只读角色名。"
+        )
+        dialog = MediaDetailDialog(self, "字幕过滤规则", content, "规则说明")
+        try:
+            dialog.content_box.SetFocus()
+            dialog.ShowModal()
+        finally:
+            dialog.Destroy()
+
+    def _on_slot_changed(self, _event: wx.CommandEvent) -> None:
+        self._store_current_slot()
+        self.current_slot = self.preset_choice.GetSelection()
+        self._load_slot(self.current_slot)
+        self._update_preset_buttons()
+
+    def _update_preset_buttons(self) -> None:
+        self.add_button.Enable(len(self.presets) < 10)
+        self.restore_default_button.Show(self.current_slot < 2)
+        self.panel.Layout()
+
+    def _add_preset(self, _event: wx.CommandEvent) -> None:
+        if len(self.presets) >= 10:
+            return
+        self._store_current_slot()
+        slot = len(self.presets)
+        preset = SubtitleFilterPreset(f"方案 {(slot + 1) % 10}")
+        self.presets.append(preset)
+        self.preset_choice.Append(f"{(slot + 1) % 10}：{preset.name}")
+        self.preset_choice.SetSelection(slot)
+        self.current_slot = slot
+        self._load_slot(slot)
+        self._update_preset_buttons()
+        self.preset_name.SetFocus()
+        self.preset_name.SelectAll()
+
+    def _restore_defaults(self, _event: wx.CommandEvent) -> None:
+        if self.current_slot >= 2:
+            return
+        preset = default_filter_presets()[self.current_slot]
+        self.presets[self.current_slot] = preset
+        self.preset_choice.SetString(self.current_slot,
+                                     f"{self.current_slot + 1}：{preset.name}")
+        self._load_slot(self.current_slot)
+        self.preset_choice.SetFocus()
+
+    def get_configuration(self) -> tuple[tuple[SubtitleFilterPreset, ...], int]:
+        self._store_current_slot()
+        return tuple(self.presets), self.current_slot
 
 
 class AccountInfoDialog(wx.Dialog):
@@ -668,6 +969,7 @@ class DanmakuSprite:
 class DanmakuCanvas(wx.Panel):
     FRAME_MS = 33
     TRAVEL_SECONDS = 8.0
+    INITIAL_SUBTITLE_CATCHUP_SECONDS = 30.0
 
     def __init__(self, parent: wx.Window) -> None:
         super().__init__(parent, style=wx.BORDER_NONE)
@@ -688,6 +990,8 @@ class DanmakuCanvas(wx.Panel):
         self.message = ""
         self.on_danmaku_due: Callable[[DanmakuItem], None] | None = None
         self.on_subtitle_due: Callable[[DanmakuItem], None] | None = None
+        self.should_read_subtitle: Callable[[DanmakuItem], bool] | None = None
+        self.pending_loaded_subtitle: DanmakuItem | None = None
         self.last_tick = time.monotonic()
         self.font = wx.Font(16, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL)
         self.timer = wx.Timer(self)
@@ -696,6 +1000,7 @@ class DanmakuCanvas(wx.Panel):
 
     def reset(self, message: str = "") -> None:
         self.items = []
+        self.pending_loaded_subtitle = None
         self.active = []
         self.next_index = 0
         self.next_lane = 0
@@ -711,12 +1016,23 @@ class DanmakuCanvas(wx.Panel):
         self.items = sorted(items, key=lambda item: item.time)
         self.active = []
         self.next_index = self._first_index_at_or_after(self.position)
+        self.pending_loaded_subtitle = None
+        # Subtitles may arrive after audio has started. Catch up to the most
+        # recent caption once, but never replay a long-stale opening scene.
+        if 0 < self.position <= self.INITIAL_SUBTITLE_CATCHUP_SECONDS:
+            for index in range(self.next_index - 1, -1, -1):
+                candidate = self.items[index]
+                if candidate.mode == DANMAKU_MODE_SUBTITLE:
+                    if self.position - candidate.time <= self.INITIAL_SUBTITLE_CATCHUP_SECONDS:
+                        self.pending_loaded_subtitle = candidate
+                    break
         self.next_lane = 0
         self.message = "" if self.items else "暂无弹幕"
         self._render_frame()
 
     def set_error(self, message: str) -> None:
         self.items = []
+        self.pending_loaded_subtitle = None
         self.active = []
         self.message = f"弹幕加载失败: {message or '未知错误'}"
         self._render_frame()
@@ -745,6 +1061,7 @@ class DanmakuCanvas(wx.Panel):
             self.position = target
             self.active = []
             self.next_index = self._first_index_at_or_after(self.position)
+            self.pending_loaded_subtitle = None
             self.next_lane = 0
         self.paused = paused
         self.last_tick = time.monotonic()
@@ -754,6 +1071,7 @@ class DanmakuCanvas(wx.Panel):
         self.position = max(0.0, self.position + float(seconds))
         self.active = []
         self.next_index = self._first_index_at_or_after(self.position)
+        self.pending_loaded_subtitle = None
         self.next_lane = 0
         self.last_tick = time.monotonic()
         self._render_frame()
@@ -830,12 +1148,19 @@ class DanmakuCanvas(wx.Panel):
         while self.next_index < len(self.items) and self.items[self.next_index].time <= now:
             item = self.items[self.next_index]
             if item.mode == DANMAKU_MODE_SUBTITLE:
-                if first_subtitle is None:
+                if first_subtitle is None and (
+                    self.should_read_subtitle is None or self.should_read_subtitle(item)
+                ):
                     first_subtitle = item
             elif first_danmaku is None:
                 first_danmaku = item
             self._spawn_item(item)
             self.next_index += 1
+        pending = self.pending_loaded_subtitle
+        self.pending_loaded_subtitle = None
+        if first_subtitle is None and pending is not None and now - pending.time <= self.INITIAL_SUBTITLE_CATCHUP_SECONDS:
+            if self.should_read_subtitle is None or self.should_read_subtitle(pending):
+                first_subtitle = pending
         if first_danmaku is not None and self.on_danmaku_due is not None:
             self.on_danmaku_due(first_danmaku)
         if first_subtitle is not None and self.on_subtitle_due is not None:
@@ -885,9 +1210,158 @@ class DanmakuCanvas(wx.Panel):
         return wx.Colour((item.color >> 16) & 0xFF, (item.color >> 8) & 0xFF, item.color & 0xFF)
 
 
+class SubtitleJumpDialog(wx.Dialog):
+    def __init__(self, parent: wx.Window, items: list[DanmakuItem], current_seconds: float) -> None:
+        super().__init__(parent, title="按字幕跳转", size=(760, 480),
+                         style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        # Keep actual (including fractional) timestamps; audience comments
+        # and filtering/reading preferences do not belong in this list.
+        self.items = sorted(
+            (item for item in items if item.mode == DANMAKU_MODE_SUBTITLE
+             and item.text.strip() and math.isfinite(item.time) and item.time >= 0),
+            key=lambda item: item.time,
+        )
+        root = wx.BoxSizer(wx.VERTICAL)
+        root.Add(wx.StaticText(self, label="选择字幕后按回车跳转到对应时间"), 0, wx.ALL, 10)
+        self.subtitle_list = wx.ListBox(self, choices=[
+            f"{item.text}，{self._format_timestamp(item.time)}" for item in self.items
+        ], name="字幕列表，选择后按回车跳转")
+        root.Add(self.subtitle_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        root.Add(self.CreateButtonSizer(wx.OK | wx.CANCEL), 0, wx.ALL | wx.ALIGN_RIGHT, 10)
+        self.FindWindow(wx.ID_OK).SetLabel("跳转")
+        self.FindWindow(wx.ID_OK).Enable(bool(self.items))
+        self.SetSizer(root)
+        if self.items:
+            selection = 0
+            for index, item in enumerate(self.items):
+                if item.time > current_seconds:
+                    break
+                selection = index
+            self.subtitle_list.SetSelection(selection)
+        self.subtitle_list.SetFocus()
+        self.subtitle_list.Bind(wx.EVT_LISTBOX_DCLICK, self._accept)
+        self.Bind(wx.EVT_BUTTON, self._accept, id=wx.ID_OK)
+        self.Bind(wx.EVT_CHAR_HOOK, self._on_key)
+
+    @staticmethod
+    def _format_timestamp(seconds: float) -> str:
+        minutes, milliseconds = divmod(round(seconds * 1000), 60000)
+        return f"{minutes}分{milliseconds / 1000:06.3f}".rstrip("0").rstrip(".") + "秒"
+
+    def _on_key(self, event: wx.KeyEvent) -> None:
+        if event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER) and self.FindFocus() is self.subtitle_list:
+            self._accept(event)
+            return
+        event.Skip()
+
+    def _accept(self, _event: wx.Event) -> None:
+        if self.subtitle_list.GetSelection() != wx.NOT_FOUND:
+            self.EndModal(wx.ID_OK)
+
+    def selected_seconds(self) -> float:
+        return self.items[self.subtitle_list.GetSelection()].time
+
+
+class JumpTimeDialog(wx.Dialog):
+    def __init__(self, parent: wx.Window, prompt: str, total_seconds: float | None,
+                 current_seconds: float, subtitle_items: Callable[[], list[DanmakuItem]]) -> None:
+        super().__init__(parent, title="跳转进度", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.total_seconds = total_seconds
+        self.current_seconds = current_seconds
+        self.subtitle_items = subtitle_items
+        self.seconds: float = 0
+        self._range_warning = ""
+        root = wx.BoxSizer(wx.VERTICAL)
+        self.prompt_text = wx.StaticText(self, label=prompt)
+        root.Add(self.prompt_text, 0, wx.ALL, 12)
+        self.time_input = wx.TextCtrl(self, name="跳转时间，分.秒", style=wx.TE_PROCESS_ENTER)
+        root.Add(self.time_input, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 12)
+        self.range_message = wx.StaticText(self, label="", size=(450, 44))
+        root.Add(self.range_message, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 12)
+        self.screen_reader = ScreenReaderAnnouncer(self.range_message, native_only=True)
+        self.subtitle_button = wx.Button(self, label="按字幕跳转")
+        root.Add(self.subtitle_button, 0, wx.ALL, 12)
+        root.Add(self.CreateButtonSizer(wx.OK | wx.CANCEL), 0, wx.ALL | wx.ALIGN_RIGHT, 12)
+        self.FindWindow(wx.ID_OK).SetLabel("跳转")
+        self.SetSizerAndFit(root)
+        self.SetMinSize(self.GetSize())
+        self.time_input.SetFocus()
+        self.Bind(wx.EVT_BUTTON, self._accept_time, id=wx.ID_OK)
+        self.time_input.Bind(wx.EVT_TEXT_ENTER, self._accept_time)
+        self.time_input.Bind(wx.EVT_TEXT, self._on_time_changed)
+        self.subtitle_button.Bind(wx.EVT_BUTTON, self._choose_subtitle)
+        self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
+
+    def _on_destroy(self, event: wx.WindowDestroyEvent) -> None:
+        if event.GetEventObject() is self:
+            self.screen_reader.close()
+        event.Skip()
+
+    def set_total_seconds(self, seconds: float) -> None:
+        self.total_seconds = seconds
+        current = PlaybackFrame._format_jump_time(min(self.current_seconds, seconds))
+        total = PlaybackFrame._format_jump_time(seconds)
+        self.prompt_text.SetLabel(f"请输入跳转时间（分.秒，当前{current}，共{total}）")
+        self.GetSizer().Fit(self)
+        self._update_range_warning()
+
+    def _on_time_changed(self, _event: wx.Event) -> None:
+        self._update_range_warning()
+
+    def _update_range_warning(self) -> None:
+        message = ""
+        value = self.time_input.GetValue().strip()
+        # A trailing dot is a normal intermediate input, not a new error.
+        if value.endswith(".") and value.count(".") == 1:
+            value = value[:-1]
+        try:
+            seconds = PlaybackFrame._parse_jump_time(value)
+        except ValueError:
+            pass  # Format errors are only reported on submission.
+        else:
+            if self.total_seconds is not None and seconds >= self.total_seconds:
+                message = PlaybackFrame._jump_range_message(self.total_seconds)
+        self.FindWindow(wx.ID_OK).Enable(not bool(message))
+        if message == self._range_warning:
+            return
+        self._range_warning = message
+        self.range_message.SetLabel(message)
+        self.range_message.SetName(message)
+        if message:
+            self.screen_reader.announce(message)
+
+    def _accept_time(self, _event: wx.Event) -> None:
+        try:
+            seconds = PlaybackFrame._parse_jump_time(self.time_input.GetValue())
+        except ValueError:
+            wx.MessageBox("请输入分.秒格式的时间", "时间格式错误", wx.OK | wx.ICON_WARNING, self)
+            self.time_input.SetFocus()
+            return
+        if self.total_seconds is not None and seconds >= self.total_seconds:
+            self._update_range_warning()
+            return
+        self.seconds = seconds
+        self.EndModal(wx.ID_OK)
+
+    def _choose_subtitle(self, _event: wx.Event) -> None:
+        dialog = SubtitleJumpDialog(self, self.subtitle_items(), self.current_seconds)
+        try:
+            if not dialog.items:
+                wx.MessageBox("当前暂无字幕可供跳转。如果字幕正在加载，请稍后重试。",
+                              "按字幕跳转", wx.OK | wx.ICON_INFORMATION, self)
+                return
+            if dialog.ShowModal() != wx.ID_OK:
+                return
+            self.seconds = dialog.selected_seconds()
+        finally:
+            dialog.Destroy()
+            self.subtitle_button.SetFocus()
+        self.EndModal(wx.ID_OK)
+
+
 class PlaybackFrame(wx.Frame):
-    SEEK_SECONDS = 15
-    PLAYBACK_RATE_STEP = 0.2
+    SEEK_SECONDS = 5
+    PLAYBACK_RATES = (0.5, 1.0, 1.25, 1.5, 1.75, 2.0)
     MIN_PLAYBACK_RATE = 0.5
     MAX_PLAYBACK_RATE = 2.0
     FINISHED_EPSILON_SECONDS = 0.4
@@ -901,6 +1375,11 @@ class PlaybackFrame(wx.Frame):
         on_finished: Callable[["PlaybackFrame", PlaybackInfo], None],
         read_danmaku_default: bool = False,
         read_subtitle_default: bool = False,
+        subtitle_filter_presets: tuple[SubtitleFilterPreset, ...] | None = None,
+        subtitle_filter_slot: int = 0,
+        on_filter_slot_changed: Callable[[int], bool] | None = None,
+        on_filter_rules: Callable[[wx.Window], None] | None = None,
+        on_cycle_output: Callable[[int, Callable], None] | None = None,
     ) -> None:
         super().__init__(parent, title="", size=(760, 480))
         self.api = api
@@ -909,30 +1388,63 @@ class PlaybackFrame(wx.Frame):
         self.on_finished = on_finished
         self.playback: PlaybackInfo | None = None
         self.load_generation = 0
+        self.read_danmaku_default = read_danmaku_default
+        self.read_subtitle_default = read_subtitle_default
         self.read_danmaku_enabled = read_danmaku_default
         self.read_subtitle_enabled = read_subtitle_default
+        self.subtitle_filter_enabled = False
+        self.subtitle_filter_presets = subtitle_filter_presets or default_filter_presets()
+        self.subtitle_filter_slot = subtitle_filter_slot if 0 <= subtitle_filter_slot < len(self.subtitle_filter_presets) else 0
+        self.subtitle_filter_rules = self.subtitle_filter_presets[self.subtitle_filter_slot].rules
+        self.book_filter_last_role: str | None = None
+        self.book_filter_context_roles: dict[int, str] = {}
+        self.subtitle_os_items: set[int] = set()
+        self.on_filter_slot_changed = on_filter_slot_changed
+        self.on_filter_rules = on_filter_rules
+        self.on_cycle_output = on_cycle_output
+        self.output_change_generation = 0
         self.time_announcement_generation = 0
         self.rate_change_generation = 0
         self.playback_rate = 1.0
         self.requested_playback_rate = 1.0
         self.finish_notified = False
+        self.last_mouse_context_menu_at = 0.0
 
         root = wx.BoxSizer(wx.VERTICAL)
         self.danmaku_canvas = DanmakuCanvas(self)
         self.danmaku_canvas.on_danmaku_due = self._on_danmaku_due
         self.danmaku_canvas.on_subtitle_due = self._on_subtitle_due
+        self.danmaku_canvas.should_read_subtitle = self._should_read_subtitle
         root.Add(self.danmaku_canvas, 1, wx.EXPAND)
         self.SetSizer(root)
         self.live_region = wx.StaticText(self, label="", pos=(0, 0), size=(1, 1))
         self.live_region.SetForegroundColour(wx.BLACK)
         self.live_region.SetBackgroundColour(wx.BLACK)
-        self.live_region.SetName("弹幕朗读")
+        self.live_region.SetName("字幕朗读")
+        # Subtitle and danmaku content share direct speech; controls use native notifications.
         self.screen_reader = ScreenReaderAnnouncer(self.live_region)
+        self.status_live_region = wx.StaticText(self, label="", pos=(1, 0), size=(1, 1))
+        self.status_live_region.SetName("播放提示")
+        self.status_live_region.SetForegroundColour(wx.BLACK)
+        self.status_live_region.SetBackgroundColour(wx.BLACK)
+        self.status_reader = ScreenReaderAnnouncer(self.status_live_region, native_only=True)
 
         self.Bind(wx.EVT_CHAR_HOOK, self.on_char_hook)
+        self.Bind(wx.EVT_CONTEXT_MENU, self.on_playback_context_menu)
+        self.danmaku_canvas.Bind(wx.EVT_CONTEXT_MENU, self.on_playback_context_menu)
+        self.danmaku_canvas.bitmap_view.Bind(wx.EVT_CONTEXT_MENU, self.on_playback_context_menu)
+        self.danmaku_canvas.Bind(wx.EVT_RIGHT_UP, self.on_playback_right_up)
+        self.danmaku_canvas.bitmap_view.Bind(wx.EVT_RIGHT_UP, self.on_playback_right_up)
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
     def play(self, playback: PlaybackInfo) -> None:
+        if self.playback is None or self.playback.sound_id != playback.sound_id:
+            self.read_danmaku_enabled = self.read_danmaku_default
+            self.read_subtitle_enabled = self.read_subtitle_default
+            self.subtitle_filter_enabled = False
+            self.book_filter_last_role = None
+            self.book_filter_context_roles = {}
+            self.subtitle_os_items = set()
         self.playback = playback
         self.load_generation += 1
         self.rate_change_generation += 1
@@ -964,7 +1476,38 @@ class PlaybackFrame(wx.Frame):
     def _set_danmaku_items(self, generation: int, items: list[DanmakuItem]) -> None:
         if generation != self.load_generation:
             return
-        self.danmaku_canvas.set_items(items)
+        marked = mark_dialogue_continuations(items)
+        active_role = ""
+        context_roles: dict[int, str] = {}
+        os_items: set[int] = set()
+        os_by_submitter: dict[str, bool] = {}
+        for item in sorted(marked, key=lambda entry: entry.time):
+            if item.mode != DANMAKU_MODE_SUBTITLE:
+                continue
+            role = self._book_subtitle_context_role(item)
+            if role is not None:
+                active_role = role
+            context_roles[id(item)] = active_role
+            # Use only the selected track, including its role/OS boundaries.
+            text = item.text.strip()
+            explicit_os = SUBTITLE_OS_MARKER.search(text) or self._subtitle_os_role(item)
+            if explicit_os:
+                os_by_submitter[item.user_id] = True
+                os_items.add(id(item))
+            elif role is not None:
+                # An explicit non-OS label ends the monologue, even when
+                # the same actor resumes speaking. Narration/credits end
+                # outstanding XML contributor streams as well.
+                if role in NON_DIALOGUE_SUBTITLE_ROLES:
+                    os_by_submitter.clear()
+                os_by_submitter[item.user_id] = False
+            elif not NON_DIALOGUE_SUBTITLE_CONTENT.fullmatch(text) and os_by_submitter.get(item.user_id, False):
+                # Do not use the short dialogue-continuation timeout here:
+                # OS prose can span multiple longer captions or a seek.
+                os_items.add(id(item))
+        self.book_filter_context_roles = context_roles
+        self.subtitle_os_items = os_items
+        self.danmaku_canvas.set_items(marked)
 
     def _set_danmaku_failed(self, generation: int, message: str) -> None:
         if generation != self.load_generation:
@@ -974,8 +1517,22 @@ class PlaybackFrame(wx.Frame):
     def on_char_hook(self, event: wx.KeyEvent) -> None:
         key = event.GetKeyCode()
         try:
+            if key == wx.WXK_MENU or (key == wx.WXK_F10 and event.ShiftDown()):
+                self._show_playback_menu(wx.DefaultPosition)
+                return
+            if key == wx.WXK_F9 and not (event.ControlDown() or event.AltDown()):
+                self._cycle_output_device(-1 if event.ShiftDown() else 1)
+                return
+            if ord("0") <= key <= ord("9") and not (
+                event.ControlDown() or event.AltDown() or event.ShiftDown()
+            ):
+                self._select_subtitle_filter_slot(9 if key == ord("0") else key - ord("1"))
+                return
             if key in (ord("D"), ord("d")):
                 self._toggle_danmaku_reader()
+                return
+            if key == wx.WXK_CONTROL_F or (key in (ord("F"), ord("f")) and event.ControlDown()):
+                self._toggle_subtitle_filter_mode()
                 return
             if key in (ord("F"), ord("f")):
                 self._toggle_subtitle_reader()
@@ -983,11 +1540,21 @@ class PlaybackFrame(wx.Frame):
             if key in (ord("T"), ord("t")):
                 self._announce_playback_time()
                 return
+            if key in (ord("J"), ord("j")):
+                self._prompt_jump_to_time()
+                return
+            if key in (ord("R"), ord("r")) and not (
+                event.ControlDown() or event.AltDown() or event.ShiftDown()
+            ):
+                if self.on_filter_rules is not None:
+                    self.on_filter_rules(self)
+                    wx.CallAfter(self.SetFocus)
+                return
             if key in (ord("C"), ord("c")):
-                self._change_playback_rate(self.PLAYBACK_RATE_STEP)
+                self._change_playback_rate(1)
                 return
             if key in (ord("X"), ord("x")):
-                self._change_playback_rate(-self.PLAYBACK_RATE_STEP)
+                self._change_playback_rate(-1)
                 return
             if key in (ord("Z"), ord("z")):
                 self._set_playback_rate(1.0)
@@ -995,25 +1562,18 @@ class PlaybackFrame(wx.Frame):
             if key == wx.WXK_SPACE:
                 paused = self.player.toggle_pause()
                 self.danmaku_canvas.set_paused(paused)
-                self._set_parent_status("已暂停" if paused else "继续播放")
                 return
             if key == wx.WXK_UP:
-                volume = self.player.volume_up()
-                self._set_parent_status(f"音量: {volume}")
+                self.player.volume_up()
                 return
             if key == wx.WXK_DOWN:
-                volume = self.player.volume_down()
-                self._set_parent_status(f"音量: {volume}")
+                self.player.volume_down()
                 return
             if key == wx.WXK_RIGHT:
-                self.player.seek(self.SEEK_SECONDS)
-                self.danmaku_canvas.seek(self.SEEK_SECONDS)
-                self._set_parent_status(f"快进 {self.SEEK_SECONDS} 秒")
+                self._seek_relative(self.SEEK_SECONDS)
                 return
             if key == wx.WXK_LEFT:
-                self.player.seek(-self.SEEK_SECONDS)
-                self.danmaku_canvas.seek(-self.SEEK_SECONDS)
-                self._set_parent_status(f"快退 {self.SEEK_SECONDS} 秒")
+                self._seek_relative(-self.SEEK_SECONDS)
                 return
         except PlayerUnavailable as exc:
             self._set_parent_status("操作失败")
@@ -1021,20 +1581,240 @@ class PlaybackFrame(wx.Frame):
             return
         event.Skip()
 
+    def _cycle_output_device(self, direction: int) -> None:
+        if self.on_cycle_output is None:
+            return
+        self.output_change_generation += 1
+        generation = self.output_change_generation
+        self.on_cycle_output(direction, lambda result: self._output_device_changed(generation, result))
+
+    def _output_device_changed(self, generation: int, result: dict) -> None:
+        if not self or generation != self.output_change_generation:
+            return
+        message = (result["name"] if result.get("ok")
+                   else f"切换输出设备失败：{result.get('error', '未知错误')}")
+        self._announce_status(message)
+
+    def on_playback_right_up(self, event: wx.MouseEvent) -> None:
+        screen_position = event.GetEventObject().ClientToScreen(event.GetPosition())
+        self.last_mouse_context_menu_at = time.monotonic()
+        self._show_playback_menu(self.ScreenToClient(screen_position))
+        self.last_mouse_context_menu_at = time.monotonic()
+
+    def on_playback_context_menu(self, event: wx.ContextMenuEvent) -> None:
+        if time.monotonic() - self.last_mouse_context_menu_at < 0.35:
+            return
+        screen_position = event.GetPosition()
+        position = wx.DefaultPosition if screen_position == wx.DefaultPosition else self.ScreenToClient(screen_position)
+        self._show_playback_menu(position)
+
+    def _show_playback_menu(self, position: wx.Point) -> None:
+        menu = wx.Menu()
+        actions: dict[int, Callable[[], None]] = {}
+
+        def add_action(label: str, action: Callable[[], None]) -> None:
+            item_id = wx.NewIdRef()
+            menu.Append(item_id, label)
+            actions[int(item_id)] = action
+
+        add_action(f"快退 {self.SEEK_SECONDS} 秒", lambda: self._seek_relative(-self.SEEK_SECONDS))
+        add_action(f"快进 {self.SEEK_SECONDS} 秒", lambda: self._seek_relative(self.SEEK_SECONDS))
+        add_action("跳转时间…", self._prompt_jump_to_time)
+        speed_menu = wx.Menu()
+        selected_rate = self._clamp_playback_rate(self.requested_playback_rate)
+        for rate in self.PLAYBACK_RATES:
+            speed_id = wx.NewIdRef()
+            entry = speed_menu.AppendRadioItem(speed_id, f"{rate:g} 倍")
+            if rate == selected_rate:
+                entry.Check(True)
+            actions[int(speed_id)] = lambda value=rate: self._set_playback_rate(value)
+        menu.AppendSubMenu(speed_menu, "播放倍速")
+        menu.AppendSeparator()
+
+        subtitle_id = wx.NewIdRef()
+        menu.AppendCheckItem(subtitle_id, "朗读字幕").Check(self.read_subtitle_enabled)
+        actions[int(subtitle_id)] = self._toggle_subtitle_reader
+        filter_id = wx.NewIdRef()
+        menu.AppendCheckItem(filter_id, "过滤模式（实验性功能）").Check(self.subtitle_filter_enabled)
+        actions[int(filter_id)] = self._toggle_subtitle_filter_mode
+        presets_menu = wx.Menu()
+        for slot, preset in enumerate(self.subtitle_filter_presets):
+            preset_id = wx.NewIdRef()
+            entry = presets_menu.AppendRadioItem(preset_id, f"{(slot + 1) % 10}：{preset.name}")
+            if slot == self.subtitle_filter_slot:
+                entry.Check(True)
+            actions[int(preset_id)] = lambda selected=slot: self._select_subtitle_filter_slot(selected)
+        menu.AppendSubMenu(presets_menu, "过滤方案")
+        danmaku_id = wx.NewIdRef()
+        menu.AppendCheckItem(danmaku_id, "朗读弹幕").Check(self.read_danmaku_enabled)
+        actions[int(danmaku_id)] = self._toggle_danmaku_reader
+
+        try:
+            choice = self.GetPopupMenuSelectionFromUser(menu, position)
+        finally:
+            menu.Destroy()
+        action = actions.get(choice)
+        if action is not None:
+            try:
+                action()
+            except PlayerUnavailable as exc:
+                self._set_parent_status("操作失败")
+                wx.MessageBox(str(exc), "错误", wx.OK | wx.ICON_ERROR, self)
+
+    def _seek_relative(self, seconds: int) -> None:
+        self.player.seek(seconds)
+        self.danmaku_canvas.seek(seconds)
+        self.book_filter_last_role = None
+
     def _toggle_danmaku_reader(self) -> None:
         self.read_danmaku_enabled = not self.read_danmaku_enabled
         message = "弹幕朗读已开启" if self.read_danmaku_enabled else "弹幕朗读已关闭"
-        self.screen_reader.announce(message)
-        self._set_parent_status(message)
+        self._announce_status(message)
 
     def _toggle_subtitle_reader(self) -> None:
         self.read_subtitle_enabled = not self.read_subtitle_enabled
+        self.subtitle_filter_enabled = False
+        self.book_filter_last_role = None
         message = "字幕朗读已开启" if self.read_subtitle_enabled else "字幕朗读已关闭"
-        self.screen_reader.announce(message)
-        self._set_parent_status(message)
+        self._announce_status(message)
 
-    def _change_playback_rate(self, delta: float) -> None:
-        self._set_playback_rate(self.requested_playback_rate + delta)
+    def _toggle_subtitle_filter_mode(self) -> None:
+        if not self.read_subtitle_enabled:
+            self.read_subtitle_enabled = True
+            self.subtitle_filter_enabled = True
+        else:
+            self.subtitle_filter_enabled = not self.subtitle_filter_enabled
+        self.book_filter_last_role = None
+        message = "字幕过滤模式已开启" if self.subtitle_filter_enabled else "已恢复朗读全部字幕"
+        self._announce_status(message)
+
+    def _select_subtitle_filter_slot(self, slot: int) -> None:
+        if not self.read_subtitle_enabled or not 0 <= slot < len(self.subtitle_filter_presets):
+            return
+        self.subtitle_filter_slot = slot
+        preset = self.subtitle_filter_presets[slot]
+        self.subtitle_filter_rules = preset.rules
+        self.subtitle_filter_enabled = True
+        self.book_filter_last_role = None
+        saved = self.on_filter_slot_changed(slot) if self.on_filter_slot_changed is not None else True
+        message = preset.name
+        if saved is False:
+            message += "，但本次选择未保存"
+        self._announce_status(message)
+
+    def _should_read_subtitle(self, item: DanmakuItem) -> bool:
+        return bool(self._subtitle_text_to_read(item))
+
+    @staticmethod
+    def _book_subtitle_context_role(item: DanmakuItem) -> str | None:
+        """Return an explicit book role; inline cues retain the previous role."""
+        text = item.text.strip()
+        if NON_DIALOGUE_SUBTITLE_CONTENT.fullmatch(text):
+            return None
+        match = SUBTITLE_ROLE_PREFIX.fullmatch(text)
+        if not match:
+            return "报幕" if NON_DIALOGUE_ANNOUNCEMENT_PREFIX.match(text) else None
+        role = item.role.strip() or match.group(1).strip()
+        if re.match(r"^报幕\s*[/／]", role):
+            return "报幕"
+        # A character can read the credits. Otherwise even parenthesized
+        # content after a speaker label belongs to that speaker in book mode.
+        if role not in NON_DIALOGUE_SUBTITLE_ROLES and NON_DIALOGUE_ANNOUNCEMENT_PREFIX.match(match.group(2)):
+            return "报幕"
+        return role
+
+    @staticmethod
+    def _subtitle_os_role(item: DanmakuItem) -> str:
+        role = PlaybackFrame._book_subtitle_context_role(item) or ""
+        return role if SUBTITLE_OS_ROLE_SUFFIX.search(role) else ""
+
+    @staticmethod
+    def _book_filter_role(item: DanmakuItem, rules: SubtitleFilterRules) -> str:
+        role = PlaybackFrame._book_subtitle_context_role(item)
+        if not role:
+            return ""
+        if role == "旁白" or role not in NON_DIALOGUE_SUBTITLE_ROLES:
+            return role
+        if rules.info_label_only and role in rules.info_labels:
+            return role
+        return ""
+
+    def _subtitle_text_to_read(self, item: DanmakuItem) -> str:
+        if not self.read_subtitle_enabled:
+            return ""
+        text = item.text.strip()
+        if not self.subtitle_filter_enabled:
+            return text
+        rules = self.subtitle_filter_rules
+        folded_text = text.casefold()
+        if any(keyword.casefold() in folded_text for keyword in rules.keywords):
+            return ""
+        story_barrage = is_story_barrage_subtitle(item)
+        if rules.speaker_transitions_only:
+            context_role = self.book_filter_context_roles.get(id(item), "")
+            if STORY_BARRAGE_SUBTITLE_ROLE.fullmatch(context_role):
+                story_barrage = True
+        if story_barrage and rules.story_barrage:
+            return ""
+        os_marker = SUBTITLE_OS_MARKER.search(text)
+        os_role = self._subtitle_os_role(item)
+        if os_marker or os_role or id(item) in getattr(self, "subtitle_os_items", ()):
+            if not rules.os_body or not (os_marker or os_role):
+                return ""
+            if not os_marker:
+                return os_role
+            if rules.speaker_transitions_only:
+                role = (self._book_filter_role(item, rules) or item.role.strip()
+                        or self.book_filter_context_roles.get(id(item), "")
+                        or self.book_filter_last_role or "")
+                return f"{role}：{os_marker.group(0)}" if role else os_marker.group(0)
+            prefix = text[:os_marker.end()].rstrip()
+            if item.role.strip() and text == item.content.strip():
+                return f"{item.role.strip()}：{prefix}"
+            return prefix
+        if story_barrage:
+            return text
+        if rules.speaker_transitions_only:
+            if NON_DIALOGUE_SUBTITLE_CONTENT.fullmatch(text):
+                # Scene/action prose is not another speaker. Preserve the
+                # current speaker across it; only an announcement block
+                # continues reading its body in this mode.
+                return text if self.book_filter_context_roles.get(id(item)) == "报幕" else ""
+            role = self._book_filter_role(item, rules)
+            if role:
+                return role if role != self.book_filter_last_role else ""
+            if self._book_subtitle_context_role(item) == "报幕":
+                return text
+            if not SUBTITLE_ROLE_PREFIX.fullmatch(text):
+                context_role = self.book_filter_context_roles.get(id(item), self.book_filter_last_role or "")
+                if not context_role:
+                    return text
+                if STORY_BARRAGE_SUBTITLE_ROLE.fullmatch(context_role):
+                    return "" if rules.story_barrage else text
+                if (context_role in NON_DIALOGUE_SUBTITLE_ROLES and context_role != "旁白"
+                        and not (rules.info_label_only and context_role in rules.info_labels)):
+                    return text
+                return context_role if context_role != self.book_filter_last_role else ""
+        explicit_role = SUBTITLE_ROLE_PREFIX.fullmatch(text)
+        role = item.role.strip() or (explicit_role.group(1).strip() if explicit_role else "")
+        if rules.info_label_only and role in rules.info_labels and not NON_DIALOGUE_SUBTITLE_CONTENT.fullmatch(text):
+            return role
+        if is_character_dialogue_subtitle(item):
+            if rules.dialogue_mode == "mute":
+                return ""
+            if rules.dialogue_mode == "role":
+                # Inferred XML continuation lines belong to the same utterance;
+                # the explicit first line already announced its speaker.
+                if item.role.strip() and item.content.strip() == text and explicit_role is None:
+                    return ""
+                return role
+        return text
+
+    def _change_playback_rate(self, direction: int) -> None:
+        current_rate = self._clamp_playback_rate(self.requested_playback_rate)
+        index = self.PLAYBACK_RATES.index(current_rate)
+        next_index = max(0, min(len(self.PLAYBACK_RATES) - 1, index + direction))
+        self._set_playback_rate(self.PLAYBACK_RATES[next_index])
 
     def _set_playback_rate(self, rate: float) -> None:
         target_rate = self._clamp_playback_rate(rate)
@@ -1057,8 +1837,7 @@ class PlaybackFrame(wx.Frame):
         if not status or not status.get("ok"):
             self.requested_playback_rate = self.playback_rate
             message = "当前播放器不支持倍速"
-            self.screen_reader.announce(message)
-            self._set_parent_status(message)
+            self._announce_status(message)
             return
 
         actual_rate = self._positive_float(status.get("rate")) or target_rate
@@ -1066,8 +1845,7 @@ class PlaybackFrame(wx.Frame):
         self.requested_playback_rate = self.playback_rate
         self.danmaku_canvas.set_playback_rate(self.playback_rate)
         message = self._format_playback_rate(self.playback_rate)
-        self.screen_reader.announce(message)
-        self._set_parent_status(message)
+        self._announce_status(message)
 
     def _on_danmaku_due(self, item: DanmakuItem) -> None:
         if not self.read_danmaku_enabled:
@@ -1077,10 +1855,16 @@ class PlaybackFrame(wx.Frame):
             self.screen_reader.announce(text)
 
     def _on_subtitle_due(self, item: DanmakuItem) -> None:
-        if not self.read_subtitle_enabled:
-            return
-        text = item.text.strip()
+        text = self._subtitle_text_to_read(item)
         if text:
+            if self.subtitle_filter_enabled and self.subtitle_filter_rules.speaker_transitions_only:
+                role = (self._book_filter_role(item, self.subtitle_filter_rules)
+                        or self.book_filter_context_roles.get(id(item), "")
+                        or item.role.strip())
+                if role and (text == role or SUBTITLE_OS_MARKER.search(item.text)):
+                    self.book_filter_last_role = role
+                elif self._book_subtitle_context_role(item) is not None:
+                    self.book_filter_last_role = None
             self.screen_reader.announce(text)
 
     def _announce_playback_time(self) -> None:
@@ -1094,7 +1878,8 @@ class PlaybackFrame(wx.Frame):
             return
         current_seconds, total_seconds = self._playback_times_from_status(status)
         if total_seconds is None:
-            self._set_parent_status("没有获取到时长")
+            self.time_announcement_generation += 1
+            self._announce_status("没有获取到时长")
             return
         self.time_announcement_generation += 1
         self._announce_time(current_seconds, total_seconds)
@@ -1104,7 +1889,8 @@ class PlaybackFrame(wx.Frame):
             return
         current_seconds, total_seconds = self._playback_times_from_status(None)
         if total_seconds is None:
-            self._set_parent_status("没有获取到时长")
+            self.time_announcement_generation += 1
+            self._announce_status("没有获取到时长")
             return
         self.time_announcement_generation += 1
         self._announce_time(current_seconds, total_seconds)
@@ -1112,8 +1898,100 @@ class PlaybackFrame(wx.Frame):
     def _announce_time(self, current_seconds: float, total_seconds: float) -> None:
         current_seconds = min(current_seconds, total_seconds) if total_seconds else current_seconds
         message = f"{self._format_spoken_time(current_seconds)}/{self._format_spoken_time(total_seconds)}"
-        self.screen_reader.announce(message)
-        self._set_parent_status(message)
+        self._announce_status(message)
+
+    @staticmethod
+    def _parse_jump_time(value: str) -> int:
+        match = re.fullmatch(r"\s*(\d+)(?:\.(\d{1,2}))?\s*", value)
+        if match is None:
+            raise ValueError("请输入分.秒格式的时间")
+        return int(match.group(1)) * 60 + int(match.group(2) or 0)
+
+    @staticmethod
+    def _format_jump_time(seconds: float) -> str:
+        minutes, remainder = divmod(max(0, int(round(seconds))), 60)
+        return f"{minutes}分{remainder:02d}秒"
+
+    def _prompt_jump_to_time(self) -> None:
+        if self.playback is None:
+            self._announce_status("当前没有正在播放的音频")
+            return
+        current_seconds, total_seconds = self._playback_times_from_status(None)
+        if total_seconds is not None:
+            current_seconds = min(current_seconds, total_seconds)
+        total_text = self._format_jump_time(total_seconds) if total_seconds is not None else "未知"
+        prompt = f"请输入跳转时间（分.秒，当前{self._format_jump_time(current_seconds)}，共{total_text}）"
+        generation = self.load_generation
+        dialog = JumpTimeDialog(self, prompt, total_seconds, current_seconds,
+                                lambda: self.danmaku_canvas.items)
+        try:
+            if total_seconds is None:
+                self.player.status(lambda status: self._jump_dialog_duration_ready(generation, dialog, status))
+            if dialog.ShowModal() != wx.ID_OK:
+                return
+            seconds = dialog.seconds
+        finally:
+            dialog.Destroy()
+            wx.CallAfter(self.SetFocus)
+        if generation != self.load_generation:
+            return
+        self.player.status(lambda status: self._jump_to_time_ready(generation, seconds, status))
+
+    def _jump_dialog_duration_ready(self, generation: int, dialog: JumpTimeDialog,
+                                    status: dict[str, object] | None) -> None:
+        if generation != self.load_generation or not dialog or dialog.IsBeingDeleted():
+            return
+        if status and status.get("ok"):
+            duration = self._positive_float(status.get("duration"))
+            if duration and math.isfinite(duration):
+                dialog.set_total_seconds(duration)
+
+    @staticmethod
+    def _jump_range_message(duration: float) -> str:
+        return f"输入超出范围，当前音频总时长为{PlaybackFrame._format_jump_time(duration)}"
+
+    def _jump_to_time_ready(
+        self, generation: int, seconds: float, status: dict[str, object] | None,
+    ) -> None:
+        if generation != self.load_generation or self.playback is None:
+            return
+        if not status or not status.get("ok"):
+            self._announce_status("播放器尚未就绪，无法跳转")
+            return
+        duration = self._positive_float(status.get("duration"))
+        if duration is None and self.playback.duration_ms:
+            duration = self.playback.duration_ms / 1000.0
+        if duration and seconds >= duration:
+            message = self._jump_range_message(duration)
+            self._set_parent_status(message)
+            wx.MessageBox(message, "输入超出范围", wx.OK | wx.ICON_WARNING, self)
+            return
+        self.player.seek_to(
+            seconds,
+            lambda result: self._jump_to_time_done(generation, seconds, result),
+            resume=True,
+        )
+
+    def _jump_to_time_done(
+        self, generation: int, seconds: float, result: dict[str, object] | None,
+    ) -> None:
+        if generation != self.load_generation or self.playback is None:
+            return
+        if not result or not result.get("ok"):
+            self._announce_status("跳转失败，请等播放器加载完成后再试")
+            return
+        position = self._positive_float(result.get("position"))
+        self.danmaku_canvas.sync_position(
+            seconds if position is None else position,
+            bool(result.get("paused", False)),
+            self.playback_rate,
+        )
+        self.book_filter_last_role = None
+        self.time_announcement_generation += 1
+        message = f"已跳转到{self._format_spoken_time(seconds)}"
+        if result.get("resume_error"):
+            message += "，但未能开始播放，请按空格重试"
+        self._announce_status(message)
 
     def _playback_times_from_status(self, status: dict[str, object] | None) -> tuple[float, float | None]:
         current_seconds = self.danmaku_canvas.current_position()
@@ -1176,6 +2054,7 @@ class PlaybackFrame(wx.Frame):
         self.load_generation += 1
         self.rate_change_generation += 1
         self.danmaku_canvas.stop()
+        self._close_readers()
         self.player.stop()
         self.on_closed(self)
         event.Skip()
@@ -1202,6 +2081,15 @@ class PlaybackFrame(wx.Frame):
         self.finish_notified = True
         self.on_finished(self, self.playback)
 
+    def _close_readers(self) -> None:
+        self.screen_reader.close()
+        self.status_reader.close()
+
+    def _announce_status(self, message: str) -> None:
+        """Native reader notification, never fall back to subtitle speech."""
+        self._set_parent_status(message)
+        self.status_reader.announce(message)
+
     def _set_parent_status(self, message: str) -> None:
         parent = self.GetParent()
         if parent is not None and hasattr(parent, "SetStatusText"):
@@ -1221,14 +2109,13 @@ class PlaybackFrame(wx.Frame):
             value = float(rate)
         except (TypeError, ValueError):
             value = 1.0
-        value = round(value, 1)
-        return max(cls.MIN_PLAYBACK_RATE, min(cls.MAX_PLAYBACK_RATE, value))
+        return min(cls.PLAYBACK_RATES, key=lambda candidate: abs(candidate - value))
 
     @staticmethod
     def _format_playback_rate(rate: float) -> str:
         if abs(rate - 1.0) < 0.05:
             return "正常速度"
-        text = f"{rate:.1f}".rstrip("0").rstrip(".")
+        text = f"{rate:g}"
         return f"{text}倍速"
 
     @staticmethod
@@ -1254,6 +2141,10 @@ class MaoerFrame(wx.Frame):
         self.active_player: HiddenBrowserPlayer | None = None
         self.player_frame: PlaybackFrame | None = None
         self.settings: AppSettings = load_settings()
+        self.audio_output_router = AudioOutputRouter(self.settings.output_device_id)
+        self.output_devices = (SYSTEM_OUTPUT,)
+        self._output_device_error = ""
+        self._audio_poll_generation = 0
         self.items: list[MediaItem] = []
         self.current_title = ""
         self.page_state: PageState | None = None
@@ -1268,10 +2159,14 @@ class MaoerFrame(wx.Frame):
         self._content_feature_request: object | None = None
         self._opened_drama_id: int | None = None
         self._publisher_request: object = object()
+        self._follow_status_cookie = self.api.cookie_header
+        self._follow_status_cache: dict[int, bool] = {}
+        self._follow_status_pending: dict[int, object] = {}
 
         self._build_ui()
         self._build_menu()
         self._bind_events()
+        wx.CallAfter(self._refresh_output_devices)
         if self.api.cookie_header:
             self._refresh_account_title()
         wx.CallAfter(lambda: self.load_homepage(focus_list=True))
@@ -1313,6 +2208,8 @@ class MaoerFrame(wx.Frame):
         self.account_info_menu_id = wx.NewIdRef()
         self.account_favorites_menu_id = wx.NewIdRef()
         self.account_subscriptions_menu_id = wx.NewIdRef()
+        self.account_history_menu_id = wx.NewIdRef()
+        self.account_following_menu_id = wx.NewIdRef()
         self.account_purchased_dramas_menu_id = wx.NewIdRef()
         self.account_logout_menu_id = wx.NewIdRef()
         self.account_exit_menu_id = wx.NewIdRef()
@@ -1330,6 +2227,7 @@ class MaoerFrame(wx.Frame):
         self.settings_startup_sound_menu_id = wx.NewIdRef()
         self.settings_subtitle_menu_id = wx.NewIdRef()
         self.settings_danmaku_menu_id = wx.NewIdRef()
+        self.settings_subtitle_filter_menu_id = wx.NewIdRef()
         self.help_hotkeys_menu_id = wx.NewIdRef()
         self.help_update_log_menu_id = wx.NewIdRef()
         self.help_about_menu_id = wx.NewIdRef()
@@ -1345,12 +2243,16 @@ class MaoerFrame(wx.Frame):
         if self.account_logged_in:
             account_menu.Append(self.account_info_menu_id, "我的信息(&I)")
             account_menu.Append(self.account_favorites_menu_id, "我的收藏(&F)")
-            account_menu.Append(self.account_subscriptions_menu_id, "剧集订阅(&S)")
+            account_menu.Append(self.account_subscriptions_menu_id, "我的追剧(&S)")
+            account_menu.Append(self.account_history_menu_id, "我的播放历史(&H)")
+            account_menu.Append(self.account_following_menu_id, "我的关注(&G)")
             account_menu.Append(self.account_purchased_dramas_menu_id, "已购广播剧(&P)")
             account_menu.AppendSeparator()
             account_menu.Append(self.account_logout_menu_id, "退出登录(&O)")
         else:
             account_menu.Append(self.account_login_menu_id, "账号登录(&L)")
+            account_menu.Append(self.account_history_menu_id, "我的播放历史(&H)")
+            account_menu.Append(self.account_following_menu_id, "我的关注(&G)")
         account_menu.AppendSeparator()
         account_menu.Append(self.account_exit_menu_id, "退出程序(&Q)")
         menu_bar.Append(account_menu, "账号(&A)")
@@ -1387,6 +2289,12 @@ class MaoerFrame(wx.Frame):
         settings_menu.AppendCheckItem(self.settings_danmaku_menu_id, "默认朗读弹幕(&D)").Check(
             self.settings.read_danmaku
         )
+        settings_menu.AppendSeparator()
+        settings_menu.Append(self.settings_subtitle_filter_menu_id, "字幕过滤规则（实验性功能）(&R)…")
+        self.output_device_menu = wx.Menu()
+        self._populate_output_device_menu()
+        settings_menu.AppendSubMenu(self.output_device_menu, "默认播放设备(&O)")
+        self.settings_menu = settings_menu
         menu_bar.Append(settings_menu, "设置(&S)")
 
         help_menu = wx.Menu()
@@ -1402,6 +2310,7 @@ class MaoerFrame(wx.Frame):
         self.search_button.Bind(wx.EVT_BUTTON, self.on_search)
         self.search_box.Bind(wx.EVT_TEXT_ENTER, self.on_search)
         self.list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_item_activated)
+        self.list.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_list_item_selected)
         self.list.Bind(wx.EVT_RIGHT_DOWN, self.on_list_right_down)
         self.list.Bind(wx.EVT_RIGHT_UP, self.on_list_right_up)
         self.list.Bind(wx.EVT_MOUSEWHEEL, self.on_list_mouse_wheel)
@@ -1415,6 +2324,8 @@ class MaoerFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_account_info, id=self.account_info_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_favorites, id=self.account_favorites_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_subscriptions, id=self.account_subscriptions_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_account_history, id=self.account_history_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_account_following, id=self.account_following_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_purchased_dramas, id=self.account_purchased_dramas_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_logout, id=self.account_logout_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_exit, id=self.account_exit_menu_id)
@@ -1432,6 +2343,8 @@ class MaoerFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_setting_changed, id=self.settings_startup_sound_menu_id)
         self.Bind(wx.EVT_MENU, self.on_setting_changed, id=self.settings_subtitle_menu_id)
         self.Bind(wx.EVT_MENU, self.on_setting_changed, id=self.settings_danmaku_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_subtitle_filter_rules, id=self.settings_subtitle_filter_menu_id)
+        self.Bind(wx.EVT_MENU_OPEN, self._on_output_menu_open)
         self.Bind(wx.EVT_MENU, self.on_help_hotkeys, id=self.help_hotkeys_menu_id)
         self.Bind(wx.EVT_MENU, self.on_help_update_log, id=self.help_update_log_menu_id)
         self.Bind(wx.EVT_MENU, self.on_help_about, id=self.help_about_menu_id)
@@ -1652,10 +2565,126 @@ class MaoerFrame(wx.Frame):
         self.settings = updated
         if self.player_frame is not None:
             if name == "read_subtitle":
+                self.player_frame.read_subtitle_default = enabled
                 self.player_frame.read_subtitle_enabled = enabled
+                self.player_frame.subtitle_filter_enabled = False
             elif name == "read_danmaku":
+                self.player_frame.read_danmaku_default = enabled
                 self.player_frame.read_danmaku_enabled = enabled
         self.SetStatusText(f"{label}已{'开启' if enabled else '关闭'}，设置已保存")
+
+    def _refresh_output_devices(self) -> None:
+        def done(result):
+            if not self:
+                return
+            if result.get("ok"):
+                self.output_devices = result["devices"]
+                self._output_device_error = ""
+            else:
+                self._output_device_error = "播放设备获取失败，请重新打开菜单重试"
+        self.audio_output_router.refresh(lambda result: wx.CallAfter(done, result))
+
+    def _populate_output_device_menu(self) -> None:
+        menu = self.output_device_menu
+        for item_id in getattr(self, "_output_menu_ids", ()):
+            self.Unbind(wx.EVT_MENU, id=item_id)
+        self._output_menu_ids = []
+        for item in menu.GetMenuItems():
+            menu.DestroyItem(item)
+        for device in self.output_devices:
+            item = menu.AppendRadioItem(wx.ID_ANY, device.name.replace("&", "&&"))
+            item.Check(device.id == self.settings.output_device_id)
+            self._output_menu_ids.append(item.GetId())
+            self.Bind(wx.EVT_MENU, lambda event, value=device.id: self._set_default_output_device(value), id=item.GetId())
+        if self.settings.output_device_id and all(device.id != self.settings.output_device_id for device in self.output_devices):
+            item = menu.AppendRadioItem(wx.ID_ANY, "已保存的设备不可用（播放时跟随系统）")
+            item.Check(True)
+            item.Enable(False)
+        if self._output_device_error:
+            menu.Append(wx.ID_ANY, self._output_device_error).Enable(False)
+
+    def _on_output_menu_open(self, event: wx.MenuEvent) -> None:
+        if event.GetMenu() is self.settings_menu:
+            self._refresh_output_devices()
+        elif event.GetMenu() is self.output_device_menu:
+            self._populate_output_device_menu()
+        event.Skip()
+
+    def _set_default_output_device(self, device_id: str) -> None:
+        updated = replace(self.settings, output_device_id=device_id)
+        try:
+            save_settings(updated)
+        except OSError as exc:
+            self.show_error(f"保存默认播放设备失败：{exc}")
+            return
+        self.settings = updated
+        def done(result):
+            if not self:
+                return
+            if result.get("ok"):
+                self.SetStatusText(f"默认播放设备：{result['name']}，已保存")
+            else:
+                self.show_error(f"默认设备已保存，但暂时无法应用：{result.get('error', '未知错误')}")
+        self.audio_output_router.select(device_id, lambda result: wx.CallAfter(done, result))
+
+    def _cycle_output_device(self, direction: int, callback: Callable) -> None:
+        self.audio_output_router.cycle(direction, lambda result: wx.CallAfter(callback, result))
+
+    def _poll_output_device(self, generation: int) -> None:
+        if not self or generation != self._audio_poll_generation or self.player_frame is None:
+            return
+        def done(result):
+            if not self or generation != self._audio_poll_generation or self.player_frame is None:
+                return
+            if result.get("fallback"):
+                message = "原播放设备不可用，音频输出：跟随系统"
+                self.player_frame._announce_status(message)
+            elif not result.get("ok"):
+                message = f"应用播放设备失败：{result.get('error', '未知错误')}"
+                if message != self.GetStatusBar().GetStatusText():
+                    self.SetStatusText(message)
+        self.audio_output_router.poll(lambda result: wx.CallAfter(done, result))
+        wx.CallLater(2000, self._poll_output_device, generation)
+
+    def on_subtitle_filter_rules(self, _event: wx.Event) -> None:
+        self._edit_subtitle_filter_rules(self)
+
+    def _edit_subtitle_filter_rules(self, parent: wx.Window) -> None:
+        dialog = SubtitleFilterRulesDialog(
+            parent, self.settings.subtitle_filter_presets,
+            self.player_frame.subtitle_filter_slot if parent is self.player_frame
+            else self.settings.active_subtitle_filter_slot,
+        )
+        try:
+            if dialog.ShowModal() != wx.ID_OK:
+                return
+            presets, slot = dialog.get_configuration()
+        finally:
+            dialog.Destroy()
+
+        updated = replace(self.settings, subtitle_filter_presets=presets, active_subtitle_filter_slot=slot)
+        try:
+            save_settings(updated)
+        except OSError as exc:
+            self.show_error(f"保存字幕过滤规则失败：{exc}")
+            return
+        self.settings = updated
+        if self.player_frame is not None:
+            self.player_frame.subtitle_filter_presets = presets
+            self.player_frame.subtitle_filter_slot = slot
+            self.player_frame.subtitle_filter_rules = presets[slot].rules
+            self.player_frame.book_filter_last_role = None
+        self.SetStatusText(f"过滤方案{(slot + 1) % 10}已保存")
+
+    def _on_filter_slot_changed(self, slot: int) -> bool:
+        updated = replace(self.settings, active_subtitle_filter_slot=slot)
+        try:
+            save_settings(updated)
+        except OSError as exc:
+            self.SetStatusText(f"过滤方案已切换，但保存选择失败：{exc}")
+            return False
+        self.settings = updated
+        return True
 
     def on_help_hotkeys(self, _event: wx.Event) -> None:
         self._open_text_file("热键表", HOTKEYS_TEXT_NAME, bundled=True)
@@ -1691,6 +2720,7 @@ class MaoerFrame(wx.Frame):
             if dialog.ShowModal() == wx.ID_OK:
                 cookie = dialog.cookie_header or self.api.cookie_header
                 self.api.set_cookie(cookie)
+                self._sync_follow_status_account()
                 self.browser_player.cookie = cookie
                 self.browser_player.shutdown()
                 self.account_logged_in = True
@@ -1810,15 +2840,67 @@ class MaoerFrame(wx.Frame):
     def on_account_subscriptions(self, _event: wx.Event) -> None:
         previous_state = self._account_list_previous_state()
         self._run_background(
-            "正在加载剧集订阅...",
+            "正在加载我的追剧...",
             lambda: self.api.subscribed_dramas(1),
             lambda items: self._enter_items(
                 items,
-                "剧集订阅",
+                "我的追剧",
                 previous_state,
                 focus_list=True,
                 page_state=PageState(1, lambda page: self.api.subscribed_dramas(page)),
             ),
+        )
+
+    def on_account_history(self, _event: wx.Event) -> None:
+        cookie = self.api.cookie_header
+        if not cookie:
+            wx.MessageBox("请先登录账号", "提示", wx.OK | wx.ICON_INFORMATION, self)
+            return
+        previous_state = self._account_list_previous_state()
+
+        def show_history(items: list[MediaItem]) -> None:
+            if self.api.cookie_header != cookie:
+                self.SetStatusText("登录账号已变化，请重新打开播放历史")
+                return
+            self._enter_items(
+                items,
+                "我的播放历史",
+                previous_state,
+                focus_list=True,
+                hide_detail_column=True,
+            )
+
+        self._run_background("正在加载我的播放历史...", self.api.playback_history, show_history)
+
+    def on_account_following(self, _event: wx.Event) -> None:
+        cookie = self.api.cookie_header
+        if not cookie:
+            wx.MessageBox("请先登录账号", "提示", wx.OK | wx.ICON_INFORMATION, self)
+            return
+        previous_state = self._account_list_previous_state()
+
+        def load_page(page: int) -> list[MediaItem]:
+            if self.api.cookie_header != cookie:
+                raise ApiError("登录账号已变化，请重新打开我的关注")
+            return self.api.followed_accounts(page)
+
+        def show_following(items: list[MediaItem]) -> None:
+            if self.api.cookie_header != cookie:
+                self.SetStatusText("登录账号已变化，请重新打开我的关注")
+                return
+            self._enter_items(
+                items,
+                "我的关注",
+                previous_state,
+                focus_list=True,
+                page_state=PageState(1, load_page),
+                hide_detail_column=True,
+            )
+
+        self._run_background(
+            "正在加载我的关注...",
+            lambda: load_page(1),
+            show_following,
         )
 
     def on_account_purchased_dramas(self, _event: wx.Event) -> None:
@@ -1837,6 +2919,7 @@ class MaoerFrame(wx.Frame):
 
     def on_account_logout(self, _event: wx.Event) -> None:
         self.api.set_cookie("")
+        self._sync_follow_status_account()
         self.api.clear_saved_cookie()
         self.browser_player.cookie = ""
         self.browser_player.shutdown()
@@ -1844,7 +2927,7 @@ class MaoerFrame(wx.Frame):
         self._update_account_menu()
         self.SetTitle(APP_TITLE)
         self.SetStatusText("已退出登录")
-        if self.current_title in {"我的收藏", "剧集订阅", "已购广播剧"}:
+        if self.current_title in {"我的收藏", "我的追剧", "我的播放历史", "我的关注", "剧集订阅", "已购广播剧"}:
             self.load_homepage(focus_list=True)
 
     def _refresh_account_title(self) -> None:
@@ -1873,6 +2956,7 @@ class MaoerFrame(wx.Frame):
 
     def _mark_account_logged_out(self, status: str = "") -> None:
         self.api.set_cookie("")
+        self._sync_follow_status_account()
         self.browser_player.cookie = ""
         if self.account_logged_in:
             self.account_logged_in = False
@@ -1917,6 +3001,12 @@ class MaoerFrame(wx.Frame):
         if key == wx.WXK_DOWN:
             self._move_list_selection(1)
             return
+        event.Skip()
+
+    def on_list_item_selected(self, event: wx.ListEvent) -> None:
+        index = event.GetIndex()
+        if 0 <= index < len(self.items):
+            self._prefetch_follow_status_for_item(self.items[index])
         event.Skip()
 
     def on_list_context_menu(self, event: wx.ContextMenuEvent) -> None:
@@ -1974,6 +3064,7 @@ class MaoerFrame(wx.Frame):
         self.list.SetItemState(index, state, state)
         if ensure_visible:
             self.list.EnsureVisible(index)
+        self._prefetch_follow_status_for_item(self.items[index])
 
     def _resize_list_columns(self) -> None:
         width = self.list.GetClientSize().width
@@ -1997,8 +3088,6 @@ class MaoerFrame(wx.Frame):
             name_label = "更新日 · 剧名"
         if title == "广播剧 · 时间表":
             detail_label = "最新更新"
-        if title in {"会员限免剧", "会员折扣剧"}:
-            detail_label = "会员权益"
         if self._items_are_categories():
             name_label = "分类"
             detail_label = ""
@@ -2047,6 +3136,10 @@ class MaoerFrame(wx.Frame):
 
     def _display_item_title(self, item: MediaItem) -> str:
         title = item.title
+        if self.current_title == "我的播放历史" and isinstance(item.raw, dict):
+            date = item.raw.get("_history_date")
+            if isinstance(date, str) and date:
+                title = f"{date} · {title}"
         if self.current_title in {"精品周更", "广播剧 · 时间表"} and isinstance(item.raw, dict):
             day_key = "_weekly_day_label" if self.current_title == "精品周更" else "_timeline_day_label"
             day = item.raw.get(day_key)
@@ -2069,7 +3162,7 @@ class MaoerFrame(wx.Frame):
 
         raw = item.raw
         if isinstance(raw, dict):
-            if raw.get("_hide_author") and self.current_title in {"我的收藏", "会员限免剧", "会员折扣剧"}:
+            if raw.get("_hide_author") and self.current_title == "我的收藏":
                 return item.subtitle
             return self._raw_text_value(raw, ("_publisher_name", "username", "user_name"))
         return ""
@@ -2077,7 +3170,7 @@ class MaoerFrame(wx.Frame):
     def _uses_publisher_column(self) -> bool:
         return (
             not self._hide_detail_column()
-            and self.current_title not in {"我的收藏", "会员限免剧", "会员折扣剧", "广播剧 · 时间表"}
+            and self.current_title not in {"我的收藏", "广播剧 · 时间表"}
         )
 
     def _start_publisher_resolution(self, items: list[MediaItem]) -> None:
@@ -2127,6 +3220,71 @@ class MaoerFrame(wx.Frame):
             return
 
         item = self.items[index]
+        profile = item.raw.get("_publisher_profile") if isinstance(item.raw, dict) else None
+        if isinstance(profile, PublisherProfile) and self.current_title == f"发布者：{profile.name}":
+            self._display_publisher_follow_menu(position, profile)
+            return
+        followed = self._known_follow_status(item) if item.kind == "drama" else None
+        if item.kind == "drama" and self.api.cookie_header and followed is None:
+            self._prefetch_follow_status_for_item(item)
+        self._display_item_menu(position, item, followed)
+
+    def _display_publisher_follow_menu(self, position: wx.Point, profile: PublisherProfile) -> None:
+        menu = wx.Menu()
+        action_id = wx.NewIdRef()
+        cookie = self.api.cookie_header
+        if not cookie:
+            label = "请先登录"
+        elif profile.followed is None or profile.followed_cookie != cookie:
+            label = "关注状态未确认，请重新打开发布者资料"
+        else:
+            label = "取消关注" if profile.followed else "关注"
+        entry = menu.Append(action_id, label)
+        entry.Enable(not cookie or (profile.followed is not None and profile.followed_cookie == cookie))
+        try:
+            choice = self.list.GetPopupMenuSelectionFromUser(menu, position)
+        finally:
+            menu.Destroy()
+        if choice != int(action_id):
+            return
+        if not cookie:
+            wx.MessageBox("请先登录账号", "提示", wx.OK | wx.ICON_INFORMATION, self)
+            return
+        follow = not profile.followed
+        self._run_background(
+            f"正在{'关注' if follow else '取消关注'}：{profile.name}",
+            lambda: self.api.set_publisher_follow(profile.user_id, follow),
+            lambda message: self._publisher_follow_done(profile, follow, cookie, str(message)),
+        )
+
+    def _publisher_follow_done(
+        self, profile: PublisherProfile, follow: bool, cookie: str, message: str,
+    ) -> None:
+        if self.api.cookie_header != cookie:
+            self.SetStatusText("登录账号已变化，请重新打开发布者资料")
+            return
+        profile.followed = follow
+        profile.followed_cookie = cookie
+        if profile.followers is not None:
+            profile.followers = max(0, profile.followers + (1 if follow else -1))
+        if self.current_title == f"发布者：{profile.name}":
+            updated_profile_item = self._publisher_profile_items(profile)[0]
+            for index, item in enumerate(self.items):
+                if item.kind != "publisher_profile":
+                    continue
+                item.title = updated_profile_item.title
+                item.raw["_profile_text"] = updated_profile_item.raw["_profile_text"]
+                self.list.SetItem(index, 0, item.title)
+                break
+        if not follow:
+            for state in self.navigation_stack:
+                if state.title == "我的关注":
+                    state.items = [item for item in state.items if item.id != profile.user_id]
+                    state.selected_index = min(state.selected_index, len(state.items) - 1)
+        self.SetStatusText(message)
+        wx.MessageBox(message, "提示", wx.OK | wx.ICON_INFORMATION, self)
+
+    def _display_item_menu(self, position: wx.Point, item: MediaItem, followed: bool | None) -> None:
         if item.kind == "category":
             return
 
@@ -2139,17 +3297,27 @@ class MaoerFrame(wx.Frame):
         open_id = wx.NewIdRef()
         detail_id = wx.NewIdRef()
         comments_id = wx.NewIdRef()
+        drama_id = wx.NewIdRef()
+        publisher_id = wx.NewIdRef()
         purchase_id = wx.NewIdRef()
         follow_id = wx.NewIdRef()
         purchase_label = self._drama_purchase_menu_label(item)
         if can_show_item_menu:
             menu.Append(open_id, "用网页打开")
             menu.Append(detail_id, "查看音频简介" if item.kind == "sound" else "查看广播剧详情")
+            if item.kind == "sound":
+                menu.Append(drama_id, "查看该剧集")
+            menu.Append(publisher_id, "查看发布者")
         if item.kind == "drama":
             menu.AppendSeparator()
             if purchase_label is not None:
                 menu.Append(purchase_id, purchase_label)
-            follow_label = "登录后追剧" if not self.api.cookie_header else self._drama_follow_menu_label(item)
+            if not self.api.cookie_header:
+                follow_label = "登录后追剧"
+            elif followed is None:
+                follow_label = "管理追剧…"
+            else:
+                follow_label = "取消追剧" if followed else "追剧"
             follow_entry = menu.Append(follow_id, follow_label)
             follow_entry.Enable(bool(self.api.cookie_header))
         if can_show_comments_menu:
@@ -2169,10 +3337,17 @@ class MaoerFrame(wx.Frame):
                 self.show_sound_intro(item)
             else:
                 self.show_drama_detail(item)
+        elif item.kind == "sound" and choice == int(drama_id):
+            self.show_sound_drama(item)
+        elif can_show_item_menu and choice == int(publisher_id):
+            self.show_item_publisher(item)
         elif item.kind == "drama" and purchase_label is not None and choice == int(purchase_id):
             self._prompt_drama_purchase(item.id)
         elif item.kind == "drama" and choice == int(follow_id):
-            self._follow_drama_from_work_menu(item)
+            if followed is None:
+                self._follow_drama_from_work_menu(item)
+            else:
+                self._follow_drama_from_work_menu(item, expected_followed=followed)
         elif can_show_comments_menu and choice == int(comments_id):
             self.show_comments(item)
 
@@ -2185,11 +3360,66 @@ class MaoerFrame(wx.Frame):
             return None
         return "购买本剧"
 
-    @staticmethod
-    def _drama_follow_menu_label(item: MediaItem) -> str:
-        raw = item.raw if isinstance(item.raw, dict) else {}
-        followed = str(raw.get("like", "")).strip().lower() in {"1", "true"}
-        return "取消追剧" if followed else "追剧"
+    def _sync_follow_status_account(self) -> str:
+        cookie = self.api.cookie_header
+        if getattr(self, "_follow_status_cookie", None) != cookie:
+            self._follow_status_cookie = cookie
+            self._follow_status_cache = {}
+            self._follow_status_pending = {}
+        return cookie
+
+    def _known_follow_status(self, item: MediaItem) -> bool | None:
+        if not self._sync_follow_status_account():
+            return None
+        if item.id in self._follow_status_cache:
+            return self._follow_status_cache[item.id]
+        cached = self.api.cached_drama_follow_status(item.id)
+        if isinstance(cached, bool):
+            self._follow_status_cache[item.id] = cached
+            return cached
+        return None
+
+    def _remember_followed_items(self, items: list[MediaItem], title: str) -> None:
+        if title not in {"我的追剧", "广播剧 · 我的追剧"} or not self._sync_follow_status_account():
+            return
+        for item in items:
+            if item.kind == "drama":
+                self._follow_status_cache.setdefault(item.id, True)
+
+    def _prefetch_follow_status_for_item(self, item: MediaItem) -> None:
+        if item.kind != "drama":
+            return
+        cookie = self._sync_follow_status_account()
+        if not cookie or self._known_follow_status(item) is not None:
+            return
+        if item.id in self._follow_status_pending:
+            return
+        token = object()
+        self._follow_status_pending[item.id] = token
+        drama_id = item.id
+
+        def runner() -> None:
+            try:
+                followed = self.api.drama_follow_status(drama_id)
+            except (ApiError, requests.RequestException, ValueError):
+                followed = None
+            except Exception as exc:
+                debug_log(f"follow status prefetch failed: {type(exc).__name__}: {exc}")
+                followed = None
+            wx.CallAfter(self._finish_follow_status_prefetch, drama_id, cookie, token, followed)
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _finish_follow_status_prefetch(
+        self, drama_id: int, cookie: str, token: object, followed: bool | None,
+    ) -> None:
+        if self._sync_follow_status_account() != cookie:
+            return
+        if self._follow_status_pending.get(drama_id) is not token:
+            return
+        del self._follow_status_pending[drama_id]
+        if isinstance(followed, bool):
+            self._follow_status_cache[drama_id] = followed
 
     def _can_show_item_menu(self, item: MediaItem) -> bool:
         return item.kind in {"drama", "sound"}
@@ -2223,6 +3453,58 @@ class MaoerFrame(wx.Frame):
             lambda content: self._show_item_detail_dialog(item, str(content), "广播剧详情"),
         )
 
+    def show_sound_drama(self, item: MediaItem) -> None:
+        previous_state = self._navigation_state_snapshot()
+        self._run_background(
+            f"正在查找该音频所属剧集: {item.title}",
+            lambda: self.api.drama_for_sound(item.id),
+            lambda drama: self._enter_items(
+                [drama], "该音频所属剧集", previous_state, focus_list=True,
+            ),
+        )
+
+    def show_item_publisher(self, item: MediaItem) -> None:
+        previous_state = self._navigation_state_snapshot()
+        self._run_background(
+            f"正在加载发布者: {item.title}",
+            lambda: self.api.publisher_profile_for_item(item),
+            lambda profile: self._enter_publisher_profile(profile, previous_state),
+        )
+
+    def show_followed_account(self, item: MediaItem) -> None:
+        previous_state = self._navigation_state_snapshot()
+        self._run_background(
+            f"正在加载账号: {item.title}",
+            lambda: self.api.publisher_profile(item.id),
+            lambda profile: self._enter_publisher_profile(profile, previous_state),
+        )
+
+    def _enter_publisher_profile(self, profile: PublisherProfile, previous_state: NavigationState) -> None:
+        self._enter_items(
+            self._publisher_profile_items(profile),
+            f"发布者：{profile.name}",
+            previous_state,
+            focus_list=True,
+            hide_detail_column=True,
+        )
+
+    @staticmethod
+    def _publisher_profile_items(profile: PublisherProfile) -> list[MediaItem]:
+        followers = str(profile.followers) if profile.followers is not None else "未知"
+        following = str(profile.following) if profile.following is not None else "未知"
+        bio = profile.bio or "暂无简介"
+        text = f"发布者：{profile.name}\n粉丝：{followers}\n关注：{following}\n简介：{bio}"
+        return [
+            MediaItem(
+                kind="publisher_profile",
+                id=profile.user_id,
+                title=f"{profile.name}粉丝：{followers}关注：{following}简介：{bio}",
+                raw={"_publisher_profile": profile, "_profile_text": text},
+            ),
+            MediaItem(kind="publisher_dramas", id=profile.user_id, title="Ta的剧集", raw={"_publisher_profile": profile}),
+            MediaItem(kind="publisher_sounds", id=profile.user_id, title="Ta的声音", raw={"_publisher_profile": profile}),
+        ]
+
     def _show_item_detail_dialog(self, item: MediaItem, content: str, detail_kind: str) -> None:
         dialog = MediaDetailDialog(self, item.title, content, detail_kind)
         try:
@@ -2252,6 +3534,45 @@ class MaoerFrame(wx.Frame):
         self.open_item(self.items[index])
 
     def open_item(self, item: MediaItem) -> None:
+        if item.kind == "publisher_account":
+            self.show_followed_account(item)
+            return
+
+        if item.kind == "publisher_profile":
+            profile = item.raw.get("_publisher_profile") if isinstance(item.raw, dict) else None
+            content = item.raw.get("_profile_text", "") if isinstance(item.raw, dict) else ""
+            if isinstance(profile, PublisherProfile):
+                self._show_item_detail_dialog(
+                    MediaItem(kind="publisher_profile", id=profile.user_id, title=profile.name),
+                    str(content),
+                    "发布者资料",
+                )
+            return
+
+        if item.kind in {"publisher_dramas", "publisher_sounds"}:
+            profile = item.raw.get("_publisher_profile") if isinstance(item.raw, dict) else None
+            if not isinstance(profile, PublisherProfile):
+                self.show_error("发布者资料已失效，请重新打开")
+                return
+            previous_state = self._navigation_state_snapshot()
+            loader = (
+                (lambda page: self.api.publisher_dramas(profile, page))
+                if item.kind == "publisher_dramas"
+                else (lambda page: self.api.publisher_sounds(profile, page))
+            )
+            self._run_background(
+                f"正在加载{profile.name}的{'剧集' if item.kind == 'publisher_dramas' else '声音'}...",
+                lambda: loader(1),
+                lambda items: self._enter_items(
+                    items,
+                    f"{profile.name} · {item.title}",
+                    previous_state,
+                    focus_list=True,
+                    page_state=PageState(1, loader),
+                ),
+            )
+            return
+
         if item.kind == "drama_purchase":
             self._prompt_drama_purchase(item.drama_id or item.id)
             return
@@ -2622,6 +3943,7 @@ class MaoerFrame(wx.Frame):
     ) -> None:
         self.current_title = title
         self.items = items
+        self._remember_followed_items(items, title)
         self.hide_list_detail_column = hide_detail_column
         self._opened_drama_id = opened_drama_id
         self._publisher_request = object()
@@ -2647,7 +3969,9 @@ class MaoerFrame(wx.Frame):
         if self.page_state is not None:
             wx.CallAfter(self._load_next_page_if_near_bottom)
 
-    def _follow_drama_from_work_menu(self, item: MediaItem) -> None:
+    def _follow_drama_from_work_menu(
+        self, item: MediaItem, expected_followed: bool | None = None,
+    ) -> None:
         cookie = self.api.cookie_header
         if not cookie:
             self.show_error("需要登录后才能追剧")
@@ -2656,12 +3980,24 @@ class MaoerFrame(wx.Frame):
         self._run_background(
             f"正在查询追剧状态: {item.title}",
             lambda: self.api.drama_follow_status(drama_id),
-            lambda followed: self._confirm_work_menu_follow(item, bool(followed), cookie),
+            lambda followed: self._confirm_work_menu_follow(
+                item, bool(followed), cookie, expected_followed=expected_followed,
+            ),
         )
 
-    def _confirm_work_menu_follow(self, item: MediaItem, followed: bool, cookie: str) -> None:
+    def _confirm_work_menu_follow(
+        self, item: MediaItem, followed: bool, cookie: str, expected_followed: bool | None = None,
+    ) -> None:
         if self.api.cookie_header != cookie:
             self.show_error("登录账号已变化，请重新追剧")
+            return
+        self._sync_follow_status_account()
+        self._follow_status_cache[item.id] = followed
+        self._follow_status_pending.pop(item.id, None)
+        if expected_followed is not None and followed != expected_followed:
+            message = "追剧状态已变化，请重新打开右键菜单。"
+            self.SetStatusText(message)
+            wx.MessageBox(message, "追剧状态已变化", wx.OK | wx.ICON_INFORMATION, self)
             return
         if followed and wx.MessageBox(
             "确定取消追剧吗？",
@@ -2693,6 +4029,9 @@ class MaoerFrame(wx.Frame):
             self.SetStatusText("服务端追剧状态未改变，请稍后重试")
             return
         item.raw = {**item.raw, "like": int(result.followed)}
+        self._sync_follow_status_account()
+        self._follow_status_cache[item.id] = result.followed
+        self._follow_status_pending.pop(item.id, None)
         message = result.message.strip() or ("已加入追剧列表" if target else "已移出追剧列表")
         self.SetStatusText(message)
         wx.MessageBox(
@@ -2780,6 +4119,7 @@ class MaoerFrame(wx.Frame):
         state.page = page
         previous_selection = self._selected_index()
         self.items.extend(new_items)
+        self._remember_followed_items(new_items, self.current_title)
         self.list.Freeze()
         try:
             for item in new_items:
@@ -2809,6 +4149,11 @@ class MaoerFrame(wx.Frame):
                 self._on_playback_finished,
                 read_danmaku_default=self.settings.read_danmaku,
                 read_subtitle_default=self.settings.read_subtitle,
+                subtitle_filter_presets=self.settings.subtitle_filter_presets,
+                subtitle_filter_slot=self.settings.active_subtitle_filter_slot,
+                on_filter_slot_changed=self._on_filter_slot_changed,
+                on_filter_rules=self._edit_subtitle_filter_rules,
+                on_cycle_output=self._cycle_output_device,
             )
             created = True
 
@@ -2824,6 +4169,10 @@ class MaoerFrame(wx.Frame):
             return
 
         self.current_playback_key = source_key or ("sound", playback.sound_id)
+        self._audio_poll_generation += 1
+        if created:
+            wx.CallAfter(self.audio_output_router.select, self.settings.output_device_id)
+        wx.CallAfter(self._poll_output_device, self._audio_poll_generation)
         self.player_frame.Show()
         self.player_frame.Raise()
         prefix = "正在播放"
@@ -3086,7 +4435,6 @@ class MaoerFrame(wx.Frame):
                 self.SetStatusText("没有正在播放的内容")
                 return
             player.seek(seconds)
-            self.SetStatusText("快进 15 秒" if seconds > 0 else "快退 15 秒")
         except PlayerUnavailable as exc:
             self.show_error(str(exc))
 
@@ -3099,7 +4447,6 @@ class MaoerFrame(wx.Frame):
                 return
             volume = player.volume_up()
             debug_log(f"volume_up result volume={volume}")
-            self.SetStatusText(f"音量: {volume}")
         except PlayerUnavailable as exc:
             self.show_error(str(exc))
 
@@ -3112,7 +4459,6 @@ class MaoerFrame(wx.Frame):
                 return
             volume = player.volume_down()
             debug_log(f"volume_down result volume={volume}")
-            self.SetStatusText(f"音量: {volume}")
         except PlayerUnavailable as exc:
             self.show_error(str(exc))
 
@@ -3122,8 +4468,7 @@ class MaoerFrame(wx.Frame):
             if player is None:
                 self.SetStatusText("没有正在播放的内容")
                 return
-            paused = player.toggle_pause()
-            self.SetStatusText("已暂停" if paused else "继续播放")
+            player.toggle_pause()
         except PlayerUnavailable as exc:
             self.show_error(str(exc))
 
@@ -3151,7 +4496,10 @@ class MaoerFrame(wx.Frame):
 
     def on_close(self, event: wx.CloseEvent) -> None:
         self._publisher_request = object()
+        self._audio_poll_generation += 1
+        self.audio_output_router.close()
         if self.player_frame is not None:
+            self.player_frame._close_readers()
             self.player_frame.Destroy()
             self.player_frame = None
         self.active_player = None
