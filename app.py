@@ -17,7 +17,7 @@ from app_paths import clear_webview2_profile
 from audio_output import AudioOutputRouter, SYSTEM_OUTPUT
 from app_settings import (
     AppSettings, SubtitleFilterPreset, SubtitleFilterRules, default_filter_presets,
-    load_settings, save_settings,
+    load_settings, save_settings, PLAYBACK_MODES,
 )
 from browser_player import (
     HiddenBrowserPlayer,
@@ -371,7 +371,7 @@ class SubtitleFilterRulesDialog(wx.Dialog):
             "人物对话：可选择不朗读，或只读角色名。需要完整朗读字幕时，请在播放窗口关闭过滤模式。\n\n"
             "有声书模式：自动选择只读角色名。旁白、角色仅在切换时播报名称，正文、场景和动作说明不读；"
             "报幕、制作信息仍保留。将人物对话改为不朗读时，会同时关闭有声书模式。\n\n"
-            "OS：勾选后，每次出现 OS 标记会读角色名和 OS，不读正文；同一角色也会提示。"
+            "OS：勾选后读角色名和 OS，不读正文；同一角色连续的 OS 只提示一次，换角色或普通台词后再出现会重新提示。"
             "取消勾选后，整段 OS 完全不读，包括没有重复标注 OS 或角色名的连续字幕。"
             "遇到明确的普通角色、旁白或报幕标签后，恢复该方案的正常规则。"
             "广播剧、有声书和自定义方案均适用；关闭过滤模式后仍完整朗读字幕。\n\n"
@@ -1380,6 +1380,11 @@ class PlaybackFrame(wx.Frame):
         on_filter_slot_changed: Callable[[int], bool] | None = None,
         on_filter_rules: Callable[[wx.Window], None] | None = None,
         on_cycle_output: Callable[[int, Callable], None] | None = None,
+        on_change_track: Callable[["PlaybackFrame", int], None] | None = None,
+        on_cycle_playback_mode: Callable[[], None] | None = None,
+        on_restart_finished: Callable[["PlaybackFrame", PlaybackInfo], None] | None = None,
+        get_playback_mode: Callable[[], str] | None = None,
+        on_set_playback_mode: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__(parent, title="", size=(760, 480))
         self.api = api
@@ -1399,9 +1404,16 @@ class PlaybackFrame(wx.Frame):
         self.book_filter_last_role: str | None = None
         self.book_filter_context_roles: dict[int, str] = {}
         self.subtitle_os_items: set[int] = set()
+        self.subtitle_os_segments: dict[int, int] = {}
+        self.last_spoken_os_segment: int | None = None
         self.on_filter_slot_changed = on_filter_slot_changed
         self.on_filter_rules = on_filter_rules
         self.on_cycle_output = on_cycle_output
+        self.on_change_track = on_change_track
+        self.on_cycle_playback_mode = on_cycle_playback_mode
+        self.on_restart_finished = on_restart_finished
+        self.get_playback_mode = get_playback_mode
+        self.on_set_playback_mode = on_set_playback_mode
         self.output_change_generation = 0
         self.time_announcement_generation = 0
         self.rate_change_generation = 0
@@ -1440,13 +1452,15 @@ class PlaybackFrame(wx.Frame):
     def play(self, playback: PlaybackInfo) -> None:
         if self.playback is None or self.playback.sound_id != playback.sound_id:
             self.read_danmaku_enabled = self.read_danmaku_default
-            self.read_subtitle_enabled = self.read_subtitle_default
-            self.subtitle_filter_enabled = False
-            self.book_filter_last_role = None
-            self.book_filter_context_roles = {}
-            self.subtitle_os_items = set()
+        # F/Ctrl+F are window-session preferences; only per-audio context resets.
+        self.book_filter_last_role = None
+        self.book_filter_context_roles = {}
+        self.subtitle_os_items = set()
+        self.subtitle_os_segments = {}
+        self.last_spoken_os_segment = None
         self.playback = playback
         self.load_generation += 1
+        self.time_announcement_generation += 1
         self.rate_change_generation += 1
         generation = self.load_generation
         self.SetTitle(playback.title)
@@ -1481,6 +1495,9 @@ class PlaybackFrame(wx.Frame):
         context_roles: dict[int, str] = {}
         os_items: set[int] = set()
         os_by_submitter: dict[str, bool] = {}
+        os_segments: dict[int, int] = {}
+        os_run: tuple[str, str] | None = None
+        os_segment = 0
         for item in sorted(marked, key=lambda entry: entry.time):
             if item.mode != DANMAKU_MODE_SUBTITLE:
                 continue
@@ -1492,9 +1509,19 @@ class PlaybackFrame(wx.Frame):
             text = item.text.strip()
             explicit_os = SUBTITLE_OS_MARKER.search(text) or self._subtitle_os_role(item)
             if explicit_os:
+                # Segment identity follows the subtitle timeline, not which
+                # lines happened to be spoken (ordinary dialogue may be muted).
+                actor = role or item.role.strip() or (os_run[1] if os_run else active_role)
+                actor = SUBTITLE_OS_ROLE_SUFFIX.sub("", actor).strip()
+                run = (item.user_id, actor)
+                if run != os_run:
+                    os_segment += 1
+                    os_run = run
+                os_segments[id(item)] = os_segment
                 os_by_submitter[item.user_id] = True
                 os_items.add(id(item))
             elif role is not None:
+                os_run = None
                 # An explicit non-OS label ends the monologue, even when
                 # the same actor resumes speaking. Narration/credits end
                 # outstanding XML contributor streams as well.
@@ -1507,6 +1534,8 @@ class PlaybackFrame(wx.Frame):
                 os_items.add(id(item))
         self.book_filter_context_roles = context_roles
         self.subtitle_os_items = os_items
+        self.subtitle_os_segments = os_segments
+        self.last_spoken_os_segment = None
         self.danmaku_canvas.set_items(marked)
 
     def _set_danmaku_failed(self, generation: int, message: str) -> None:
@@ -1522,6 +1551,25 @@ class PlaybackFrame(wx.Frame):
                 return
             if key == wx.WXK_F9 and not (event.ControlDown() or event.AltDown()):
                 self._cycle_output_device(-1 if event.ShiftDown() else 1)
+                return
+            if key in (ord("Q"), ord("q")) and not (
+                event.ControlDown() or event.AltDown() or event.ShiftDown()
+            ):
+                focus = wx.Window.FindFocus()
+                if focus is not None and wx.GetTopLevelParent(focus) is not self:
+                    event.Skip()
+                    return
+                if self.on_cycle_playback_mode is not None:
+                    self.on_cycle_playback_mode()
+                return
+            if key in (wx.WXK_PAGEUP, wx.WXK_PAGEDOWN) and not (
+                event.ControlDown() or event.AltDown() or event.ShiftDown()
+            ):
+                focus = wx.Window.FindFocus()
+                if focus is not None and wx.GetTopLevelParent(focus) is not self:
+                    event.Skip()
+                    return
+                self._request_track_change(-1 if key == wx.WXK_PAGEUP else 1)
                 return
             if ord("0") <= key <= ord("9") and not (
                 event.ControlDown() or event.AltDown() or event.ShiftDown()
@@ -1560,6 +1608,9 @@ class PlaybackFrame(wx.Frame):
                 self._set_playback_rate(1.0)
                 return
             if key == wx.WXK_SPACE:
+                if self.finish_notified and self.playback is not None and self.on_restart_finished is not None:
+                    self.on_restart_finished(self, self.playback)
+                    return
                 paused = self.player.toggle_pause()
                 self.danmaku_canvas.set_paused(paused)
                 return
@@ -1611,41 +1662,61 @@ class PlaybackFrame(wx.Frame):
     def _show_playback_menu(self, position: wx.Point) -> None:
         menu = wx.Menu()
         actions: dict[int, Callable[[], None]] = {}
+        id_refs = []
 
-        def add_action(label: str, action: Callable[[], None]) -> None:
+        def new_id():
             item_id = wx.NewIdRef()
-            menu.Append(item_id, label)
+            id_refs.append(item_id)
+            return item_id
+
+        def add_action(label: str, action: Callable[[], None], enabled: bool = True) -> None:
+            item_id = new_id()
+            menu.Append(item_id, label).Enable(enabled)
             actions[int(item_id)] = action
 
+        can_change = self.playback is not None and self.on_change_track is not None
+        add_action("上一集", lambda: self._request_track_change(-1), can_change)
+        add_action("下一集", lambda: self._request_track_change(1), can_change)
+        menu.AppendSeparator()
         add_action(f"快退 {self.SEEK_SECONDS} 秒", lambda: self._seek_relative(-self.SEEK_SECONDS))
         add_action(f"快进 {self.SEEK_SECONDS} 秒", lambda: self._seek_relative(self.SEEK_SECONDS))
         add_action("跳转时间…", self._prompt_jump_to_time)
         speed_menu = wx.Menu()
         selected_rate = self._clamp_playback_rate(self.requested_playback_rate)
         for rate in self.PLAYBACK_RATES:
-            speed_id = wx.NewIdRef()
+            speed_id = new_id()
             entry = speed_menu.AppendRadioItem(speed_id, f"{rate:g} 倍")
             if rate == selected_rate:
                 entry.Check(True)
             actions[int(speed_id)] = lambda value=rate: self._set_playback_rate(value)
         menu.AppendSubMenu(speed_menu, "播放倍速")
+        mode_menu = wx.Menu()
+        selected_mode = self.get_playback_mode() if self.get_playback_mode is not None else "sequential"
+        for mode, label in PLAYBACK_MODES:
+            mode_id = new_id()
+            entry = mode_menu.AppendRadioItem(mode_id, label)
+            entry.Check(mode == selected_mode)
+            entry.Enable(self.on_set_playback_mode is not None)
+            actions[int(mode_id)] = lambda value=mode: (
+                self.on_set_playback_mode(value) if self.on_set_playback_mode is not None else None)
+        menu.AppendSubMenu(mode_menu, "播放结束后")
         menu.AppendSeparator()
 
-        subtitle_id = wx.NewIdRef()
+        subtitle_id = new_id()
         menu.AppendCheckItem(subtitle_id, "朗读字幕").Check(self.read_subtitle_enabled)
         actions[int(subtitle_id)] = self._toggle_subtitle_reader
-        filter_id = wx.NewIdRef()
+        filter_id = new_id()
         menu.AppendCheckItem(filter_id, "过滤模式（实验性功能）").Check(self.subtitle_filter_enabled)
         actions[int(filter_id)] = self._toggle_subtitle_filter_mode
         presets_menu = wx.Menu()
         for slot, preset in enumerate(self.subtitle_filter_presets):
-            preset_id = wx.NewIdRef()
+            preset_id = new_id()
             entry = presets_menu.AppendRadioItem(preset_id, f"{(slot + 1) % 10}：{preset.name}")
             if slot == self.subtitle_filter_slot:
                 entry.Check(True)
             actions[int(preset_id)] = lambda selected=slot: self._select_subtitle_filter_slot(selected)
         menu.AppendSubMenu(presets_menu, "过滤方案")
-        danmaku_id = wx.NewIdRef()
+        danmaku_id = new_id()
         menu.AppendCheckItem(danmaku_id, "朗读弹幕").Check(self.read_danmaku_enabled)
         actions[int(danmaku_id)] = self._toggle_danmaku_reader
 
@@ -1661,10 +1732,15 @@ class PlaybackFrame(wx.Frame):
                 self._set_parent_status("操作失败")
                 wx.MessageBox(str(exc), "错误", wx.OK | wx.ICON_ERROR, self)
 
+    def _request_track_change(self, direction: int) -> None:
+        if self.playback is not None and self.on_change_track is not None:
+            self.on_change_track(self, direction)
+
     def _seek_relative(self, seconds: int) -> None:
         self.player.seek(seconds)
         self.danmaku_canvas.seek(seconds)
         self.book_filter_last_role = None
+        self.last_spoken_os_segment = None
 
     def _toggle_danmaku_reader(self) -> None:
         self.read_danmaku_enabled = not self.read_danmaku_enabled
@@ -1675,16 +1751,16 @@ class PlaybackFrame(wx.Frame):
         self.read_subtitle_enabled = not self.read_subtitle_enabled
         self.subtitle_filter_enabled = False
         self.book_filter_last_role = None
+        self.last_spoken_os_segment = None
         message = "字幕朗读已开启" if self.read_subtitle_enabled else "字幕朗读已关闭"
         self._announce_status(message)
 
     def _toggle_subtitle_filter_mode(self) -> None:
         if not self.read_subtitle_enabled:
-            self.read_subtitle_enabled = True
-            self.subtitle_filter_enabled = True
-        else:
-            self.subtitle_filter_enabled = not self.subtitle_filter_enabled
+            return
+        self.subtitle_filter_enabled = not self.subtitle_filter_enabled
         self.book_filter_last_role = None
+        self.last_spoken_os_segment = None
         message = "字幕过滤模式已开启" if self.subtitle_filter_enabled else "已恢复朗读全部字幕"
         self._announce_status(message)
 
@@ -1696,6 +1772,7 @@ class PlaybackFrame(wx.Frame):
         self.subtitle_filter_rules = preset.rules
         self.subtitle_filter_enabled = True
         self.book_filter_last_role = None
+        self.last_spoken_os_segment = None
         saved = self.on_filter_slot_changed(slot) if self.on_filter_slot_changed is not None else True
         message = preset.name
         if saved is False:
@@ -1760,6 +1837,9 @@ class PlaybackFrame(wx.Frame):
         os_role = self._subtitle_os_role(item)
         if os_marker or os_role or id(item) in getattr(self, "subtitle_os_items", ()):
             if not rules.os_body or not (os_marker or os_role):
+                return ""
+            segment = getattr(self, "subtitle_os_segments", {}).get(id(item))
+            if segment is not None and segment == getattr(self, "last_spoken_os_segment", None):
                 return ""
             if not os_marker:
                 return os_role
@@ -1857,6 +1937,10 @@ class PlaybackFrame(wx.Frame):
     def _on_subtitle_due(self, item: DanmakuItem) -> None:
         text = self._subtitle_text_to_read(item)
         if text:
+            if self.subtitle_filter_enabled:
+                segment = getattr(self, "subtitle_os_segments", {}).get(id(item))
+                if segment is not None:
+                    self.last_spoken_os_segment = segment
             if self.subtitle_filter_enabled and self.subtitle_filter_rules.speaker_transitions_only:
                 role = (self._book_filter_role(item, self.subtitle_filter_rules)
                         or self.book_filter_context_roles.get(id(item), "")
@@ -1988,6 +2072,7 @@ class PlaybackFrame(wx.Frame):
         )
         self.book_filter_last_role = None
         self.time_announcement_generation += 1
+        self.last_spoken_os_segment = None
         message = f"已跳转到{self._format_spoken_time(seconds)}"
         if result.get("resume_error"):
             message += "，但未能开始播放，请按空格重试"
@@ -2155,6 +2240,11 @@ class MaoerFrame(wx.Frame):
         self.last_mouse_context_menu_at = 0.0
         self.account_logged_in = bool(self.api.cookie_header)
         self.current_playback_key: tuple[str, int] | None = None
+        self._play_request: object | None = None
+        self._auto_play_generation = 0
+        self._auto_pending_request: object | None = None
+        self._pending_track_key: tuple[str, int] | None = None
+        self._playback_context: tuple[list[MediaItem], PageState | None, str] | None = None
         self._vip_catalog_request: object | None = None
         self._content_feature_request: object | None = None
         self._opened_drama_id: int | None = None
@@ -2228,6 +2318,8 @@ class MaoerFrame(wx.Frame):
         self.settings_subtitle_menu_id = wx.NewIdRef()
         self.settings_danmaku_menu_id = wx.NewIdRef()
         self.settings_subtitle_filter_menu_id = wx.NewIdRef()
+        self._playback_mode_id_refs = [wx.NewIdRef() for _ in PLAYBACK_MODES]
+        self.playback_mode_menu_ids = {int(item_id): mode for item_id, (mode, _label) in zip(self._playback_mode_id_refs, PLAYBACK_MODES)}
         self.help_hotkeys_menu_id = wx.NewIdRef()
         self.help_update_log_menu_id = wx.NewIdRef()
         self.help_about_menu_id = wx.NewIdRef()
@@ -2279,6 +2371,11 @@ class MaoerFrame(wx.Frame):
         menu_bar.Append(vip_menu, "会员(&V)")
 
         settings_menu = wx.Menu()
+        playback_mode_menu = wx.Menu()
+        for item_id, mode in self.playback_mode_menu_ids.items():
+            playback_mode_menu.AppendRadioItem(item_id, dict(PLAYBACK_MODES)[mode]).Check(self.settings.playback_mode == mode)
+        settings_menu.AppendSubMenu(playback_mode_menu, "播放结束后(&P)")
+        settings_menu.AppendSeparator()
         settings_menu.AppendCheckItem(self.settings_startup_sound_menu_id, "播放启动音效(&M)").Check(
             self.settings.startup_sound
         )
@@ -2344,6 +2441,8 @@ class MaoerFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_setting_changed, id=self.settings_subtitle_menu_id)
         self.Bind(wx.EVT_MENU, self.on_setting_changed, id=self.settings_danmaku_menu_id)
         self.Bind(wx.EVT_MENU, self.on_subtitle_filter_rules, id=self.settings_subtitle_filter_menu_id)
+        for item_id in self.playback_mode_menu_ids:
+            self.Bind(wx.EVT_MENU, self.on_playback_mode_changed, id=item_id)
         self.Bind(wx.EVT_MENU_OPEN, self._on_output_menu_open)
         self.Bind(wx.EVT_MENU, self.on_help_hotkeys, id=self.help_hotkeys_menu_id)
         self.Bind(wx.EVT_MENU, self.on_help_update_log, id=self.help_update_log_menu_id)
@@ -2573,6 +2672,44 @@ class MaoerFrame(wx.Frame):
                 self.player_frame.read_danmaku_enabled = enabled
         self.SetStatusText(f"{label}已{'开启' if enabled else '关闭'}，设置已保存")
 
+    def on_playback_mode_changed(self, event: wx.CommandEvent) -> None:
+        mode = self.playback_mode_menu_ids.get(event.GetId())
+        if mode is not None:
+            self._set_playback_mode(mode)
+
+    def _cycle_playback_mode(self) -> None:
+        modes = [mode for mode, _label in PLAYBACK_MODES]
+        self._set_playback_mode(modes[(modes.index(self.settings.playback_mode) + 1) % len(modes)])
+
+    def _set_playback_mode(self, mode: str) -> None:
+        if mode not in dict(PLAYBACK_MODES):
+            return
+        updated = replace(self.settings, playback_mode=mode)
+        try:
+            save_settings(updated)
+        except OSError as exc:
+            for item_id, value in self.playback_mode_menu_ids.items():
+                self.GetMenuBar().FindItemById(item_id).Check(value == self.settings.playback_mode)
+            self.show_error(f"保存播放模式失败：{exc}")
+            return
+        self.settings = updated
+        self._cancel_auto_play()
+        for item_id, value in self.playback_mode_menu_ids.items():
+            self.GetMenuBar().FindItemById(item_id).Check(value == mode)
+        label = dict(PLAYBACK_MODES)[mode]
+        if self.player_frame is not None:
+            self.player_frame._announce_status(label)
+        else:
+            self.SetStatusText(f"播放结束后：{label}，设置已保存")
+
+    def _cancel_auto_play(self) -> None:
+        self._auto_play_generation = getattr(self, "_auto_play_generation", 0) + 1
+        pending = getattr(self, "_auto_pending_request", None)
+        if pending is not None and self._play_request is pending:
+            self._play_request = None
+            self._pending_track_key = None
+        self._auto_pending_request = None
+
     def _refresh_output_devices(self) -> None:
         def done(result):
             if not self:
@@ -2674,6 +2811,7 @@ class MaoerFrame(wx.Frame):
             self.player_frame.subtitle_filter_slot = slot
             self.player_frame.subtitle_filter_rules = presets[slot].rules
             self.player_frame.book_filter_last_role = None
+            self.player_frame.last_spoken_os_segment = None
         self.SetStatusText(f"过滤方案{(slot + 1) % 10}已保存")
 
     def _on_filter_slot_changed(self, slot: int) -> bool:
@@ -3136,6 +3274,13 @@ class MaoerFrame(wx.Frame):
 
     def _display_item_title(self, item: MediaItem) -> str:
         title = item.title
+        if self.current_title in {"我的追剧", "广播剧 · 我的追剧"} and item.kind == "drama" and isinstance(item.raw, dict):
+            if "_followed_latest" in item.raw:
+                heard = item.raw.get("_followed_last_heard")
+                newest = item.raw.get("_followed_latest")
+                heard_text = f"上次收听到 {heard}" if heard else "暂无收听记录"
+                newest_text = f"更新至 {newest}" if newest else "暂无更新信息"
+                title = f"{title}；{heard_text}；{newest_text}"
         if self.current_title == "我的播放历史" and isinstance(item.raw, dict):
             date = item.raw.get("_history_date")
             if isinstance(date, str) and date:
@@ -3585,6 +3730,10 @@ class MaoerFrame(wx.Frame):
             previous_state = self._navigation_state_snapshot()
             if item.kind == "drama":
                 force_owned = isinstance(item.raw, dict) and bool(item.raw.get("_purchased_full_drama"))
+                if (self.current_title in {"我的追剧", "广播剧 · 我的追剧"}
+                        and isinstance(item.raw, dict) and "_followed_latest" in item.raw):
+                    self._open_followed_drama(item, previous_state, force_owned)
+                    return
                 self._run_background(
                     f"正在加载: {item.title}",
                     lambda: self.api.drama_episodes_page(item.id, 1, force_owned=force_owned),
@@ -3634,6 +3783,31 @@ class MaoerFrame(wx.Frame):
 
         self._play_sound_item(item)
 
+    def _open_followed_drama(self, item: MediaItem, previous_state: NavigationState, force_owned: bool) -> None:
+        request = self._followed_open_request = object()
+        source_items = self.items
+        cookie = self.api.cookie_header
+        hide_detail = self.hide_list_detail_column
+        last_sound_id = item.raw.get("_followed_last_sound_id")
+
+        def loaded(result):
+            if (self._followed_open_request is not request or self.items is not source_items
+                    or self.api.cookie_header != cookie):
+                return
+            items, page, index, has_more = result
+            self._enter_items(
+                items, item.title, previous_state, focus_list=True,
+                page_state=PageState(page, lambda number: self.api.drama_episodes_page(
+                    item.id, number, force_owned=force_owned), has_more=has_more),
+                hide_detail_column=hide_detail, opened_drama_id=item.id, selected_index=index,
+            )
+
+        self._run_background(
+            f"正在加载并定位上次收听：{item.title}",
+            lambda: self.api.followed_drama_episodes(item.id, last_sound_id, force_owned=force_owned),
+            loaded,
+        )
+
     def open_category(self, item: MediaItem) -> None:
         previous_state = self._navigation_state_snapshot()
         children = self.api.category_children(item)
@@ -3672,18 +3846,34 @@ class MaoerFrame(wx.Frame):
             lambda info: self._show_drama_purchase_prompt(info, play_after=play_after),
         )
 
-    def _prompt_sound_purchase(self, item: MediaItem) -> None:
+    def _prompt_sound_purchase(
+        self, item: MediaItem, *, on_play: Callable[[], None] | None = None,
+        is_current: Callable[[], bool] | None = None,
+        on_cancel: Callable[[], None] | None = None,
+    ) -> None:
         if item.kind != "sound":
             self.show_purchase_required(item.title)
             return
 
+        def loaded(info):
+            if is_current is None or is_current():
+                self._show_sound_purchase_prompt(item, info, on_play=on_play, on_cancel=on_cancel)
+
+        def failed(message):
+            if is_current is None or is_current():
+                self.show_error(message)
+
         self._run_background(
             "正在获取购买信息...",
             lambda: self.api.sound_purchase_info(item),
-            lambda info: self._show_sound_purchase_prompt(item, info),
+            loaded,
+            on_error=failed,
         )
 
-    def _show_sound_purchase_prompt(self, item: MediaItem, info: object) -> None:
+    def _show_sound_purchase_prompt(
+        self, item: MediaItem, info: object, *, on_play: Callable[[], None] | None = None,
+        on_cancel: Callable[[], None] | None = None,
+    ) -> None:
         if not isinstance(info, SoundPurchaseInfo):
             self.show_purchase_required(item.title)
             return
@@ -3702,25 +3892,30 @@ class MaoerFrame(wx.Frame):
             if info.drama.pay_type == DRAMA_PAY_TYPE_WHOLE:
                 self._mark_drama_purchased_in_items(info.drama.drama_id)
             self.SetStatusText("已购买，正在播放")
-            self._play_sound_item(item)
+            if on_play is not None:
+                on_play()
+            else:
+                self._play_sound_item(item)
             return
 
         if info.pay_type == DRAMA_PAY_TYPE_EPISODES:
             price = item.price if item.price is not None else info.drama.price
             if not self._confirm_episode_purchase(item, info.drama, price):
                 self.SetStatusText("已取消购买")
+                if on_cancel is not None:
+                    on_cancel()
                 return
 
             self._run_background(
                 f"正在购买单集: {item.title}",
                 lambda: self.api.buy_drama_episode(info.drama.drama_id, item.id),
-                lambda _payload: self._finish_episode_purchase(item, info.drama.drama_id),
+                lambda _payload: self._finish_episode_purchase(item, info.drama.drama_id, on_play=on_play),
                 on_error=self._show_purchase_failure,
             )
             return
 
         if info.pay_type == DRAMA_PAY_TYPE_WHOLE or info.drama.pay_type == DRAMA_PAY_TYPE_WHOLE:
-            self._show_drama_purchase_prompt(info.drama, play_after=item)
+            self._show_drama_purchase_prompt(info.drama, play_after=item, on_play=on_play, on_cancel=on_cancel)
             return
 
         if info.drama.pay_type != DRAMA_PAY_TYPE_EPISODES:
@@ -3730,12 +3925,14 @@ class MaoerFrame(wx.Frame):
         price = item.price if item.price is not None else info.drama.price
         if not self._confirm_episode_purchase(item, info.drama, price):
             self.SetStatusText("已取消购买")
+            if on_cancel is not None:
+                on_cancel()
             return
 
         self._run_background(
             f"正在购买单集: {item.title}",
             lambda: self.api.buy_drama_episode(info.drama.drama_id, item.id),
-            lambda _payload: self._finish_episode_purchase(item, info.drama.drama_id),
+            lambda _payload: self._finish_episode_purchase(item, info.drama.drama_id, on_play=on_play),
             on_error=self._show_purchase_failure,
         )
 
@@ -3743,23 +3940,27 @@ class MaoerFrame(wx.Frame):
         self,
         info: object,
         play_after: MediaItem | None = None,
+        on_play: Callable[[], None] | None = None,
+        on_cancel: Callable[[], None] | None = None,
     ) -> None:
         if not isinstance(info, DramaPurchaseInfo):
             self.show_purchase_required(play_after.title if play_after else "广播剧")
             return
 
         if not info.need_pay:
-            self._finish_drama_purchase(info.drama_id, play_after=play_after, already_owned=True)
+            self._finish_drama_purchase(info.drama_id, play_after=play_after, already_owned=True, on_play=on_play)
             return
 
         if not self._confirm_drama_purchase(info):
             self.SetStatusText("已取消购买")
+            if on_cancel is not None:
+                on_cancel()
             return
 
         self._run_background(
             f"正在购买广播剧: {info.title}",
             lambda: self.api.buy_drama(info.drama_id),
-            lambda _payload: self._finish_drama_purchase(info.drama_id, play_after=play_after),
+            lambda _payload: self._finish_drama_purchase(info.drama_id, play_after=play_after, on_play=on_play),
             on_error=self._show_purchase_failure,
         )
 
@@ -3786,7 +3987,7 @@ class MaoerFrame(wx.Frame):
 
     def _confirm_purchase(self, message: str, title: str) -> bool:
         dialog = wx.MessageDialog(
-            self,
+            self.player_frame if getattr(self, "player_frame", None) is not None else self,
             message,
             title,
             wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION,
@@ -3804,22 +4005,31 @@ class MaoerFrame(wx.Frame):
         drama_id: int,
         play_after: MediaItem | None = None,
         already_owned: bool = False,
+        on_play: Callable[[], None] | None = None,
     ) -> None:
         self._mark_drama_purchased_in_items(drama_id)
         message = "本剧已购买" if already_owned else "购买成功，已解锁本剧"
         wx.MessageBox(message, "购买成功", wx.OK | wx.ICON_INFORMATION, self)
         if play_after is not None:
             play_after.need_pay = False
-            self._play_sound_item(play_after)
+            if on_play is not None:
+                on_play()
+            else:
+                self._play_sound_item(play_after)
             return
         self.SetStatusText(message)
 
-    def _finish_episode_purchase(self, item: MediaItem, drama_id: int) -> None:
+    def _finish_episode_purchase(
+        self, item: MediaItem, drama_id: int, *, on_play: Callable[[], None] | None = None,
+    ) -> None:
         item.need_pay = False
         self._mark_sound_purchased_in_items(item.id)
         wx.MessageBox("购买成功，正在播放。", "购买成功", wx.OK | wx.ICON_INFORMATION, self)
         self.SetStatusText("购买成功，正在播放")
-        self._play_sound_item(item)
+        if on_play is not None:
+            on_play()
+        else:
+            self._play_sound_item(item)
 
     def _show_purchase_failure(self, message: str) -> None:
         self.SetStatusText("购买失败")
@@ -3920,6 +4130,7 @@ class MaoerFrame(wx.Frame):
         page_state: PageState | None = None,
         hide_detail_column: bool = False,
         opened_drama_id: int | None = None,
+        selected_index: int = 0,
     ) -> None:
         self.navigation_stack.append(previous_state)
         self.page_state = page_state
@@ -3929,6 +4140,7 @@ class MaoerFrame(wx.Frame):
             focus_list=focus_list,
             hide_detail_column=hide_detail_column,
             opened_drama_id=opened_drama_id,
+            selected_index=selected_index,
         )
 
     def set_items(
@@ -4138,7 +4350,7 @@ class MaoerFrame(wx.Frame):
         playback: PlaybackInfo,
         source_key: tuple[str, int] | None = None,
         source_title: str = "",
-    ) -> None:
+    ) -> bool:
         created = False
         if self.player_frame is None:
             self.player_frame = PlaybackFrame(
@@ -4154,6 +4366,11 @@ class MaoerFrame(wx.Frame):
                 on_filter_slot_changed=self._on_filter_slot_changed,
                 on_filter_rules=self._edit_subtitle_filter_rules,
                 on_cycle_output=self._cycle_output_device,
+                on_change_track=self._change_playback_track,
+                on_cycle_playback_mode=self._cycle_playback_mode,
+                on_restart_finished=self._restart_finished_playback,
+                get_playback_mode=lambda: self.settings.playback_mode,
+                on_set_playback_mode=self._set_playback_mode,
             )
             created = True
 
@@ -4166,7 +4383,7 @@ class MaoerFrame(wx.Frame):
                 self.player_frame.Destroy()
                 self.player_frame = None
             self.show_error(str(exc))
-            return
+            return False
 
         self.current_playback_key = source_key or ("sound", playback.sound_id)
         self._audio_poll_generation += 1
@@ -4180,8 +4397,13 @@ class MaoerFrame(wx.Frame):
             prefix = f"{prefix}({source_title})"
         self.SetStatusText(f"{prefix}: {playback.title}")
         threading.Thread(target=self.api.add_play_times, args=(playback,), daemon=True).start()
+        return True
 
     def _on_player_window_close(self, frame: PlaybackFrame) -> None:
+        self._cancel_auto_play()
+        self._play_request = None
+        self._pending_track_key = None
+        self._playback_context = None
         if self.player_frame is frame:
             self.player_frame = None
         if self.active_player is self.browser_player:
@@ -4189,38 +4411,82 @@ class MaoerFrame(wx.Frame):
         self.current_playback_key = None
         self.SetStatusText("已停止播放")
 
+    def _restart_finished_playback(self, frame: PlaybackFrame, playback: PlaybackInfo) -> None:
+        if (frame is not self.player_frame or not frame.finish_notified
+                or frame.playback is not playback or self._pending_track_key is not None
+                or self.current_playback_key != ("sound", playback.sound_id)):
+            return
+        # Reopen the same episode to reset the browser's end guard and the
+        # subtitle timeline. Re-resolve access/URLs instead of resuming ended media.
+        context = self._playback_context
+        key = ("sound", playback.sound_id)
+        item = next((item for item in context[0] if self._item_key(item) == key), None) if context else None
+        if item is None:
+            item = MediaItem("sound", playback.sound_id, playback.title, drama_id=playback.drama_id)
+        if context is None:
+            context = ([item], None, playback.title)
+        self._play_sound_item(item, status_prefix="正在重新播放", playback_context=context)
+
     def _on_playback_finished(self, frame: PlaybackFrame, playback: PlaybackInfo) -> None:
         if frame is not self.player_frame:
+            return
+        if self._pending_track_key is not None:
             return
         playback_key = ("sound", playback.sound_id)
         if self.current_playback_key not in (None, playback_key):
             return
         self.current_playback_key = playback_key
-        self._play_next_from_current_list(playback_key)
-
-    def _play_next_from_current_list(self, current_key: tuple[str, int]) -> None:
-        if self.current_playback_key != current_key:
-            return
-        if self._index_for_item_key(current_key) is None:
+        self._cancel_auto_play()
+        generation = self._auto_play_generation
+        mode = self.settings.playback_mode
+        if mode == "stop":
             self.SetStatusText("播放结束")
             return
-        next_index = self._next_playable_index(current_key)
+        if mode == "single_loop":
+            context = self._playback_context
+            item = next((item for item in context[0] if self._item_key(item) == playback_key), None) if context else None
+            if item is None:
+                item = MediaItem("sound", playback.sound_id, playback.title, drama_id=playback.drama_id)
+            self._play_sound_item(item, status_prefix="正在单曲循环", auto_current_key=playback_key,
+                                  playback_context=context, auto_generation=generation)
+        else:
+            self._play_next_from_current_list(playback_key, generation)
+
+    def _play_next_from_current_list(self, current_key: tuple[str, int], generation: int | None = None) -> None:
+        if generation is None:
+            generation = self._auto_play_generation
+        if (self.current_playback_key != current_key or generation != self._auto_play_generation
+                or self.settings.playback_mode != "sequential" or self.player_frame is None):
+            return
+        context = self._playback_context
+        if context is None:
+            self.SetStatusText("播放结束")
+            return
+        items, _state, _title = context
+        index = next((i for i, item in enumerate(items) if self._item_key(item) == current_key), None)
+        if index is None:
+            self.SetStatusText("播放结束")
+            return
+        next_index = next((i for i in range(index + 1, len(items))
+                           if self._is_auto_playable_item(items[i])), None)
         if next_index is None:
-            self._load_next_page_for_auto_play(current_key)
+            self._load_next_page_for_auto_play(current_key, generation)
             return
 
-        next_item = self.items[next_index]
-        self._select_list_row(next_index)
-        self._play_sound_item(next_item, status_prefix="正在自动播放", auto_current_key=current_key)
+        self._play_sound_item(items[next_index], status_prefix="正在自动播放", auto_current_key=current_key,
+                              playback_context=context, auto_generation=generation, announce_track=True)
 
-    def _load_next_page_for_auto_play(self, current_key: tuple[str, int]) -> None:
-        state = self.page_state
+    def _load_next_page_for_auto_play(self, current_key: tuple[str, int], generation: int) -> None:
+        context = self._playback_context
+        if context is None or generation != self._auto_play_generation:
+            return
+        original_items, state, title = context
         if state is None or not state.has_more:
             self.SetStatusText("已播放到最后一个音频")
             return
         if state.loading:
             self.SetStatusText("正在等待下一页加载")
-            wx.CallLater(1200, self._play_next_from_current_list, current_key)
+            wx.CallLater(1200, self._play_next_from_current_list, current_key, generation)
             return
 
         state.loading = True
@@ -4233,56 +4499,217 @@ class MaoerFrame(wx.Frame):
                 state.loading = False
 
         def done(items: object) -> None:
-            if self.page_state is state:
+            if self.page_state is state and self.items is original_items:
                 self._append_next_page(state, next_page, items if isinstance(items, list) else [])
-            if self.current_playback_key == current_key:
-                self._play_next_from_current_list(current_key)
+            else:
+                existing = {self._item_key(item) for item in original_items}
+                added = [item for item in items if self._item_key(item) not in existing] if isinstance(items, list) else []
+                original_items.extend(added)
+                state.page = next_page
+                state.has_more = bool(added)
+            self._play_next_from_current_list(current_key, generation)
 
         self._run_background(
-            f"正在加载下一页: {self.current_title}",
+            f"正在加载下一页: {title}",
             work,
             done,
         )
+
+    def _change_playback_track(self, frame: PlaybackFrame, direction: int) -> None:
+        if frame is not self.player_frame or self._playback_context is None:
+            return
+        self._cancel_auto_play()
+        items, state, title = self._playback_context
+        key = self._pending_track_key or self.current_playback_key
+        index = next((i for i, item in enumerate(items) if self._item_key(item) == key), None)
+        if index is None:
+            frame._announce_status("当前音频不在播放列表中")
+            return
+        step = -1 if direction < 0 else 1
+        for target in range(index + step, len(items) if step > 0 else -1, step):
+            item = items[target]
+            if item.kind == "sound" and not item.is_collection:
+                # Use the ordinary access check, including a purchase prompt for
+                # unpaid episodes, rather than silently skipping requested tracks.
+                self._play_sound_item(item, status_prefix="正在切换音频",
+                                      playback_context=self._playback_context, announce_track=True)
+                return
+        if step < 0 or state is None or not state.has_more:
+            if self._pending_track_key == self.current_playback_key:
+                self._pending_track_key = None
+            frame._announce_status("已经是第一曲" if step < 0 else "已经是最后一曲")
+            return
+        request = object()
+        self._play_request = request
+        self._pending_track_key = key
+        self._load_page_for_track_step(frame, request, self._playback_context, 30)
+
+    def _load_page_for_track_step(self, frame, request, context, attempts) -> None:
+        if self._play_request is not request or self.player_frame is not frame:
+            return
+        items, state, title = context
+        if state.loading:
+            if attempts:
+                wx.CallLater(300, self._load_page_for_track_step, frame, request, context, attempts - 1)
+            else:
+                self._pending_track_key = None
+                frame._announce_status("列表仍在加载，请稍后再试")
+            return
+        # A main-window page request may have finished while we were waiting.
+        key = self._pending_track_key or self.current_playback_key
+        index = next((i for i, item in enumerate(items) if self._item_key(item) == key), -1)
+        if any(item.kind == "sound" and not item.is_collection for item in items[index + 1:]) or not state.has_more:
+            self._change_playback_track(frame, 1)
+            return
+        state.loading = True
+        page = state.page + 1
+
+        def failed(message):
+            state.loading = False
+            if self._play_request is request and self.player_frame is frame:
+                self._pending_track_key = None
+                frame._announce_status(f"切换失败：{message}")
+
+        def loaded(result):
+            state.loading = False
+            new_items = result if isinstance(result, list) else []
+            if self.items is items and self.page_state is state:
+                self._append_next_page(state, page, new_items)
+            else:
+                existing = {self._item_key(item) for item in items}
+                added = [item for item in new_items if self._item_key(item) not in existing]
+                items.extend(added)
+                state.page = page
+                state.has_more = bool(added)
+            if self._play_request is request and self.player_frame is frame:
+                self._change_playback_track(frame, 1)
+
+        self._run_background(f"正在加载播放列表下一页：{title}", lambda: state.loader(page), loaded, on_error=failed)
 
     def _play_sound_item(
         self,
         item: MediaItem,
         status_prefix: str = "正在获取播放地址",
         auto_current_key: tuple[str, int] | None = None,
+        playback_context: tuple[list[MediaItem], PageState | None, str] | None = None,
+        announce_track: bool = False,
+        auto_generation: int | None = None,
     ) -> None:
         if item.kind != "sound":
-            if auto_current_key is not None:
-                wx.CallAfter(self._play_next_from_current_list, auto_current_key)
             return
+        if auto_current_key is None:
+            self._cancel_auto_play()
+        elif auto_generation is None:
+            auto_generation = self._auto_play_generation
         source_key = self._item_key(item)
-        source_title = self.current_title
+        context = playback_context or (getattr(self, "items", [item]), getattr(self, "page_state", None), self.current_title)
+        source_title = context[2]
+        request = object()
+        self._play_request = request
+        self._pending_track_key = source_key
+        if auto_current_key is not None:
+            self._auto_pending_request = request
+
+        def current_request():
+            return (self._play_request is request and
+                    (auto_current_key is None or auto_generation == self._auto_play_generation))
+
+        def loaded(playback):
+            if not current_request():
+                return
+            self._pending_track_key = None
+            self._auto_pending_request = None
+            if self.items is context[0] or self.current_title == source_title:
+                index = self._index_for_item_key(source_key)
+                if index is not None:
+                    self._select_list_row(index)
+            started = self._play(playback, source_key=source_key, source_title=source_title)
+            if started:
+                self._playback_context = context
+            if started and announce_track and self.player_frame is not None:
+                self.player_frame._announce_status(playback.title)
+
+        def purchase_required(_exc):
+            if not current_request():
+                return
+            # A denial is terminal for both manual and automatic switching.
+            # Consume before opening a modal dialog to reject duplicate/late results.
+            self._pending_track_key = None
+            prompt_request = object()
+            self._play_request = prompt_request
+            self._auto_pending_request = prompt_request if auto_current_key is not None else None
+            cookie = self.api.cookie_header
+
+            def prompt_is_current():
+                return (self._play_request is prompt_request and self.api.cookie_header == cookie
+                        and (auto_current_key is None or auto_generation == self._auto_play_generation))
+
+            def play_after_purchase():
+                if prompt_is_current():
+                    self._play_sound_item(item, playback_context=context, announce_track=announce_track)
+
+            def cancelled():
+                if prompt_is_current():
+                    self._return_to_playback_list(context, source_key)
+
+            if self.items is context[0]:
+                index = self._index_for_item_key(source_key)
+                if index is not None:
+                    self._select_list_row(index)
+            self._on_playback_purchase_required(item, on_play=play_after_purchase, is_current=prompt_is_current,
+                                                on_cancel=cancelled)
+
+        def failed(message):
+            if current_request():
+                self._pending_track_key = None
+                self.show_error(message)
+
         self._run_background(
             f"{status_prefix}: {item.title}",
             lambda: self.api.playback_info(item),
-            lambda playback: self._play(playback, source_key=source_key, source_title=source_title),
-            on_purchase_required=(
-                (lambda _exc: self._skip_auto_purchase_required(auto_current_key, item))
-                if auto_current_key is not None
-                else (lambda _exc: self._on_manual_purchase_required(item))
-            ),
+            loaded,
+            on_purchase_required=purchase_required,
+            on_error=failed,
         )
 
-    def _on_manual_purchase_required(self, item: MediaItem) -> None:
+    def _on_playback_purchase_required(
+        self, item: MediaItem, *, on_play: Callable[[], None] | None = None,
+        is_current: Callable[[], bool] | None = None,
+        on_cancel: Callable[[], None] | None = None,
+    ) -> None:
         item.need_pay = True
+        if isinstance(item.raw, dict):
+            item.raw.pop("_member_vip_limited_free", None)
         index = self._index_for_item_key(self._item_key(item))
         if index is not None:
             self.list.SetItem(index, 0, self._display_item_title(item))
-        self._prompt_sound_purchase(item)
+        self._prompt_sound_purchase(item, on_play=on_play, is_current=is_current, on_cancel=on_cancel)
 
-    def _skip_auto_purchase_required(self, current_key: tuple[str, int], item: MediaItem) -> None:
-        if self.current_playback_key != current_key:
-            return
-        item.need_pay = True
-        index = self._index_for_item_key(self._item_key(item))
-        if index is not None:
-            self.list.SetItem(index, 0, self._display_item_title(item))
-        self.SetStatusText(f"跳过需要购买的音频: {item.title}")
-        wx.CallAfter(self._play_next_from_current_list, current_key)
+    def _return_to_playback_list(
+        self, context: tuple[list[MediaItem], PageState | None, str], key: tuple[str, int],
+    ) -> None:
+        self._cancel_auto_play()
+        self._play_request = None
+        self._pending_track_key = None
+        if self.player_frame is not None:
+            self.player_frame.Close()
+        items, state, title = context
+        index = next((i for i, item in enumerate(items) if self._item_key(item) == key), 0)
+        if self.items is items:
+            if items:
+                self._select_list_row(index)
+        else:
+            # Return to the originating list even if the main window has browsed
+            # elsewhere. Preserve that navigation as the Back destination.
+            previous = self._navigation_state_snapshot()
+            drama_id = items[index].drama_id if items else None
+            if any(item.kind != "sound" or item.drama_id != drama_id for item in items):
+                drama_id = None
+            self._enter_items(items, title, previous, selected_index=index, page_state=state,
+                              focus_list=False, opened_drama_id=drama_id)
+        self.Show()
+        self.Raise()
+        wx.CallAfter(self._focus_list)
 
     def _next_playable_index(self, current_key: tuple[str, int]) -> int | None:
         current_index = self._index_for_item_key(current_key)
@@ -4295,7 +4722,9 @@ class MaoerFrame(wx.Frame):
 
     @staticmethod
     def _is_auto_playable_item(item: MediaItem) -> bool:
-        return item.kind == "sound" and not item.is_collection and not item.need_pay
+        # need_pay is a catalogue hint, not current account access: member-free
+        # and newly purchased episodes must reach playback_info just like manual next.
+        return item.kind == "sound" and not item.is_collection
 
     def _index_for_item_key(self, key: tuple[str, int]) -> int | None:
         for index, item in enumerate(self.items):

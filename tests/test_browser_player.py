@@ -198,6 +198,131 @@ class SeekResumeTests(unittest.TestCase):
         self.assertEqual(self.pending, [])
 
 
+class LongPauseRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.player = HiddenBrowserPlayer(None)
+        self.player._current = PlaybackInfo(123, "sound", "", page_url="https://www.missevan.com/sound/player?id=123")
+        self.player._webview = Mock()
+        self.player._paused = True
+        self.player._last_position = 123.5
+        self.player._run_control = Mock()
+        self.player._install_user_scripts = Mock()
+        self.pending = []
+        self.player._run_control_callback = Mock(side_effect=lambda action, value, callback: self.pending.append((action, value, callback)))
+
+    def respond(self, expected, **result):
+        action, value, callback = self.pending.pop(0)
+        self.assertEqual(action, expected)
+        callback(result)
+
+    def test_normal_resume_does_not_reload_the_page(self):
+        self.player.toggle_pause()
+        self.respond("status", ok=True, paused=True, position=123.5)
+        self.respond("resume", ok=True)
+        self.respond("status", ok=True, paused=False, position=124, ended=False)
+        self.assertFalse(self.player.is_paused())
+        self.assertIsNone(self.player._resume_request)
+        self.player._webview.LoadURL.assert_not_called()
+
+    def test_idle_backend_reset_to_zero_does_not_erase_saved_pause_position(self):
+        self.player.status(Mock())
+        self.respond("status", ok=True, paused=True, position=0)
+        self.assertEqual(self.player._last_position, 123.5)
+        self.player.toggle_pause()
+        self.respond("status", ok=True, paused=True, position=0)
+        self.assertEqual(self.player._resume_request.position, 123.5)
+
+    def test_explicit_seek_to_zero_updates_saved_position(self):
+        self.player.seek_to(0, Mock())
+        self.respond("seek_to", ok=True, position=0)
+        self.assertEqual(self.player._last_position, 0)
+
+    def test_late_resume_callbacks_cannot_override_pause_stop_or_seek(self):
+        for operation in (self.player.toggle_pause, self.player.stop, lambda: self.player.seek(5)):
+            with self.subTest(operation=operation):
+                self.player._current = PlaybackInfo(123, "sound", "")
+                self.player._paused = True
+                self.player.toggle_pause()
+                operation()
+                self.respond("status", ok=True, paused=True, position=123.5)
+                self.assertEqual(self.pending, [])
+                self.assertIsNone(self.player._resume_request)
+
+    def test_accepting_play_without_progress_does_not_count_as_recovered(self):
+        self.player.toggle_pause()
+        self.respond("status", ok=True, paused=True, position=123.5)
+        self.respond("resume", ok=True)
+        with patch("browser_player.wx.CallLater", side_effect=lambda delay, fn, *args: fn(*args)), \
+                patch.object(self.player, "_reload_for_resume") as reload:
+            while self.pending:
+                self.respond("status", ok=True, paused=False, position=123.5)
+        reload.assert_called_once()
+
+    def test_recovery_is_bounded_if_network_or_player_remains_unavailable(self):
+        scheduled = []
+        self.player._run_control_callback = Mock(side_effect=lambda action, value, callback: callback(None))
+        with patch("browser_player.wx.CallLater", side_effect=lambda delay, fn, *args: scheduled.append((fn, args))):
+            self.player.toggle_pause()
+            for _ in range(100):
+                if not scheduled:
+                    break
+                fn, args = scheduled.pop(0)
+                fn(*args)
+        self.assertEqual(scheduled, [])
+        self.assertTrue(self.player.is_paused())
+        self.assertIsNone(self.player._resume_request)
+        self.player._webview.LoadURL.assert_called_once()
+
+    def test_reloading_does_not_reset_subtitle_position_or_mark_episode_finished(self):
+        self.player.toggle_pause()
+        self.player.status(lambda status: self.assertEqual(
+            (status["position"], status["paused"], status["ended"]), (123.5, True, False)))
+        _action, _value, callback = self.pending.pop()
+        callback({"ok": False, "position": 0, "ended": True})
+
+    def test_space_recovers_an_idle_player_that_accepts_play_but_does_not_advance(self):
+        player = HiddenBrowserPlayer(None)
+        player._current = PlaybackInfo(123, "sound", "", page_url="https://www.missevan.com/sound/player?id=123")
+        player._paused = True
+        player._playback_rate = 1.25
+        player._webview = Mock()
+        engine = {"stale": True, "paused": True, "position": 123.5, "rate": 1.25}
+        scheduled = []
+
+        def control(action, value=None):
+            if action in ("resume", "autoplay", "pause"):
+                if not engine["stale"]:
+                    engine["paused"] = False
+            elif action == "seek_to":
+                engine["position"] = value
+            elif action == "rate":
+                engine["rate"] = value
+            elif action == "status" and not engine["paused"]:
+                engine["position"] += 0.5
+            return {"ok": True, "paused": engine["paused"], "position": engine["position"],
+                    "rate": engine["rate"], "duration": 1800, "ended": False}
+
+        def reload(_url):
+            engine.update(stale=False, paused=True, position=0, rate=1)
+            player._on_loaded(Mock())
+
+        player._webview.LoadURL.side_effect = reload
+        player._run_control = Mock(side_effect=control)
+        player._run_control_callback = Mock(side_effect=lambda action, value, callback: callback(control(action, value)))
+        with patch("browser_player.wx.CallLater", side_effect=lambda delay, fn, *args: scheduled.append((fn, args))), \
+                patch.object(player, "_install_user_scripts"), patch.object(player, "_apply_volume"):
+            player.toggle_pause()
+            for _ in range(100):
+                if not scheduled:
+                    break
+                fn, args = scheduled.pop(0)
+                fn(*args)
+        self.assertFalse(engine["paused"], "Space must recover playback after the idle backend stops responding")
+        self.assertGreaterEqual(engine["position"], 123.5)
+        self.assertEqual(engine["rate"], 1.25)
+        player._webview.LoadURL.assert_called_once()
+
+
 class AutoplaySchedulingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.player = HiddenBrowserPlayer(None)

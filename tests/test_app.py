@@ -7,10 +7,10 @@ from unittest.mock import Mock, patch
 
 import wx
 
-from app import JumpTimeDialog, SubtitleJumpDialog, MaoerFrame, MediaDetailDialog, NavigationState, PlaybackFrame, SubtitleFilterRulesDialog, is_character_dialogue_subtitle, mark_dialogue_continuations
+from app import JumpTimeDialog, SubtitleJumpDialog, MaoerFrame, MediaDetailDialog, NavigationState, PageState, PlaybackFrame, SubtitleFilterRulesDialog, is_character_dialogue_subtitle, mark_dialogue_continuations
 from app_settings import AppSettings, SubtitleFilterPreset, SubtitleFilterRules, default_filter_presets, load_settings
 from audio_output import OutputDevice, SYSTEM_OUTPUT
-from maoer_api import DANMAKU_MODE_SUBTITLE, DanmakuItem, DramaFollowResult, DramaPurchaseInfo, MaoerApi, MediaItem, PlaybackInfo, PublisherProfile
+from maoer_api import DANMAKU_MODE_SUBTITLE, DanmakuItem, DramaFollowResult, DramaPurchaseInfo, MaoerApi, MediaItem, PlaybackInfo, PublisherProfile, PurchaseRequired, SoundPurchaseInfo
 
 
 class PlaybackAnnouncementTests(unittest.TestCase):
@@ -159,6 +159,85 @@ class PlaybackAnnouncementTests(unittest.TestCase):
 
 
 class PlaybackMenuTests(unittest.TestCase):
+    def test_q_uses_persistent_mode_callback_without_subtitle_speech(self):
+        self.frame.on_cycle_playback_mode = Mock()
+        event = Mock()
+        event.GetKeyCode.return_value = ord("Q")
+        event.ControlDown.return_value = event.AltDown.return_value = event.ShiftDown.return_value = False
+        with patch.object(wx.Window, "FindFocus", return_value=self.frame.danmaku_canvas):
+            self.frame.on_char_hook(event)
+        self.frame.on_cycle_playback_mode.assert_called_once_with()
+        self.frame.screen_reader.announce.assert_not_called()
+        event.Skip.assert_not_called()
+
+    def test_subtitle_and_filter_state_survive_tracks_and_single_track_repeat(self):
+        with patch.object(self.frame, "_load_danmaku"), patch("app.wx.CallLater"), patch("app.wx.CallAfter"):
+            self.frame.play(PlaybackInfo(1, "第一集", ""))
+            for read, filtered in ((False, False), (True, False), (True, True)):
+                with self.subTest(read=read, filtered=filtered):
+                    self.frame.read_subtitle_enabled = read
+                    self.frame.subtitle_filter_enabled = filtered
+                    for sound_id in (2, 2, 1):
+                        self.frame.book_filter_last_role = "上次角色"
+                        self.frame.subtitle_os_items = {7}
+                        self.frame.play(PlaybackInfo(sound_id, "下一集或重播", ""))
+                        self.assertEqual((self.frame.read_subtitle_enabled, self.frame.subtitle_filter_enabled), (read, filtered))
+                        self.assertIsNone(self.frame.book_filter_last_role)
+                        self.assertEqual(self.frame.subtitle_os_items, set())
+
+    def test_new_playback_window_uses_subtitle_default_and_filter_off(self):
+        for enabled in (True, False):
+            with patch("app.ScreenReaderAnnouncer", return_value=Mock()):
+                fresh = PlaybackFrame(None, Mock(), self.player, Mock(), Mock(), read_subtitle_default=enabled)
+            try:
+                self.assertEqual(fresh.read_subtitle_enabled, enabled)
+                self.assertFalse(fresh.subtitle_filter_enabled)
+            finally:
+                fresh.Destroy()
+
+    def test_page_keys_request_previous_and_next_only_from_playback_window(self):
+        self.frame.playback = PlaybackInfo(123, "current", "")
+        self.frame.on_change_track = Mock()
+        for key, direction in ((wx.WXK_PAGEUP, -1), (wx.WXK_PAGEDOWN, 1)):
+            event = Mock()
+            event.GetKeyCode.return_value = key
+            event.ControlDown.return_value = event.AltDown.return_value = event.ShiftDown.return_value = False
+            with patch.object(wx.Window, "FindFocus", return_value=self.frame.danmaku_canvas):
+                self.frame.on_char_hook(event)
+            self.frame.on_change_track.assert_called_with(self.frame, direction)
+            event.Skip.assert_not_called()
+        self.frame.on_change_track.reset_mock()
+        dialog = wx.Dialog(self.frame)
+        self.addCleanup(dialog.Destroy)
+        with patch.object(wx.Window, "FindFocus", return_value=dialog):
+            self.frame.on_char_hook(event)
+        self.frame.on_change_track.assert_not_called()
+        event.Skip.assert_called_once()
+
+    def test_track_change_replaces_subtitle_jump_list_danmaku_and_context(self):
+        old = PlaybackInfo(123, "old", "", subtitle_url="https://static.example/old.json")
+        new = PlaybackInfo(456, "new", "", subtitle_url="https://static.example/new.json")
+        with patch.object(self.frame, "_load_danmaku") as load, patch("app.wx.CallLater"), patch("app.wx.CallAfter"):
+            self.frame.play(old)
+            old_generation = self.frame.load_generation
+            old_items = [DanmakuItem(1, "旧字幕", 4), DanmakuItem(2, "旧弹幕", 1)]
+            self.frame._set_danmaku_items(old_generation, old_items)
+            self.frame.book_filter_last_role = "旧角色"
+            self.frame.play(new)
+            generation = self.frame.load_generation
+            load.assert_called_with(456, new.subtitle_url, generation)
+            self.assertEqual(self.frame.danmaku_canvas.items, [])
+            self.assertEqual(self.frame.danmaku_canvas.position, 0)
+            self.assertIsNone(self.frame.book_filter_last_role)
+            self.frame._set_danmaku_items(old_generation, old_items)
+            self.assertEqual(self.frame.danmaku_canvas.items, [])
+            new_items = [DanmakuItem(3, "新字幕", 4), DanmakuItem(4, "新弹幕", 1)]
+            self.frame._set_danmaku_items(generation, new_items)
+            self.assertEqual([item.text for item in self.frame.danmaku_canvas.items], ["新字幕", "新弹幕"])
+            dialog = SubtitleJumpDialog(self.frame, self.frame.danmaku_canvas.items, 0)
+            self.addCleanup(dialog.Destroy)
+            self.assertEqual([item.text for item in dialog.items], ["新字幕"])
+
     def test_d_key_toggle_uses_native_notifications_while_content_uses_direct_speech(self):
         self.frame.read_danmaku_enabled = False
         event = Mock()
@@ -327,6 +406,19 @@ class PlaybackMenuTests(unittest.TestCase):
         self.assertEqual([call.args for call in self.player.seek.call_args_list], [(-5,), (5,)])
         self.assertEqual([call.args for call in seek.call_args_list], [(-5,), (5,)])
 
+    def test_space_after_finished_requests_replay_without_pause_or_speech(self):
+        self.frame.playback = PlaybackInfo(1, '第一集', 'fixture')
+        self.frame.finish_notified = True
+        self.frame.on_restart_finished = Mock()
+        event = Mock()
+        event.GetKeyCode.return_value = wx.WXK_SPACE
+        self.frame.on_char_hook(event)
+        self.frame.on_restart_finished.assert_called_once_with(self.frame, self.frame.playback)
+        self.player.toggle_pause.assert_not_called()
+        self.frame.status_reader.announce.assert_not_called()
+        self.frame.screen_reader.announce.assert_not_called()
+        event.Skip.assert_not_called()
+
     def test_native_failure_never_uses_subtitle_channel_and_subtitles_still_read(self):
         self.frame.status_reader.announce.return_value = False
         self.frame._announce_time(1, 60)
@@ -385,20 +477,26 @@ class PlaybackMenuTests(unittest.TestCase):
             items = menu.GetMenuItems()
             self.assertEqual(
                 [item.GetItemLabelText() for item in items if not item.IsSeparator()],
-                ["快退 5 秒", "快进 5 秒", "跳转时间…", "播放倍速", "朗读字幕", "过滤模式（实验性功能）", "过滤方案", "朗读弹幕"],
+                ["上一集", "下一集", "快退 5 秒", "快进 5 秒", "跳转时间…", "播放倍速", "播放结束后",
+                 "朗读字幕", "过滤模式（实验性功能）", "过滤方案", "朗读弹幕"],
             )
-            self.assertEqual(items[5].IsChecked(), self.frame.read_subtitle_enabled)
-            self.assertEqual(items[6].IsChecked(), self.frame.subtitle_filter_enabled)
-            self.assertEqual(items[8].IsChecked(), self.frame.read_danmaku_enabled)
-            speed_menu = items[3].GetSubMenu()
-            presets_menu = items[7].GetSubMenu()
+            named = {item.GetItemLabelText(): item for item in items if not item.IsSeparator()}
+            self.assertEqual(named['朗读字幕'].IsChecked(), self.frame.read_subtitle_enabled)
+            self.assertEqual(named['过滤模式（实验性功能）'].IsChecked(), self.frame.subtitle_filter_enabled)
+            self.assertEqual(named['朗读弹幕'].IsChecked(), self.frame.read_danmaku_enabled)
+            speed_menu = named['播放倍速'].GetSubMenu()
+            presets_menu = named['过滤方案'].GetSubMenu()
+            mode_menu = named['播放结束后'].GetSubMenu()
             self.assertEqual(
                 [item.GetItemLabelText() for item in speed_menu.GetMenuItems()],
                 ["0.5 倍", "1 倍", "1.25 倍", "1.5 倍", "1.75 倍", "2 倍"],
             )
             self.assertEqual(len(presets_menu.GetMenuItems()), len(self.frame.subtitle_filter_presets))
             self.assertTrue(presets_menu.GetMenuItems()[self.frame.subtitle_filter_slot].IsChecked())
-            for item in list(items) + list(speed_menu.GetMenuItems()) + list(presets_menu.GetMenuItems()):
+            all_items = list(items) + list(speed_menu.GetMenuItems()) + list(presets_menu.GetMenuItems()) + list(mode_menu.GetMenuItems())
+            action_ids = [item.GetId() for item in all_items if not item.IsSeparator()]
+            self.assertEqual(len(action_ids), len(set(action_ids)))
+            for item in all_items:
                 if item.GetItemLabelText() == label:
                     return item.GetId()
             return wx.ID_NONE
@@ -717,20 +815,22 @@ class PlaybackMenuTests(unittest.TestCase):
         self.press_f(control=True, control_code=True)
         self.assertTrue(self.frame.subtitle_filter_enabled)
 
-    def test_f_disables_filter_and_ctrl_f_starts_filter_mode_while_reading_is_off(self):
+    def test_ctrl_f_is_inert_while_subtitle_reading_is_off(self):
         self.press_f(control=True)
         self.press_f()
         self.assertFalse(self.frame.read_subtitle_enabled)
         self.assertFalse(self.frame.subtitle_filter_enabled)
         self.frame.status_reader.reset_mock()
         self.press_f(control=True)
-        self.assertTrue(self.frame.read_subtitle_enabled)
-        self.assertTrue(self.frame.subtitle_filter_enabled)
-        self.frame.status_reader.announce.assert_called_once_with("字幕过滤模式已开启")
-
-        self.press_f()
         self.assertFalse(self.frame.read_subtitle_enabled)
         self.assertFalse(self.frame.subtitle_filter_enabled)
+        self.frame.status_reader.announce.assert_not_called()
+
+        self.press_f()
+        self.assertTrue(self.frame.read_subtitle_enabled)
+        self.assertFalse(self.frame.subtitle_filter_enabled)
+        self.press_f(control=True)
+        self.assertTrue(self.frame.subtitle_filter_enabled)
 
     def test_filter_menu_switches_mode_and_keeps_full_reading_available(self):
         self.choose("过滤模式（实验性功能）")
@@ -998,6 +1098,24 @@ class PlaybackMenuTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in self.frame.screen_reader.announce.call_args_list],
                          ["旁白", *captions[1:]])
 
+    def test_contiguous_os_markers_are_announced_once_in_both_filter_presets(self):
+        for book_mode in (False, True):
+            with self.subTest(book_mode=book_mode):
+                self.frame.subtitle_filter_enabled = True
+                self.frame.subtitle_filter_rules = SubtitleFilterRules(os_body=True, speaker_transitions_only=book_mode)
+                self.frame.screen_reader.reset_mock()
+                captions = [
+                    DanmakuItem(1987.833, '楚青崖：(OS)我亲了她那么多次', DANMAKU_MODE_SUBTITLE),
+                    DanmakuItem(1990.458, '楚青崖：(OS)她都不记得吗？', DANMAKU_MODE_SUBTITLE),
+                ]
+                canvas = self.frame.danmaku_canvas
+                canvas.position = 0
+                self.frame._set_danmaku_items(self.frame.load_generation, captions)
+                for item in captions:
+                    canvas.position = item.time
+                    canvas._spawn_due_items()
+                self.assertEqual([c.args[0] for c in self.frame.screen_reader.announce.call_args_list], ['楚青崖：(OS)'])
+
     def test_weigou_book_filter_announces_os_even_for_the_current_speaker(self):
         self.frame.subtitle_filter_presets = default_filter_presets()
         self.frame._select_subtitle_filter_slot(1)
@@ -1019,7 +1137,69 @@ class PlaybackMenuTests(unittest.TestCase):
             canvas.position = position
             canvas._spawn_due_items()
         self.assertEqual([call.args[0] for call in self.frame.screen_reader.announce.call_args_list],
-                         ["周其琛", "周其琛：（OS）", "周其琛：（OS）", "旁白"])
+                         ["周其琛", "周其琛：（OS）", "旁白"])
+
+    def test_os_runs_restart_for_roles_and_muted_dialogue_but_not_scene_or_continuation(self):
+        self.frame.subtitle_filter_enabled = True
+        self.frame.subtitle_filter_rules = SubtitleFilterRules(dialogue_mode='mute', os_body=True)
+        texts = ['甲：(OS)开始', '没有标签的续行', '【镜头推近】', '甲：【os】继续',
+                 '乙OS：另一人', '乙：（OS）仍是乙', '甲：（OS）回到甲',
+                 '甲：普通台词被过滤', '甲：（OS）新一段', '旁白：场景', '甲：(OS)再一段']
+        rows = [DanmakuItem(i + 1, text, DANMAKU_MODE_SUBTITLE) for i, text in enumerate(texts)]
+        self.frame._set_danmaku_items(self.frame.load_generation, rows)
+        for item in rows:
+            self.frame.danmaku_canvas.position = item.time
+            self.frame.danmaku_canvas._spawn_due_items()
+        self.assertEqual([c.args[0] for c in self.frame.screen_reader.announce.call_args_list],
+                         ['甲：(OS)', '【镜头推近】', '乙OS', '甲：（OS）', '甲：（OS）', '旁白：场景', '甲：(OS)'])
+
+    def test_os_predicate_is_pure_and_reset_operations_reannounce_segment(self):
+        self.frame.playback = PlaybackInfo(1, '测试', 'fixture')
+        self.frame.subtitle_filter_enabled = True
+        self.frame.subtitle_filter_rules = SubtitleFilterRules(os_body=True)
+        rows = [DanmakuItem(1, '甲：(OS)第一行', DANMAKU_MODE_SUBTITLE),
+                DanmakuItem(2, '甲：(OS)第二行', DANMAKU_MODE_SUBTITLE)]
+        self.frame._set_danmaku_items(self.frame.load_generation, rows)
+        self.assertTrue(self.frame._should_read_subtitle(rows[0]))
+        self.assertTrue(self.frame._should_read_subtitle(rows[0]))
+        self.frame._on_subtitle_due(rows[0])
+        self.assertFalse(self.frame._should_read_subtitle(rows[1]))
+        for reset in (lambda: self.frame._seek_relative(-5),
+                      lambda: self.frame._jump_to_time_done(self.frame.load_generation, 1, {'ok': True, 'position': 1}),
+                      lambda: (self.frame._toggle_subtitle_filter_mode(), self.frame._toggle_subtitle_filter_mode()),
+                      lambda: self.frame._select_subtitle_filter_slot(0)):
+            with self.subTest(reset=reset):
+                reset()
+                self.assertTrue(self.frame._should_read_subtitle(rows[1]))
+                self.frame._on_subtitle_due(rows[1])
+                self.assertFalse(self.frame._should_read_subtitle(rows[1]))
+
+    def test_os_repeat_rule_does_not_remove_subtitles_or_change_full_reading(self):
+        rows = [DanmakuItem(1, '甲：(OS)第一行', DANMAKU_MODE_SUBTITLE),
+                DanmakuItem(2, '甲：(OS)第二行', DANMAKU_MODE_SUBTITLE)]
+        self.frame._set_danmaku_items(self.frame.load_generation, rows)
+        self.frame.subtitle_filter_enabled = False
+        for item in rows:
+            self.frame._on_subtitle_due(item)
+        self.assertEqual([c.args[0] for c in self.frame.screen_reader.announce.call_args_list], [r.text for r in rows])
+        self.assertEqual(len(self.frame.danmaku_canvas.items), 2)
+        self.frame.subtitle_filter_enabled = True
+        self.frame.subtitle_filter_rules = SubtitleFilterRules(os_body=False)
+        self.frame.screen_reader.reset_mock()
+        for item in rows:
+            self.frame._on_subtitle_due(item)
+        self.frame.screen_reader.announce.assert_not_called()
+
+    def test_os_first_filtered_line_does_not_consume_next_os_notice(self):
+        self.frame.subtitle_filter_enabled = True
+        self.frame.subtitle_filter_rules = SubtitleFilterRules(os_body=True, keywords=('广告',))
+        rows = [DanmakuItem(1, '甲：(OS)广告', DANMAKU_MODE_SUBTITLE),
+                DanmakuItem(2, '甲：(OS)真正的独白', DANMAKU_MODE_SUBTITLE)]
+        self.frame._set_danmaku_items(self.frame.load_generation, rows)
+        for item in rows:
+            self.frame.danmaku_canvas.position = item.time
+            self.frame.danmaku_canvas._spawn_due_items()
+        self.frame.screen_reader.announce.assert_called_once_with('甲：(OS)')
 
     def test_book_os_without_role_uses_context_and_keeps_story_barrage_filtered(self):
         self.frame.subtitle_filter_presets = default_filter_presets()
@@ -1039,7 +1219,7 @@ class PlaybackMenuTests(unittest.TestCase):
             canvas.position = position
             canvas._spawn_due_items()
         self.assertEqual([call.args[0] for call in self.frame.screen_reader.announce.call_args_list],
-                         ["周其琛", "周其琛：(os)", "周其琛：（OS）", "周其琛：【OS】", "旁白"])
+                         ["周其琛", "周其琛：(os)", "旁白"])
 
     def test_book_os_checkbox_can_be_disabled_without_disabling_speaker_filter(self):
         self.frame.subtitle_filter_presets = default_filter_presets()
@@ -1233,7 +1413,7 @@ class PlaybackMenuTests(unittest.TestCase):
             self.choose("跳转时间…")
         prompt.assert_called_once_with()
 
-    def test_menu_reading_switches_are_local_and_reset_for_next_sound(self):
+    def test_danmaku_resets_but_subtitle_session_state_survives_next_sound(self):
         self.choose("朗读弹幕")
         self.assertTrue(self.frame.read_danmaku_enabled)
         self.assertFalse(self.frame.read_danmaku_default)
@@ -1241,10 +1421,10 @@ class PlaybackMenuTests(unittest.TestCase):
             self.frame.play(PlaybackInfo(1, "第一集", "https://example.com/1.mp3"))
             self.frame.read_danmaku_enabled = True
             self.frame.read_subtitle_enabled = False
-            self.frame.subtitle_filter_enabled = True
+            self.frame.subtitle_filter_enabled = False
             self.frame.play(PlaybackInfo(2, "第二集", "https://example.com/2.mp3"))
         self.assertFalse(self.frame.read_danmaku_enabled)
-        self.assertTrue(self.frame.read_subtitle_enabled)
+        self.assertFalse(self.frame.read_subtitle_enabled)
         self.assertFalse(self.frame.subtitle_filter_enabled)
 
     def test_speed_menu_and_x_c_z_use_native_speed_levels(self):
@@ -1258,6 +1438,25 @@ class PlaybackMenuTests(unittest.TestCase):
         self.assertEqual(self.frame.playback_rate, 1.25)
         self.frame._set_playback_rate(1.0)
         self.assertEqual(self.frame.playback_rate, 1.0)
+
+    def test_previous_next_menu_uses_same_callback_as_page_keys(self):
+        self.frame.playback = PlaybackInfo(1, '第一集', 'fixture')
+        self.frame.on_change_track = Mock()
+        self.choose('上一集')
+        self.frame.on_change_track.assert_called_with(self.frame, -1)
+        self.choose('下一集')
+        self.frame.on_change_track.assert_called_with(self.frame, 1)
+
+    def test_track_menu_without_audio_is_disabled(self):
+        self.frame.on_change_track = Mock()
+        def popup(menu, _position):
+            for item in menu.GetMenuItems():
+                if item.GetItemLabelText() in ('上一集', '下一集'):
+                    self.assertFalse(item.IsEnabled())
+            return wx.ID_NONE
+        with patch.object(PlaybackFrame, 'GetPopupMenuSelectionFromUser', side_effect=popup):
+            self.frame._show_playback_menu(wx.DefaultPosition)
+        self.frame.on_change_track.assert_not_called()
 
     def test_right_click_on_playback_image_and_keyboard_menu_open_actions(self):
         mouse_event = Mock()
@@ -1542,6 +1741,78 @@ class PlaybackJumpTests(unittest.TestCase):
 
 
 class SettingsMenuTests(unittest.TestCase):
+    def test_playback_context_menu_settings_and_q_share_one_saved_mode(self):
+        owner = self.frame
+        with patch('app.ScreenReaderAnnouncer', side_effect=lambda *args, **kwargs: Mock()):
+            player = PlaybackFrame(owner, Mock(), Mock(), Mock(), Mock(),
+                get_playback_mode=lambda: owner.settings.playback_mode,
+                on_set_playback_mode=owner._set_playback_mode)
+        owner.player_frame = player
+        self.addCleanup(player.Destroy)
+        def choose(expected_checked, selection=None):
+            def popup(menu, _position):
+                modes = next(item.GetSubMenu() for item in menu.GetMenuItems()
+                             if item.GetItemLabelText() == '播放结束后').GetMenuItems()
+                self.assertEqual([item.GetItemLabelText() for item in modes], ['单曲循环', '顺序播放', '不播放'])
+                self.assertEqual([item.GetItemLabelText() for item in modes if item.IsChecked()], [expected_checked])
+                return next(item.GetId() for item in modes if item.GetItemLabelText() == selection) if selection else wx.ID_NONE
+            with patch.object(PlaybackFrame, 'GetPopupMenuSelectionFromUser', side_effect=popup):
+                player._show_playback_menu(wx.DefaultPosition)
+        choose('顺序播放', '单曲循环')
+        self.assertEqual(load_settings().playback_mode, 'single_loop')
+        player.status_reader.announce.assert_called_with('单曲循环')
+        for menu_id, mode in owner.playback_mode_menu_ids.items():
+            self.assertEqual(self.menu_item(menu_id).IsChecked(), mode == 'single_loop')
+        owner._cycle_playback_mode()
+        choose('顺序播放')
+        menu_id = next(i for i, mode in owner.playback_mode_menu_ids.items() if mode == 'stop')
+        owner.on_playback_mode_changed(wx.CommandEvent(wx.wxEVT_MENU, menu_id))
+        choose('不播放')
+        self.assertEqual(load_settings().playback_mode, 'stop')
+        with patch('app.save_settings', side_effect=OSError('disk full')), patch.object(owner, 'show_error'):
+            choose('不播放', '单曲循环')
+        choose('不播放')
+        self.assertEqual(load_settings().playback_mode, 'stop')
+        player.screen_reader.announce.assert_not_called()
+
+    def test_finished_action_menu_has_clear_name_and_unchanged_choices(self):
+        bar = self.frame.GetMenuBar()
+        submenus = [item for index in range(bar.GetMenuCount())
+                    for item in bar.GetMenu(index).GetMenuItems() if item.GetSubMenu()]
+        menu = next(item.GetSubMenu() for item in submenus if item.GetItemLabel() == '播放结束后(&P)')
+        self.assertEqual([item.GetItemLabelText() for item in menu.GetMenuItems()],
+                         ['单曲循环', '顺序播放', '不播放'])
+
+    def test_playback_mode_menu_and_q_share_saved_mode_and_native_announcement(self):
+        frame = self.frame
+        frame.player_frame = Mock()
+        menu_id = next(item_id for item_id, mode in frame.playback_mode_menu_ids.items() if mode == 'single_loop')
+        frame.on_playback_mode_changed(wx.CommandEvent(wx.wxEVT_MENU, menu_id))
+        self.assertEqual(load_settings().playback_mode, 'single_loop')
+        self.assertTrue(self.menu_item(menu_id).IsChecked())
+        self.assertEqual(self.menu_item(menu_id).GetItemLabelText(), '单曲循环')
+        frame.player_frame._announce_status.assert_called_once_with('单曲循环')
+        for mode, label in (('sequential', '顺序播放'), ('stop', '不播放'), ('single_loop', '单曲循环')):
+            frame._cycle_playback_mode()
+            self.assertEqual(load_settings().playback_mode, mode)
+            frame.player_frame._announce_status.assert_called_with(label)
+            for item_id, value in frame.playback_mode_menu_ids.items():
+                self.assertEqual(self.menu_item(item_id).IsChecked(), value == mode)
+        frame._update_account_menu()
+        self.assertTrue(self.menu_item(menu_id).IsChecked())
+
+    def test_failed_mode_save_keeps_previous_mode_and_checkmark(self):
+        frame = self.frame
+        frame.player_frame = Mock()
+        with patch('app.save_settings', side_effect=OSError('disk full')), patch.object(frame, 'show_error') as error:
+            frame._set_playback_mode('single_loop')
+        error.assert_called_once()
+        self.assertEqual(frame.settings.playback_mode, 'sequential')
+        self.assertEqual(load_settings().playback_mode, 'sequential')
+        frame.player_frame._announce_status.assert_not_called()
+        for item_id, value in frame.playback_mode_menu_ids.items():
+            self.assertEqual(self.menu_item(item_id).IsChecked(), value == 'sequential')
+
     def setUp(self):
         self.app = wx.GetApp() or wx.App(False)
         self.directory = tempfile.TemporaryDirectory()
@@ -2060,6 +2331,509 @@ class SettingsMenuTests(unittest.TestCase):
             frame.list = original_list
 
 
+class TrackNavigationTests(unittest.TestCase):
+    def setUp(self):
+        self.frame = MaoerFrame.__new__(MaoerFrame)
+        self.frame.settings = AppSettings()
+        self.frame._auto_play_generation = 0
+        self.frame._auto_pending_request = None
+        self.frame.SetStatusText = Mock()
+        self.frame.items = [MediaItem("sound", 1, "第一集"), MediaItem("drama", 99, "作品"),
+                            MediaItem("sound", 2, "第二集", need_pay=True), MediaItem("sound", 3, "第三集")]
+        self.frame.current_title = "剧集"
+        self.frame.page_state = None
+        self.frame._playback_context = (self.frame.items, None, "剧集")
+        self.frame._play_request = None
+        self.frame._pending_track_key = None
+        self.frame.current_playback_key = ("sound", 1)
+        self.frame.player_frame = Mock()
+        self.frame._select_list_row = Mock()
+        self.frame._play = Mock()
+        self.frame.show_error = Mock()
+        self.frame.show_purchase_required = Mock()
+        self.frame._prompt_sound_purchase = Mock()
+        self.frame.api = Mock()
+        self.frame.list = Mock()
+        self.frame._opened_drama_id = None
+        self.jobs = []
+        self.frame._run_background = lambda status, work, done, **kw: self.jobs.append((work, done, kw))
+
+    def finish_via_player_status(self):
+        player = PlaybackFrame.__new__(PlaybackFrame)
+        self.frame.player_frame = player
+        player.playback = PlaybackInfo(1, '第一集', '')
+        player.load_generation = 1
+        player.rate_change_generation = 0
+        player.finish_notified = False
+        player.playback_rate = 1.0
+        player.danmaku_canvas = Mock()
+        player.status_reader = Mock()
+        player.screen_reader = Mock()
+        player._set_parent_status = Mock()
+        player.on_restart_finished = self.frame._restart_finished_playback
+        player.on_finished = self.frame._on_playback_finished
+        player._sync_playback_status_done(1, 0, {
+            'ok': True, 'ended': True, 'position': 0, 'duration': 60,
+            'paused': True, 'rate': 1,
+        })
+        self.assertTrue(player.finish_notified)
+
+    def complete_next_job(self):
+        work, done, kwargs = self.jobs.pop(0)
+        try:
+            result = work()
+        except PurchaseRequired as exc:
+            with patch('app.wx.CallAfter', side_effect=lambda callback, *args: callback(*args)):
+                kwargs['on_purchase_required'](exc)
+        else:
+            done(result)
+
+    def test_auto_next_announces_title_once_on_native_channel_after_start(self):
+        self.frame.api.playback_info.return_value = PlaybackInfo(2, '第二集标题', 'fixture')
+        self.finish_via_player_status()
+        player = self.frame.player_frame
+        player.status_reader.announce.assert_not_called()
+        self.complete_next_job()
+        player.status_reader.announce.assert_called_once_with('第二集标题')
+        player.screen_reader.announce.assert_not_called()
+        player._notify_playback_finished()
+        player.status_reader.announce.assert_called_once_with('第二集标题')
+
+    def test_failed_auto_start_never_announces_title(self):
+        self.frame._play.return_value = False
+        self.frame.api.playback_info.return_value = PlaybackInfo(2, '第二集标题', 'fixture')
+        self.finish_via_player_status()
+        self.complete_next_job()
+        self.frame.player_frame.status_reader.announce.assert_not_called()
+
+    def test_stop_mode_space_replays_current_track_instead_of_next(self):
+        self.frame.settings = AppSettings(playback_mode='stop')
+        self.finish_via_player_status()
+        self.assertEqual(self.jobs, [])
+        player = self.frame.player_frame
+        original = self.frame._playback_context
+        # Browsing another list must not replace the replay's originating queue.
+        self.frame.items = [MediaItem('sound', 99, '其他音频')]
+        event = Mock()
+        event.GetKeyCode.return_value = wx.WXK_SPACE
+        player.on_char_hook(event)
+        player.on_char_hook(event)  # Do not issue duplicate requests while loading.
+        self.assertEqual(len(self.jobs), 1)
+        self.frame.api.playback_info.return_value = PlaybackInfo(1, '第一集', 'new-url')
+        self.complete_next_job()
+        self.frame.api.playback_info.assert_called_once_with(original[0][0])
+        self.assertEqual(self.frame._play.call_args.args[0].sound_id, 1)
+        self.assertIs(self.frame._playback_context, original)
+        self.assertEqual(self.frame.settings.playback_mode, 'stop')
+        player.status_reader.announce.assert_not_called()
+        player.screen_reader.announce.assert_not_called()
+
+    def test_replay_failure_can_retry_and_old_request_cannot_replace_manual_next(self):
+        self.frame.settings = AppSettings(playback_mode='stop')
+        self.finish_via_player_status()
+        player = self.frame.player_frame
+        self.frame._restart_finished_playback(player, player.playback)
+        self.jobs.pop(0)[2]['on_error']('网络错误')
+        self.frame._restart_finished_playback(player, player.playback)
+        replay_done = self.jobs.pop(0)[1]
+        self.frame._change_playback_track(player, 1)
+        replay_done(PlaybackInfo(1, '第一集', 'fixture'))
+        self.frame._play.assert_not_called()
+        self.assertEqual(self.frame._pending_track_key, ('sound', 2))
+
+    def test_sequential_last_episode_space_replays_without_changing_mode(self):
+        self.frame.items[:] = self.frame.items[:1]
+        self.finish_via_player_status()
+        self.assertEqual(self.jobs, [])
+        player = self.frame.player_frame
+        event = Mock()
+        event.GetKeyCode.return_value = wx.WXK_SPACE
+        player.on_char_hook(event)
+        self.frame.api.playback_info.return_value = PlaybackInfo(1, '第一集', 'fixture')
+        self.complete_next_job()
+        self.assertEqual(self.frame._play.call_args.args[0].sound_id, 1)
+        self.assertEqual(self.frame.settings.playback_mode, 'sequential')
+        player.status_reader.announce.assert_not_called()
+
+    def test_finished_space_does_not_interrupt_pending_next_episode(self):
+        self.finish_via_player_status()
+        event = Mock()
+        event.GetKeyCode.return_value = wx.WXK_SPACE
+        self.frame.player_frame.on_char_hook(event)
+        self.assertEqual(len(self.jobs), 1)
+        self.assertEqual(self.frame._pending_track_key, ('sound', 2))
+
+    def test_finished_without_queue_replays_only_current_episode(self):
+        self.frame._playback_context = None
+        self.finish_via_player_status()
+        player = self.frame.player_frame
+        self.frame._restart_finished_playback(player, player.playback)
+        self.frame.api.playback_info.return_value = PlaybackInfo(1, '第一集', 'fixture')
+        self.complete_next_job()
+        self.assertEqual([item.id for item in self.frame._playback_context[0]], [1])
+
+    def test_all_later_episodes_denied_space_still_replays_current(self):
+        self.frame.api.playback_info.side_effect = PurchaseRequired('需要购买')
+        self.finish_via_player_status()
+        self.complete_next_job()
+        self.assertEqual(self.jobs, [])
+        self.frame.api.playback_info.side_effect = None
+        self.frame.api.playback_info.return_value = PlaybackInfo(1, '第一集', 'fixture')
+        event = Mock()
+        event.GetKeyCode.return_value = wx.WXK_SPACE
+        self.frame.player_frame.on_char_hook(event)
+        self.complete_next_job()
+        self.assertEqual(self.frame._play.call_args.args[0].sound_id, 1)
+        self.assertEqual(self.frame.settings.playback_mode, 'sequential')
+        self.frame.player_frame.status_reader.announce.assert_not_called()
+
+    def test_natural_finish_resolves_member_free_and_stale_paid_candidates(self):
+        for raw in ({'need_pay': 1, '_member_vip_limited_free': True}, {'need_pay': 1}):
+            with self.subTest(raw=raw):
+                self.frame._pending_track_key = None
+                self.frame.items[2].raw = raw
+                self.frame.api.playback_info.reset_mock()
+                self.frame.api.playback_info.return_value = PlaybackInfo(2, '第二集', 'fixture')
+                self.finish_via_player_status()
+                self.complete_next_job()
+                self.frame.api.playback_info.assert_called_once_with(self.frame.items[2])
+                self.assertEqual(self.frame._play.call_args.args[0].sound_id, 2)
+                self.frame.player_frame._notify_playback_finished()
+                self.assertEqual(self.jobs, [])
+
+    def test_natural_finish_prompts_once_and_never_skips_paid_next(self):
+        self.frame.api.playback_info.side_effect = [
+            PurchaseRequired('需要购买'), PlaybackInfo(3, '第三集', 'fixture')]
+        self.finish_via_player_status()
+        duplicate_denial = self.jobs[0][2]['on_purchase_required']
+        self.complete_next_job()
+        duplicate_denial(PurchaseRequired('需要购买'))
+        self.assertEqual([call.args[0].id for call in self.frame.api.playback_info.call_args_list], [2])
+        self.frame._play.assert_not_called()
+        self.assertEqual(self.jobs, [])
+        self.frame.show_purchase_required.assert_not_called()
+        self.frame._prompt_sound_purchase.assert_called_once()
+        self.assertIs(self.frame._prompt_sound_purchase.call_args.args[0], self.frame.items[2])
+        self.frame.player_frame.status_reader.announce.assert_not_called()
+        self.frame.player_frame.screen_reader.announce.assert_not_called()
+        self.assertIsNotNone(self.frame._auto_pending_request)
+
+    def test_paywall_stops_and_new_request_rechecks_current_access(self):
+        self.frame.api.playback_info.side_effect = PurchaseRequired('需要购买')
+        self.finish_via_player_status()
+        self.complete_next_job()
+        self.assertEqual([call.args[0].id for call in self.frame.api.playback_info.call_args_list], [2])
+        self.assertEqual(self.jobs, [])
+        self.frame._play.assert_not_called()
+        self.frame._prompt_sound_purchase.assert_called_once()
+        # A new attempt must recheck account rights (membership/purchase may change).
+        self.frame.api.playback_info.side_effect = None
+        self.frame.api.playback_info.return_value = PlaybackInfo(2, '第二集', 'fixture')
+        self.finish_via_player_status()
+        self.complete_next_job()
+        self.assertEqual(self.frame._play.call_args.args[0].sound_id, 2)
+
+    def test_paid_next_page_prompts_without_advancing_to_later_audio(self):
+        original = self.frame.items
+        original[:] = original[:1]
+        state = PageState(1, Mock(return_value=[MediaItem('sound', 4, '第四集', need_pay=True),
+                                             MediaItem('sound', 5, '第五集')]))
+        self.frame._playback_context = (original, state, '剧集')
+        self.frame.items = []
+        self.frame.api.playback_info.side_effect = PurchaseRequired('需要购买')
+        self.finish_via_player_status()
+        for _ in range(2):  # Page fetch, then denied next track.
+            self.complete_next_job()
+        self.assertEqual([call.args[0].id for call in self.frame.api.playback_info.call_args_list], [4])
+        self.frame._play.assert_not_called()
+        self.frame._prompt_sound_purchase.assert_called_once()
+        self.assertEqual(self.jobs, [])
+
+    def test_manual_next_and_direct_open_share_access_denied_prompt(self):
+        item = self.frame.items[2]
+        self.frame.api.playback_info.side_effect = PurchaseRequired('需要购买')
+        self.frame._change_playback_track(self.frame.player_frame, 1)
+        self.complete_next_job()
+        self.frame._prompt_sound_purchase.assert_called_once()
+        self.frame._prompt_sound_purchase.reset_mock()
+        self.frame.open_item(item)
+        self.complete_next_job()
+        self.frame._prompt_sound_purchase.assert_called_once()
+        self.frame.show_purchase_required.assert_not_called()
+        self.frame._play.assert_not_called()
+
+    def test_stale_auto_paywall_does_not_skip_after_manual_next(self):
+        self.finish_via_player_status()
+        stale = self.jobs.pop(0)[2]['on_purchase_required']
+        self.frame._change_playback_track(self.frame.player_frame, 1)
+        with patch('app.wx.CallAfter') as later:
+            stale(PurchaseRequired('需要购买'))
+        later.assert_not_called()
+        self.assertEqual(self.frame._pending_track_key, ('sound', 2))
+        self.assertEqual(len(self.jobs), 1)
+
+    def test_auto_network_failure_stops_instead_of_skipping_entitled_episode(self):
+        self.finish_via_player_status()
+        self.jobs.pop(0)[2]['on_error']('网络错误')
+        self.frame.show_error.assert_called_once_with('网络错误')
+        self.assertIsNone(self.frame._pending_track_key)
+        self.assertEqual(self.jobs, [])
+
+    def test_finished_track_dispatches_all_three_playback_modes(self):
+        for mode, target in (('single_loop', 1), ('sequential', 2), ('stop', None)):
+            with self.subTest(mode=mode):
+                self.jobs.clear()
+                self.frame._pending_track_key = None
+                self.frame.settings = AppSettings(playback_mode=mode)
+                self.frame._on_playback_finished(self.frame.player_frame, PlaybackInfo(1, '第一集', ''))
+                if target is None:
+                    self.assertEqual(self.jobs, [])
+                else:
+                    self.assertEqual(self.frame._pending_track_key, ('sound', target))
+                    self.jobs[0][1](PlaybackInfo(target, '音频', ''))
+                    self.assertEqual(self.frame._play.call_args.args[0].sound_id, target)
+
+    def test_sequential_stops_at_end_but_single_loop_repeats_last_track(self):
+        self.frame.current_playback_key = ('sound', 3)
+        playback = PlaybackInfo(3, '第三集', '')
+        self.frame._on_playback_finished(self.frame.player_frame, playback)
+        self.assertEqual(self.jobs, [])
+        self.frame.settings = AppSettings(playback_mode='single_loop')
+        self.frame._on_playback_finished(self.frame.player_frame, playback)
+        self.assertEqual(self.frame._pending_track_key, ('sound', 3))
+
+    def test_mode_change_cancels_in_flight_automatic_playback_only(self):
+        self.frame._on_playback_finished(self.frame.player_frame, PlaybackInfo(1, '第一集', ''))
+        self.frame.settings = AppSettings(playback_mode='stop')
+        self.frame._cancel_auto_play()
+        self.jobs.pop()[1](PlaybackInfo(2, '第二集', ''))
+        self.frame._play.assert_not_called()
+        self.assertIsNone(self.frame._pending_track_key)
+        self.frame._change_playback_track(self.frame.player_frame, 1)
+        self.frame._cancel_auto_play()
+        self.jobs.pop()[1](PlaybackInfo(2, '第二集', ''))
+        self.frame._play.assert_called_once()
+
+    def test_stale_auto_page_result_cannot_resume_after_mode_change(self):
+        state = PageState(1, Mock(return_value=[MediaItem('sound', 4, '第四集')]))
+        original = self.frame.items
+        self.frame._playback_context = (original, state, '剧集')
+        self.frame.current_playback_key = ('sound', 3)
+        self.frame.items = []
+        self.frame._on_playback_finished(self.frame.player_frame, PlaybackInfo(3, '第三集', ''))
+        work, done, _kw = self.jobs.pop()
+        self.frame.settings = AppSettings(playback_mode='stop')
+        self.frame._cancel_auto_play()
+        done(work())
+        self.assertEqual(self.jobs, [])
+        self.frame._play.assert_not_called()
+
+    def test_sequential_uses_original_queue_not_new_main_window_list(self):
+        self.frame.items = [MediaItem('sound', 77, '另一列表')]
+        self.frame._on_playback_finished(self.frame.player_frame, PlaybackInfo(1, '第一集', ''))
+        self.assertEqual(self.frame._pending_track_key, ('sound', 2))
+
+    def test_single_loop_paywall_stops_without_switching_to_another_track(self):
+        self.frame.settings = AppSettings(playback_mode='single_loop')
+        self.frame._on_playback_finished(self.frame.player_frame, PlaybackInfo(1, '第一集', ''))
+        with patch.object(self.frame, '_index_for_item_key', return_value=None), patch('app.wx.CallAfter') as later:
+            self.jobs[0][2]['on_purchase_required'](None)
+        later.assert_not_called()
+        self.frame._prompt_sound_purchase.assert_called_once()
+        self.assertIsNone(self.frame._pending_track_key)
+
+    def test_next_and_previous_use_audio_order_and_do_not_skip_paid_target(self):
+        self.frame._change_playback_track(self.frame.player_frame, 1)
+        self.assertEqual(self.frame._pending_track_key, ("sound", 2))
+        self.jobs.pop()[1](PlaybackInfo(2, "第二集", ""))
+        self.frame._play.assert_called_once()
+        self.frame.current_playback_key = ("sound", 2)
+        self.frame._change_playback_track(self.frame.player_frame, -1)
+        self.assertEqual(self.frame._pending_track_key, ("sound", 1))
+
+    def test_rapid_next_only_accepts_the_latest_playback_result(self):
+        self.frame._change_playback_track(self.frame.player_frame, 1)
+        self.frame._change_playback_track(self.frame.player_frame, 1)
+        self.assertEqual(self.frame._pending_track_key, ("sound", 3))
+        self.jobs[1][1](PlaybackInfo(3, "第三集", ""))
+        self.jobs[0][1](PlaybackInfo(2, "第二集", ""))
+        self.frame._play.assert_called_once()
+        self.assertEqual(self.frame._play.call_args.args[0].sound_id, 3)
+        self.frame.player_frame._announce_status.assert_called_once_with("第三集")
+
+    def test_failed_track_start_does_not_announce_a_playing_title(self):
+        self.frame._play.return_value = False
+        self.frame._change_playback_track(self.frame.player_frame, 1)
+        self.jobs[0][1](PlaybackInfo(2, "第二集", ""))
+        self.frame.player_frame._announce_status.assert_not_called()
+
+    def test_navigating_main_list_does_not_change_active_playback_queue(self):
+        self.frame.items = [MediaItem("sound", 888, "另一列表")]
+        self.frame.current_title = "另一个列表"
+        self.frame._change_playback_track(self.frame.player_frame, 1)
+        self.jobs[0][1](PlaybackInfo(2, "第二集", ""))
+        self.assertEqual(self.frame._play.call_args.kwargs['source_title'], "剧集")
+        self.frame._select_list_row.assert_not_called()
+
+    def test_boundaries_do_not_wrap_or_restart_current_audio(self):
+        self.frame._change_playback_track(self.frame.player_frame, -1)
+        self.frame.player_frame._announce_status.assert_called_with("已经是第一曲")
+        self.frame.current_playback_key = ("sound", 3)
+        self.frame._change_playback_track(self.frame.player_frame, 1)
+        self.frame.player_frame._announce_status.assert_called_with("已经是最后一曲")
+        self.assertEqual(self.jobs, [])
+
+    def test_next_loads_another_page_in_original_queue_after_main_navigation(self):
+        original = self.frame.items
+        state = PageState(1, Mock(return_value=[MediaItem("sound", 4, "第四集")]))
+        self.frame._playback_context = (original, state, "剧集")
+        self.frame.current_playback_key = ("sound", 3)
+        self.frame.items = []
+        self.frame._change_playback_track(self.frame.player_frame, 1)
+        work, done, _kw = self.jobs.pop(0)
+        done(work())
+        self.assertEqual(self.frame._pending_track_key, ("sound", 4))
+        self.assertEqual(state.page, 2)
+        self.assertEqual([item.id for item in original], [1, 99, 2, 3, 4])
+
+    def test_late_purchase_prompt_is_ignored_after_a_new_track_request(self):
+        self.frame._change_playback_track(self.frame.player_frame, 1)
+        self.frame._change_playback_track(self.frame.player_frame, 1)
+        self.jobs[0][2]['on_purchase_required'](None)
+        self.frame.show_purchase_required.assert_not_called()
+
+
+class PurchaseSwitchFlowTests(unittest.TestCase):
+    def setUp(self):
+        self.driver = TrackNavigationTests()
+        self.driver.setUp()
+        self.frame = self.driver.frame
+        self.jobs = self.driver.jobs
+        del self.frame._prompt_sound_purchase  # Exercise actual price/confirmation pipeline.
+        self.frame.api.cookie_header = 'test-account'
+        self.frame._confirm_purchase = Mock(return_value=False)
+        self.frame._return_to_playback_list = Mock()
+        self.frame._mark_drama_purchased_in_items = Mock()
+
+    def start(self, route='auto', pay_type=1):
+        drama = DramaPurchaseInfo(12, '测试剧', pay_type, True, 30)
+        self.frame.api.sound_purchase_info.return_value = SoundPurchaseInfo(2, '第二集', pay_type, True, drama, 10)
+        self.frame.api.playback_info.side_effect = [PurchaseRequired('付费内容'), PlaybackInfo(2, '第二集', 'fixture')]
+        if route == 'auto':
+            self.driver.finish_via_player_status()
+        elif route == 'manual':
+            self.frame._change_playback_track(self.frame.player_frame, 1)
+        else:
+            self.frame.open_item(self.frame.items[2])
+        self.driver.complete_next_job()  # Access denied, now fetching price.
+
+    def test_all_entry_paths_show_price_and_no_returns_to_selected_episode(self):
+        for route in ('auto', 'manual', 'direct'):
+            for pay_type in (1, 2):
+                with self.subTest(route=route, pay_type=pay_type):
+                    self.setUp()
+                    context = self.frame._playback_context
+                    self.start(route, pay_type)
+                    self.driver.complete_next_job()
+                    message, title = self.frame._confirm_purchase.call_args.args
+                    self.assertIn('10 钻石' if pay_type == 1 else '30 钻石', message)
+                    self.assertEqual(title, '购买单集' if pay_type == 1 else '购买广播剧')
+                    self.frame._return_to_playback_list.assert_called_once_with(context, ('sound', 2))
+                    self.frame._select_list_row.assert_called_with(2)
+                    self.frame.show_purchase_required.assert_not_called()
+                    self.frame.api.buy_drama.assert_not_called()
+                    self.frame.api.buy_drama_episode.assert_not_called()
+                    self.assertEqual(self.jobs, [])
+                    self.frame._play.assert_not_called()
+
+    def test_confirmed_purchase_starts_exact_target_and_preserves_queue(self):
+        for pay_type in (1, 2):
+            with self.subTest(pay_type=pay_type):
+                self.setUp()
+                self.frame._confirm_purchase.return_value = True
+                context = self.frame._playback_context
+                self.start('auto', pay_type)
+                self.driver.complete_next_job()  # Yes -> enqueue purchase, not yet executed.
+                self.frame.api.buy_drama.assert_not_called()
+                self.frame.api.buy_drama_episode.assert_not_called()
+                # Main list may be rebuilt after purchase; preserve source queue and select target.
+                self.frame.items = self.frame.items.copy()
+                with patch('app.wx.MessageBox'):
+                    self.driver.complete_next_job()  # Mock purchase succeeds, enqueue playback.
+                self.driver.complete_next_job()
+                self.assertEqual(self.frame._play.call_args.args[0].sound_id, 2)
+                self.assertIs(self.frame._playback_context, context)
+                self.frame._select_list_row.assert_called_with(2)
+                self.frame.player_frame.status_reader.announce.assert_called_once_with('第二集')
+                self.frame._return_to_playback_list.assert_not_called()
+                if pay_type == 1:
+                    self.frame.api.buy_drama_episode.assert_called_once_with(12, 2)
+                    self.frame.api.buy_drama.assert_not_called()
+                else:
+                    self.frame.api.buy_drama.assert_called_once_with(12)
+                    self.frame.api.buy_drama_episode.assert_not_called()
+
+    def test_stale_price_result_never_opens_confirmation(self):
+        for change in ('next', 'mode', 'account'):
+            with self.subTest(change=change):
+                self.setUp()
+                self.start()
+                work, done, _ = self.jobs.pop(0)
+                if change == 'next':
+                    self.frame._change_playback_track(self.frame.player_frame, 1)
+                elif change == 'mode':
+                    self.frame._cancel_auto_play()
+                else:
+                    self.frame.api.cookie_header = 'different-account'
+                done(work())
+                self.frame._confirm_purchase.assert_not_called()
+
+    def test_late_purchase_success_does_not_replace_new_manual_audio(self):
+        self.frame._confirm_purchase.return_value = True
+        self.start()
+        self.driver.complete_next_job()
+        work, done, _ = self.jobs.pop(0)
+        self.frame._play_sound_item(self.frame.items[3])
+        with patch('app.wx.MessageBox'):
+            done(work())
+        self.assertEqual(self.frame._pending_track_key, ('sound', 3))
+        self.assertEqual(len(self.jobs), 1)
+        self.frame._play.assert_not_called()
+
+    def test_decline_closes_player_and_focuses_original_list_target(self):
+        for browsed_elsewhere in (False, True):
+            with self.subTest(browsed_elsewhere=browsed_elsewhere):
+                self.setUp()
+                del self.frame._return_to_playback_list
+                context = self.frame._playback_context
+                self.start()
+                player = self.frame.player_frame
+                self.frame.browser_player = Mock()
+                self.frame.active_player = self.frame.browser_player
+                player.Close = Mock(side_effect=lambda: self.frame._on_player_window_close(player))
+                self.frame.Show = Mock()
+                self.frame.Raise = Mock()
+                self.frame._focus_list = Mock()
+                self.frame._navigation_state_snapshot = Mock()
+                self.frame._enter_items = Mock()
+                if browsed_elsewhere:
+                    self.frame.items = []
+                with patch('app.wx.CallAfter', side_effect=lambda callback, *args: callback(*args)):
+                    self.driver.complete_next_job()
+                player.Close.assert_called_once()
+                self.assertIsNone(self.frame.player_frame)
+                self.assertIsNone(self.frame.current_playback_key)
+                self.assertIsNone(self.frame._play_request)
+                self.frame.Show.assert_called_once()
+                self.frame.Raise.assert_called_once()
+                self.frame._focus_list.assert_called_once()
+                if browsed_elsewhere:
+                    self.assertIs(self.frame._enter_items.call_args.args[0], context[0])
+                    self.assertEqual(self.frame._enter_items.call_args.kwargs['selected_index'], 2)
+                else:
+                    self.frame._select_list_row.assert_called_with(2)
+
+
 class PaidSoundRoutingTests(unittest.TestCase):
     def test_paid_sound_is_delegated_to_playback_resolution(self) -> None:
         frame = MaoerFrame.__new__(MaoerFrame)
@@ -2100,6 +2874,45 @@ class PaidSoundRoutingTests(unittest.TestCase):
 
 
 class PublisherColumnTests(unittest.TestCase):
+    def test_my_followed_drama_title_has_account_history_and_latest_without_changing_publisher(self):
+        frame = self.make_frame()
+        item = MediaItem('drama', 96416, '灯花笑 下季', raw={
+            '_followed_last_heard': '中秋邀帖', '_followed_latest': '幕后特辑',
+            'username': '发布账号',
+        })
+        for title in ('我的追剧', '广播剧 · 我的追剧'):
+            frame.current_title = title
+            self.assertEqual(frame._display_item_title(item), '灯花笑 下季；上次收听到 中秋邀帖；更新至 幕后特辑')
+            self.assertEqual(frame._item_publisher(item), '发布账号')
+        frame.current_title = '首页'
+        self.assertEqual(frame._display_item_title(item), '灯花笑 下季')
+
+    def test_followed_drama_enter_selects_last_heard_without_playing(self):
+        frame = self.make_frame()
+        frame.current_title = '我的追剧'
+        item = MediaItem('drama', 1, '作品', raw={'_followed_latest': '第三集', '_followed_last_sound_id': 30})
+        frame.items = [item]
+        frame.api = Mock(cookie_header='account')
+        frame.api.followed_drama_episodes.return_value = ([MediaItem('sound', 30, '上次一集')], 2, 0, True)
+        frame._navigation_state_snapshot = Mock()
+        frame._enter_items = Mock()
+        frame._play_sound_item = Mock()
+        jobs = []
+        frame._run_background = lambda status, work, done: jobs.append((work, done))
+        frame.open_item(item)
+        work, done = jobs.pop()
+        done(work())
+        frame.api.followed_drama_episodes.assert_called_once_with(1, 30, force_owned=False)
+        options = frame._enter_items.call_args.kwargs
+        self.assertEqual(options['selected_index'], 0)
+        self.assertEqual(options['page_state'].page, 2)
+        self.assertTrue(options['focus_list'])
+        frame._play_sound_item.assert_not_called()
+        frame._enter_items.reset_mock()
+        frame.items = []
+        done(work())
+        frame._enter_items.assert_not_called()
+
     def make_frame(self):
         frame = MaoerFrame.__new__(MaoerFrame)
         frame.current_title = "首页"

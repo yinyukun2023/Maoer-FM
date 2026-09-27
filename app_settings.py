@@ -10,6 +10,7 @@ from app_paths import app_data_dir
 
 
 SETTINGS_FILENAME = "settings.json"
+PLAYBACK_MODES = (("single_loop", "单曲循环"), ("sequential", "顺序播放"), ("stop", "不播放"))
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class AppSettings:
     active_subtitle_filter_slot: int = 0
     filter_presets_version: int = 2
     output_device_id: str = ""
+    playback_mode: str = "sequential"
 
 
 def _clean_strings(value: object, fallback: tuple[str, ...]) -> tuple[str, ...]:
@@ -126,6 +128,8 @@ def load_settings() -> AppSettings:
     values["active_subtitle_filter_slot"] = slot_map.get(slot, 0) if type(slot) is int else 0
     device_id = data.get("output_device_id", "")
     values["output_device_id"] = device_id if isinstance(device_id, str) else ""
+    mode = data.get("playback_mode")
+    values["playback_mode"] = mode if mode in tuple(key for key, _label in PLAYBACK_MODES) else defaults.playback_mode
     return AppSettings(**values)
 
 

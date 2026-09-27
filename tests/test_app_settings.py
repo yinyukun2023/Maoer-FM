@@ -9,6 +9,16 @@ from app_settings import AppSettings, SubtitleFilterPreset, SubtitleFilterRules,
 
 
 class AppSettingsTests(unittest.TestCase):
+    def test_playback_modes_persist_and_invalid_or_old_values_default_to_sequential(self):
+        for mode in ("single_loop", "sequential", "stop"):
+            save_settings(AppSettings(playback_mode=mode))
+            self.assertEqual(load_settings().playback_mode, mode)
+        for value in (None, "unknown", False, [], {}):
+            (self.path / "settings.json").write_text(json.dumps({"playback_mode": value}), encoding="utf-8")
+            self.assertEqual(load_settings().playback_mode, "sequential")
+        (self.path / "settings.json").write_text('{}', encoding="utf-8")
+        self.assertEqual(load_settings().playback_mode, "sequential")
+
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

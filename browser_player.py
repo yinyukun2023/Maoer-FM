@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
+from dataclasses import dataclass
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
@@ -21,6 +23,14 @@ class PlayerUnavailable(RuntimeError):
 MIN_PLAYBACK_RATE = 0.5
 MAX_PLAYBACK_RATE = 2.0
 ScriptCallback = Callable[[dict[str, object] | None], None]
+
+
+@dataclass
+class _PauseResume:
+    generation: int
+    position: float
+    rate: float
+    reloaded: bool = False
 
 
 def debug_log(message: str) -> None:
@@ -262,6 +272,9 @@ CONTROL_SCRIPT = r"""
           }
           var original = sound[name];
           sound[name] = function() {
+            if (window.__maoerResumeHold) {
+              return sound;
+            }
             var state = currentGuard();
             if ((state.blockNext && state.handled) || isUnexpectedSound(sound)) {
               blockUnexpected(currentMedia(), sound);
@@ -279,6 +292,9 @@ CONTROL_SCRIPT = r"""
         var nativePlay = HTMLMediaElement.prototype.play;
         HTMLMediaElement.prototype.__maoerSingleSoundGuardPatched = true;
         HTMLMediaElement.prototype.play = function() {
+          if (window.__maoerResumeHold) {
+            return Promise.resolve();
+          }
           var state = currentGuard();
           if ((state.blockNext && state.handled) || isUnexpectedMedia(this)) {
             blockUnexpected(this, demo());
@@ -911,6 +927,14 @@ CONTROL_SCRIPT = r"""
 
     function resumePlayback() {
       // Explicit play, never a toggle. Also leaves volume and rate intact.
+      window.__maoerResumeHold = false;
+      var item = currentMedia();
+      if (item) {
+        if (!item.paused && !item.ended && !item.error) {
+          return result({ok: true});
+        }
+        return result({ok: playMedia(item)});
+      }
       var sound = demo();
       if (sound) {
         if (sound.playState === 1 && !sound.paused) {
@@ -924,13 +948,6 @@ CONTROL_SCRIPT = r"""
           sound.play();
           return result({ok: true});
         }
-      }
-      var item = currentMedia();
-      if (item) {
-        if (!item.paused && !item.ended) {
-          return result({ok: true});
-        }
-        return result({ok: playMedia(item)});
       }
       return result({ok: false, error: "no-player"});
     }
@@ -951,10 +968,10 @@ CONTROL_SCRIPT = r"""
       var statusPaused = false;
       var guard = window.__maoerSingleSoundGuard || {};
       var statusEnded = !!guard.handled;
-      if (statusSound) {
-        statusPaused = !!statusSound.paused || statusSound.playState === 0;
-      } else if (statusItem) {
+      if (statusItem) {
         statusPaused = !!statusItem.paused;
+      } else if (statusSound) {
+        statusPaused = !!statusSound.paused || statusSound.playState === 0;
       }
       if (statusItem && statusItem.ended) {
         statusEnded = true;
@@ -987,6 +1004,15 @@ CONTROL_SCRIPT = r"""
 
     if (action === "pause") {
       return togglePause();
+    }
+
+    if (action === "pause_only") {
+      var sound = demo();
+      if (sound && typeof sound.pause === "function") {
+        sound.pause();
+      }
+      mediaElements().forEach(function(item) { item.pause(); });
+      return result({ok: !!sound || !!currentMedia(), paused: true});
     }
 
     if (action === "volume") {
@@ -1034,6 +1060,8 @@ class HiddenBrowserPlayer:
         self._seek_generation = 0
         self._page_loaded = False
         self._paused = False
+        self._last_position = 0.0
+        self._resume_request: _PauseResume | None = None
         self._suppress_autoplay = False
         self._playback_rate = 1.0
         self._cookie_primer_target: str | None = None
@@ -1048,6 +1076,8 @@ class HiddenBrowserPlayer:
 
     def play(self, playback: PlaybackInfo) -> None:
         self._seek_generation += 1
+        self._resume_request = None
+        self._last_position = 0.0
         self._cancel_autoplay_timer()
         page_url = playback.page_url or f"https://www.missevan.com/sound/player?id={playback.sound_id}"
         debug_log(f"play sound_id={playback.sound_id} title={playback.title!r} url={page_url}")
@@ -1078,13 +1108,24 @@ class HiddenBrowserPlayer:
 
     def seek(self, seconds: int) -> None:
         self._seek_generation += 1
+        self._resume_request = None
         self._run_control("seek", seconds)
 
     def seek_to(self, seconds: float, callback: ScriptCallback, *, resume: bool = False) -> None:
         self._seek_generation += 1
+        self._resume_request = None
         generation = self._seek_generation
         if not resume:
-            self._run_control_callback("seek_to", seconds, callback)
+            def seek_done(result):
+                if generation != self._seek_generation:
+                    callback(None)
+                    return
+                if result and result.get("ok"):
+                    position = self._float_value(result.get("position"))
+                    if position is not None:
+                        self._last_position = position
+                callback(result)
+            self._run_control_callback("seek_to", seconds, seek_done)
             return
         self._suppress_autoplay = True
         self._cancel_autoplay_timer()
@@ -1120,6 +1161,9 @@ class HiddenBrowserPlayer:
             if not result or not result.get("ok"):
                 callback(result)
                 return
+            position = self._float_value(result.get("position"))
+            if position is not None:
+                self._last_position = position
             def resumed(response):
                 if not current():
                     callback(None)
@@ -1138,6 +1182,8 @@ class HiddenBrowserPlayer:
             if result and result.get("ok"):
                 actual_rate = self._float_value(result.get("rate")) or rate
                 self._playback_rate = self._clamp_playback_rate(actual_rate)
+                if self._resume_request is not None:
+                    self._resume_request.rate = self._playback_rate
                 result["rate"] = self._playback_rate
             callback(result)
 
@@ -1151,16 +1197,159 @@ class HiddenBrowserPlayer:
 
     def toggle_pause(self) -> bool:
         self._seek_generation += 1
+        self._resume_request = None
         self._suppress_autoplay = True
+        self._cancel_autoplay_timer()
         self._paused = not self._paused
-        self._run_control("pause")
+        if self._paused:
+            self._run_control("pause_only")
+        elif self._current is not None and self._webview is not None:
+            request = _PauseResume(self._seek_generation, self._last_position, self._playback_rate)
+            self._resume_request = request
+
+            def located(status):
+                if not self._resume_is_current(request):
+                    return
+                if status and status.get("ok"):
+                    position = self._float_value(status.get("position"))
+                    if position is not None and position > 0:
+                        request.position = position
+                self._request_pause_resume(request)
+
+            self._run_control_callback("status", None, located)
+        else:
+            self._run_control("resume")
         return self._paused
+
+    def _resume_is_current(self, request: _PauseResume) -> bool:
+        return (self._resume_request is request and request.generation == self._seek_generation
+                and self._current is not None and self._webview is not None)
+
+    def _request_pause_resume(self, request: _PauseResume) -> None:
+        if not self._resume_is_current(request):
+            return
+
+        def resumed(_result):
+            if self._resume_is_current(request):
+                self._confirm_pause_resume(request, 12)
+
+        self._run_control_callback("resume", None, resumed)
+
+    def _confirm_pause_resume(self, request: _PauseResume, attempts: int) -> None:
+        if not self._resume_is_current(request):
+            return
+
+        def checked(status):
+            if not self._resume_is_current(request):
+                return
+            position = self._float_value(status.get("position")) if status and status.get("ok") else None
+            # A successful play() or paused=False is not proof of audible playback:
+            # idle/expired media can accept the command without advancing at all.
+            if (position is not None and position > request.position + 0.05
+                    and status.get("paused") is False and not status.get("ended")):
+                self._last_position = position
+                self._paused = False
+                self._resume_request = None
+            elif attempts:
+                wx.CallLater(300, self._confirm_pause_resume, request, attempts - 1)
+            elif not request.reloaded:
+                self._reload_for_resume(request)
+            else:
+                self._fail_pause_resume(request)
+
+        self._run_control_callback("status", None, checked)
+
+    def _reload_for_resume(self, request: _PauseResume) -> None:
+        if not self._resume_is_current(request):
+            return
+        request.reloaded = True
+        self._page_loaded = False
+        self._load_generation += 1
+        self._cookie_primer_target = None
+        # A fresh official page obtains fresh playback URLs/licences through the
+        # normal authenticated player. Never reuse a possibly expired media URL.
+        self._install_user_scripts(self._webview)
+        page = self._current.page_url or f"{BASE_URL}/sound/player?id={self._current.sound_id}"
+        self._webview.LoadURL(page)
+        wx.CallLater(300, self._restore_paused_position, request, 50)
+
+    def _restore_paused_position(self, request: _PauseResume, attempts: int) -> None:
+        if not self._resume_is_current(request):
+            return
+
+        def ready(status):
+            if not self._resume_is_current(request):
+                return
+            duration = self._float_value(status.get("duration")) if status and status.get("ok") else None
+            if duration is None or duration <= request.position:
+                if attempts:
+                    wx.CallLater(300, self._restore_paused_position, request, attempts - 1)
+                else:
+                    self._fail_pause_resume(request)
+                return
+            self._run_control("pause_only")
+
+            def sought(result):
+                if not self._resume_is_current(request):
+                    return
+                if not result or not result.get("ok"):
+                    self._fail_pause_resume(request)
+                    return
+                self._confirm_restored_position(request, 10)
+
+            self._run_control_callback("seek_to", request.position, sought)
+
+        self._run_control_callback("status", None, ready)
+
+    def _confirm_restored_position(self, request: _PauseResume, attempts: int) -> None:
+        if not self._resume_is_current(request):
+            return
+
+        def positioned(status):
+            if not self._resume_is_current(request):
+                return
+            position = self._float_value(status.get("position")) if status and status.get("ok") else None
+            if position is not None and abs(position - request.position) <= 0.25:
+                self._run_control("rate", request.rate)
+                self._apply_volume(self._volume)
+                self._request_pause_resume(request)
+            elif attempts:
+                wx.CallLater(150, self._confirm_restored_position, request, attempts - 1)
+            else:
+                self._fail_pause_resume(request)
+
+        self._run_control_callback("status", None, positioned)
+
+    def _fail_pause_resume(self, request: _PauseResume) -> None:
+        if self._resume_is_current(request):
+            self._run_control("pause_only")
+            self._paused = True
+            self._resume_request = None
 
     def is_paused(self) -> bool:
         return self._paused
 
     def status(self, callback: Callable[[dict[str, object] | None], None]) -> None:
-        self._run_control_callback("status", None, callback)
+        generation = self._load_generation
+
+        def done(status):
+            if generation != self._load_generation:
+                callback(None)
+                return
+            request = self._resume_request
+            if request is not None:
+                # Keep subtitles at the saved position while the page reloads;
+                # its temporary zero position must not look like a user seek.
+                callback({**(status or {}), "ok": True, "position": request.position,
+                          "paused": True, "ended": False, "rate": request.rate})
+                return
+            if status and status.get("ok"):
+                position = self._float_value(status.get("position"))
+                if position is not None and (position > 0 or not self._paused or self._last_position == 0):
+                    self._last_position = position
+            callback(status)
+
+        self._run_control_callback("status", None, done)
 
     def _run_control_callback(self, action: str, value: object | None, callback: ScriptCallback) -> None:
         callback_id = self._next_script_callback_id
@@ -1174,6 +1363,7 @@ class HiddenBrowserPlayer:
 
     def stop(self) -> None:
         self._seek_generation += 1
+        self._resume_request = None
         self._cancel_autoplay_timer()
         if self._webview is None:
             return
@@ -1270,6 +1460,10 @@ class HiddenBrowserPlayer:
         except Exception:
             pass
         webview.AddUserScript(self._hide_embedded_page_from_screen_readers_script(), html2.WEBVIEW_INJECT_AT_DOCUMENT_START)
+        if self._resume_request is not None and self._resume_request.reloaded:
+            # Prevent the site's own autoplay from sounding at 00:00 during
+            # reload; explicit resume releases this only after restoring time.
+            webview.AddUserScript("window.__maoerResumeHold = true;", html2.WEBVIEW_INJECT_AT_DOCUMENT_START)
         webview.AddUserScript(self._single_sound_guard_script(), html2.WEBVIEW_INJECT_AT_DOCUMENT_START)
         webview.AddUserScript(self._volume_bootstrap_script(), html2.WEBVIEW_INJECT_AT_DOCUMENT_START)
         cookie_script = self._cookie_script()
@@ -1349,6 +1543,8 @@ class HiddenBrowserPlayer:
         if self._current is None:
             return
         self._page_loaded = True
+        if self._resume_request is not None and self._resume_request.reloaded:
+            self._run_control("pause_only")
         self._schedule_autoplay(self._load_generation)
 
     def _on_navigated(self, _event: wx.Event) -> None:
@@ -1571,7 +1767,7 @@ class HiddenBrowserPlayer:
             number = float(value)
         except (TypeError, ValueError):
             return None
-        return number if number > 0 else None
+        return number if math.isfinite(number) and number >= 0 else None
 
     @staticmethod
     def _parse_control_result(result: str) -> dict[str, object] | None:

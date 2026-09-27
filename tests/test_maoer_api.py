@@ -11,6 +11,69 @@ from maoer_api import AccountInfo, BASE_URL, ApiError, DANMAKU_MODE_SUBTITLE, Ma
 SUBTITLE_URL = "https://static.example/subtitle.json"
 
 
+class FollowedDramaFeedTests(unittest.TestCase):
+    def setUp(self):
+        self.api = MaoerApi(cookie="test-cookie")
+        self.api._mark_purchased_dramas = lambda items: items
+
+    def test_account_feed_preserves_server_global_update_order_and_history(self):
+        pages = {
+            1: [{"id": 96416, "name": "灯花笑 下季", "newest": "幕后特辑",
+                 "lastupdate_time": 1790416616, "saw_episode": "中秋邀帖", "saw_sound_id": 13682793}],
+            2: [{"id": 94733, "name": "灯花笑 上季", "newest": "配乐", "lastupdate_time": 1790000000,
+                 "saw_episode": "第十六集", "saw_sound_id": 16}],
+        }
+        self.api._get = Mock(side_effect=lambda path, params: {"info": {"data": pages[params['p']]}})
+        items = self.api.subscribed_dramas(1) + self.api.subscribed_dramas(2)
+        self.assertEqual([item.id for item in items], [96416, 94733])
+        self.assertEqual(items[0].raw['_followed_last_heard'], '中秋邀帖')
+        self.assertEqual(items[0].raw['_followed_latest'], '幕后特辑')
+        self.assertEqual(items[0].raw['_followed_last_sound_id'], 13682793)
+        self.assertEqual([call.args[0] for call in self.api._get.call_args_list], ['/person/dramafeed'] * 2)
+        self.assertEqual([call.args[1]['p'] for call in self.api._get.call_args_list], [1, 2])
+
+    def test_no_account_history_is_not_inferred_from_episode_number_or_local_state(self):
+        self.api._get = Mock(return_value={"info": {"data": [
+            {"id": 1, "name": "新作品", "newest": "第十二集", "saw_episode": "错误旧标签", "saw_sound_id": 0}
+        ]}})
+        item = self.api.subscribed_dramas()[0]
+        self.assertEqual(item.raw['_followed_last_heard'], '')
+        self.assertIsNone(item.raw['_followed_last_sound_id'])
+
+    def test_signed_out_does_not_request_account_feed(self):
+        self.api.cookie_header = ''
+        self.api._get = Mock()
+        with self.assertRaises(ApiError):
+            self.api.subscribed_dramas()
+        self.api._get.assert_not_called()
+
+    def test_episode_focus_loads_through_target_and_preserves_continuing_page(self):
+        first = MediaItem('sound', 10, '第一集')
+        second = MediaItem('sound', 20, '第二集')
+        target = MediaItem('sound', 30, '上次收听')
+        self.api.drama_episodes_page = Mock(side_effect=[[first, second], [target]])
+        self.api._drama_detail_data = Mock(return_value={
+            'episodes': {'episode': [{'sound_id': 10}, {'sound_id': 20}, {'sound_id': 30}]}})
+        items, page, selected, has_more = self.api.followed_drama_episodes(1, 30)
+        self.assertEqual([item.id for item in items], [10, 20, 30])
+        self.assertEqual((page, selected, has_more), (2, 2, True))
+        self.assertEqual([c.args[1] for c in self.api.drama_episodes_page.call_args_list], [1, 2])
+
+    def test_missing_history_or_removed_episode_focuses_first_without_loading_every_page(self):
+        for target in (None, 99):
+            self.api.drama_episodes_page = Mock(return_value=[MediaItem('sound', 10, '第一集')])
+            self.api._drama_detail_data = Mock(return_value={'episodes': {'episode': [{'sound_id': 10}]}})
+            items, page, selected, _has_more = self.api.followed_drama_episodes(1, target)
+            self.assertEqual((page, selected), (1, 0))
+            self.api.drama_episodes_page.assert_called_once()
+
+    def test_repeating_pages_cannot_loop_forever_while_locating_history(self):
+        self.api.drama_episodes_page = Mock(return_value=[MediaItem('sound', 10, '第一集')])
+        self.api._drama_detail_data = Mock(return_value={'episodes': {'episode': [{'sound_id': 10}, {'sound_id': 30}]}})
+        items, page, selected, has_more = self.api.followed_drama_episodes(1, 30)
+        self.assertEqual((len(items), page, selected, has_more), (1, 2, 0, False))
+
+
 class PublisherNavigationTests(unittest.TestCase):
     def test_followed_accounts_come_from_signed_in_account(self):
         api = MaoerApi(cookie="test-cookie")
@@ -501,6 +564,32 @@ class SubtitleCompatibilityTests(unittest.TestCase):
 
 
 class MemberEntitlementTests(unittest.TestCase):
+    def test_paid_access_matrix_before_purchase_prompt(self):
+        for cookie, member, vip_free, need_pay, allowed in (
+            ('', False, 1, 1, False),
+            ('test-account', False, 1, 1, False),
+            ('test-account', True, 0, 1, False),
+            ('test-account', True, 1, 1, True),
+            ('test-account', False, 0, 2, True),
+        ):
+            with self.subTest(logged_in=bool(cookie), member=member, vip_free=vip_free, need_pay=need_pay):
+                api = FakeMemberPlaybackApi()
+                api.cookie_header = cookie
+                api._member_vip_active_cache = member
+                original = api._get
+                def get(path, params=None):
+                    payload = original(path, params)
+                    if path == '/sound/getsound':
+                        payload['info']['sound'].update(vip=vip_free, need_pay=need_pay)
+                    return payload
+                item = MediaItem('sound', 456, '测试付费集', need_pay=True)
+                with patch.object(api, '_get', side_effect=get):
+                    if allowed:
+                        self.assertEqual(api.playback_info(item).sound_id, 456)
+                    else:
+                        with self.assertRaises(PurchaseRequired):
+                            api.playback_info(item)
+
     def test_member_can_play_vip_limited_free_sound(self) -> None:
         item = MediaItem(
             kind="sound",
@@ -516,6 +605,44 @@ class MemberEntitlementTests(unittest.TestCase):
 
 
 class DramaPurchaseDisplayTests(unittest.TestCase):
+    def test_need_pay_two_means_owned_in_all_episode_entry_points(self):
+        for flag in (2, "2"):
+            with self.subTest(flag=flag):
+                api = MaoerApi(cookie="")
+                episode = {"sound_id": 1050453, "name": "第六期", "pay_type": 1, "need_pay": flag}
+                sound = {"id": 1050453, "drama_id": 17702, "soundstr": "无限恐怖 第六期",
+                         "pay_type": 1, "need_pay": flag, "soundurl": "https://static.example/owned.mp3"}
+                api._drama_detail_data = Mock(return_value={
+                    "drama": {"id": 17702, "name": "无限恐怖", "pay_type": 1, "need_pay": flag},
+                    "episodes": {"episode": [episode]},
+                })
+                api._get = Mock(return_value={"info": {"sound": sound, "Datas": [sound]}})
+                for item in (api.drama_episodes(17702)[0], api.drama_episodes_page(17702)[0], api._sound_item(sound)):
+                    self.assertFalse(item.need_pay)
+                    self.assertFalse(api.sound_purchase_info(item).need_pay)
+                    self.assertEqual(api.playback_info(item).sound_id, 1050453)
+
+    def test_owned_episode_fresh_access_overrides_stale_paid_list_flag(self):
+        api = FakePlaybackApi()
+        api._get = Mock(return_value={"info": {"sound": {
+            "id": 34, "soundstr": "已购单集", "pay_type": 1,
+            "need_pay": 0, "soundurl": "https://static.example/owned.mp3",
+        }}})
+        item = MediaItem(kind="sound", id=34, title="已购单集", need_pay=True, pay_type=1)
+        self.assertEqual(api.playback_info(item).url, "https://static.example/owned.mp3")
+        self.assertFalse(item.need_pay)
+
+    def test_episode_page_access_overrides_stale_drama_summary(self):
+        api = MaoerApi(cookie="")
+        api._drama_detail_data = Mock(return_value={
+            "drama": {"id": 12, "name": "按集购买", "pay_type": 1},
+            "episodes": {"episode": [{"sound_id": 34, "name": "第一集", "need_pay": 1, "pay_type": 1}]},
+        })
+        api._get = Mock(return_value={"info": {"Datas": [
+            {"id": 34, "soundstr": "第一集", "need_pay": 0, "pay_type": 1},
+        ]}})
+        self.assertFalse(api.drama_episodes_page(12)[0].need_pay)
+
     def test_drama_episode_lists_contain_only_sounds(self) -> None:
         api = MaoerApi(cookie="")
         api._drama_detail_data = Mock(return_value={
