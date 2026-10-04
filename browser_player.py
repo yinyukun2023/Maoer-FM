@@ -13,6 +13,7 @@ import wx.html2 as html2
 
 from app_paths import webview2_profile_dir
 from maoer_api import BASE_URL, PlaybackInfo
+from uia_live_region import HIDDEN_WEBVIEW_SCRIPT
 from windows_audio import set_current_app_volume
 
 
@@ -1498,7 +1499,7 @@ class HiddenBrowserPlayer:
             webview.RemoveAllUserScripts()
         except Exception:
             pass
-        webview.AddUserScript(self._hide_embedded_page_from_screen_readers_script(), html2.WEBVIEW_INJECT_AT_DOCUMENT_START)
+        webview.AddUserScript(HIDDEN_WEBVIEW_SCRIPT, html2.WEBVIEW_INJECT_AT_DOCUMENT_START)
         if self._resume_request is not None and self._resume_request.reloaded:
             # Prevent the site's own autoplay from sounding at 00:00 during
             # reload; explicit resume releases this only after restoring time.
@@ -1509,28 +1510,9 @@ class HiddenBrowserPlayer:
         if cookie_script:
             webview.AddUserScript(cookie_script, html2.WEBVIEW_INJECT_AT_DOCUMENT_START)
 
-    @staticmethod
-    def _hide_embedded_page_from_screen_readers_script() -> str:
-        # This 1x1 offscreen WebView is only an audio transport. Its own
-        # changing captions must not reach the screen reader independently of
-        # PlaybackFrame's F / Ctrl+F subtitle announcements.
-        return """(function(){
-  function hide() {
-    if (document.documentElement && document.documentElement.getAttribute('aria-hidden') !== 'true') {
-      document.documentElement.setAttribute('aria-hidden', 'true');
-    }
-    if (document.body && document.body.getAttribute('aria-hidden') !== 'true') {
-      document.body.setAttribute('aria-hidden', 'true');
-    }
-  }
-  hide();
-  document.addEventListener('DOMContentLoaded', hide);
-  new MutationObserver(hide).observe(document, {childList: true, subtree: true, attributes: true, attributeFilter: ['aria-hidden']});
-})();"""
-
     def _prepare_environment(self) -> None:
         os.environ.setdefault("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--autoplay-policy=no-user-gesture-required")
-        profile = webview2_profile_dir()
+        profile = webview2_profile_dir(cookie=self.cookie)
         os.environ["WEBVIEW2_USER_DATA_FOLDER"] = str(profile)
 
     def _cookie_script(self) -> str:

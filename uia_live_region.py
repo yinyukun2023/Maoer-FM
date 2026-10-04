@@ -14,6 +14,26 @@ OBJID_CLIENT_LONG = -4
 CHILDID_SELF = 0
 LIVE_SETTING_ASSERTIVE = 2
 
+# Offscreen playback/login pages leave all screen-reader feedback to native UI.
+HIDDEN_WEBVIEW_SCRIPT = """(function(){
+  function hide() {
+    // aria-hidden alone can be ignored when a page script focuses a child.
+    // inert blocks page focus while preserving our scripted form/media actions.
+    if (document.documentElement && !document.documentElement.inert) {
+      document.documentElement.inert = true;
+    }
+    if (document.documentElement && document.documentElement.getAttribute('aria-hidden') !== 'true') {
+      document.documentElement.setAttribute('aria-hidden', 'true');
+    }
+    if (document.body && document.body.getAttribute('aria-hidden') !== 'true') {
+      document.body.setAttribute('aria-hidden', 'true');
+    }
+  }
+  hide();
+  document.addEventListener('DOMContentLoaded', hide);
+  new MutationObserver(hide).observe(document, {childList: true, subtree: true, attributes: true, attributeFilter: ['aria-hidden', 'inert']});
+})();"""
+
 
 def debug_log(message: str) -> None:
     if os.environ.get("MAOER_DEBUG"):

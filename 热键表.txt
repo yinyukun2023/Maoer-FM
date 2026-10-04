@@ -8,6 +8,15 @@ Alt+Shift+Enter：在网页中打开选中的音频或广播剧
 Backspace：返回上一级；搜索结果页返回首页
 菜单键 或 Shift+F10：打开选中项目的内容菜单
 
+账号管理
+Alt+N：新增账号
+Alt+E：编辑选中的账号
+Alt+D：删除选中的账号（需确认）
+Alt+O：退出当前账号
+Alt+C：复制选中账号的 Cookie
+Alt+X 或 Esc：关闭账号管理
+Enter：在账号列表中登录所选账号，成功后返回主界面
+
 评论窗口
 Enter：打开选中评论的回复
 Shift+Enter：查看选中评论详情

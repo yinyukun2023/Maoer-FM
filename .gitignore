@@ -3,6 +3,7 @@ __pycache__/
 
 cookey
 cookies.txt
+accounts.json
 
 build/
 dist/

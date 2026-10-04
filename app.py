@@ -14,6 +14,10 @@ import requests
 import wx
 
 from app_paths import clear_webview2_profile
+from account_store import (
+    AccountState, LoginCredentials, SavedAccount, load_accounts, normalize_cookie,
+    protect_login, save_accounts, unprotect_login,
+)
 from audio_output import AudioOutputRouter, SYSTEM_OUTPUT
 from app_settings import (
     AppSettings, SubtitleFilterPreset, SubtitleFilterRules, default_filter_presets,
@@ -24,7 +28,7 @@ from browser_player import (
     HiddenBrowserPlayer,
     PlayerUnavailable,
 )
-from login_dialog import LoginDialog
+from login_dialog import AccountManagerDialog, CookieLoginDialog, LoginDialog, validated_account
 from maoer_api import (
     AccountInfo,
     BASE_URL,
@@ -2389,7 +2393,15 @@ class PlaybackFrame(wx.Frame):
 class MaoerFrame(wx.Frame):
     def __init__(self) -> None:
         super().__init__(None, title=APP_TITLE, size=(940, 620))
-        self.api = MaoerApi()
+        self._account_store_error = ""
+        try:
+            saved_state = load_accounts()
+        except (OSError, ValueError, UnicodeError):
+            saved_state = AccountState()
+            self._account_store_error = "无法读取账号文件。原文件未改动，请修复 accounts.json 后重启程序。"
+        self.account_state = saved_state or AccountState()
+        active_account = self.account_state.get(self.account_state.active_user_id)
+        self.api = MaoerApi(cookie=active_account.cookie if active_account else ("" if saved_state is not None else None))
         self.browser_player = HiddenBrowserPlayer(self, cookie=self.api.cookie_header)
         self.active_player: HiddenBrowserPlayer | None = None
         self.player_frame: PlaybackFrame | None = None
@@ -2424,6 +2436,8 @@ class MaoerFrame(wx.Frame):
         self._build_ui()
         self._build_menu()
         self._bind_events()
+        if self._account_store_error:
+            wx.CallAfter(self.show_error, self._account_store_error)
         wx.CallAfter(self._refresh_output_devices)
         if self.api.cookie_header:
             self._refresh_account_title()
@@ -2463,6 +2477,8 @@ class MaoerFrame(wx.Frame):
 
     def _build_menu(self) -> None:
         self.account_login_menu_id = wx.NewIdRef()
+        self.account_cookie_login_menu_id = wx.NewIdRef()
+        self.account_manage_menu_id = wx.NewIdRef()
         self.account_info_menu_id = wx.NewIdRef()
         self.account_favorites_menu_id = wx.NewIdRef()
         self.account_subscriptions_menu_id = wx.NewIdRef()
@@ -2501,6 +2517,14 @@ class MaoerFrame(wx.Frame):
         menu_bar = wx.MenuBar()
 
         account_menu = wx.Menu()
+        if self.account_state.accounts or self.account_logged_in:
+            account_menu.Append(self.account_manage_menu_id, "账号管理(&M)…")
+        else:
+            login_menu = wx.Menu()
+            login_menu.Append(self.account_login_menu_id, "账号登录(&A)…")
+            login_menu.Append(self.account_cookie_login_menu_id, "Cookie 登录(&C)…")
+            account_menu.AppendSubMenu(login_menu, "登录(&L)")
+        account_menu.AppendSeparator()
         if self.account_logged_in:
             account_menu.Append(self.account_info_menu_id, "我的信息(&I)")
             account_menu.Append(self.account_favorites_menu_id, "我的收藏(&F)")
@@ -2508,10 +2532,7 @@ class MaoerFrame(wx.Frame):
             account_menu.Append(self.account_history_menu_id, "我的播放历史(&H)")
             account_menu.Append(self.account_following_menu_id, "我的关注(&G)")
             account_menu.Append(self.account_purchased_dramas_menu_id, "已购广播剧(&P)")
-            account_menu.AppendSeparator()
-            account_menu.Append(self.account_logout_menu_id, "退出登录(&O)")
         else:
-            account_menu.Append(self.account_login_menu_id, "账号登录(&L)")
             account_menu.Append(self.account_history_menu_id, "我的播放历史(&H)")
             account_menu.Append(self.account_following_menu_id, "我的关注(&G)")
         account_menu.AppendSeparator()
@@ -2588,6 +2609,8 @@ class MaoerFrame(wx.Frame):
         self.panel.Bind(wx.EVT_CONTEXT_MENU, self.on_list_context_menu)
         self.Bind(wx.EVT_CONTEXT_MENU, self.on_list_context_menu)
         self.Bind(wx.EVT_MENU, self.on_account_login, id=self.account_login_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_cookie_login, id=self.account_cookie_login_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_account_manage, id=self.account_manage_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_info, id=self.account_info_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_favorites, id=self.account_favorites_menu_id)
         self.Bind(wx.EVT_MENU, self.on_account_subscriptions, id=self.account_subscriptions_menu_id)
@@ -3041,20 +3064,128 @@ class MaoerFrame(wx.Frame):
             wx.MessageBox(f"无法打开文件：{filename}", title, wx.OK | wx.ICON_ERROR, self)
 
     def on_account_login(self, _event: wx.Event) -> None:
-        dialog = LoginDialog(self, self.api)
+        self._show_account_login(self)
+
+    def on_cookie_login(self, _event: wx.Event) -> None:
+        self._show_account_login(self, cookie_login=True)
+
+    def _show_account_login(self, parent: wx.Window, *, cookie_login: bool = False) -> bool:
+        dialog = CookieLoginDialog(parent) if cookie_login else LoginDialog(parent, MaoerApi(cookie=""))
         try:
-            if dialog.ShowModal() == wx.ID_OK:
-                cookie = dialog.cookie_header or self.api.cookie_header
-                self.api.set_cookie(cookie)
-                self._sync_follow_status_account()
-                self.browser_player.cookie = cookie
-                self.browser_player.shutdown()
-                self.account_logged_in = True
-                self._update_account_menu()
-                self.SetStatusText("账号登录成功")
-                self._refresh_account_title()
+            if dialog.ShowModal() == wx.ID_OK and dialog.account_info is not None:
+                return self._save_account(dialog.api, dialog.account_info, login=dialog.login, parent=parent)
         finally:
             dialog.Destroy()
+        return False
+
+    def on_account_manage(self, _event: wx.Event) -> None:
+        dialog = AccountManagerDialog(self)
+        self._account_manager = dialog
+        try:
+            dialog.ShowModal()
+        finally:
+            self._account_manager = None
+            dialog.Destroy()
+        self.list.SetFocus()
+
+    def _persist_accounts(self, state: AccountState, parent: wx.Window | None = None) -> bool:
+        try:
+            if self._account_store_error:
+                raise ValueError(self._account_store_error)
+            save_accounts(state)
+        except (OSError, ValueError) as exc:
+            wx.MessageBox(f"无法保存账号：{exc}", "保存失败", wx.OK | wx.ICON_ERROR, parent or self)
+            return False
+        self.account_state = state
+        # The new file is authoritative, including an explicitly logged-out state.
+        # Remove legacy credentials only after the replacement was saved successfully.
+        try:
+            self.api.clear_saved_cookie()
+        except OSError:
+            self.SetStatusText("账号已保存，但旧版登录文件未能清理")
+        return True
+
+    def _save_account(
+        self, api: MaoerApi, account: AccountInfo, *, note: str | None = None,
+        activate: bool = True, parent: wx.Window | None = None, login: LoginCredentials | None = None,
+    ) -> bool:
+        try:
+            if account.user_id is None or account.user_id <= 0:
+                raise ValueError("无法确认账号身份")
+            previous = self.account_state.get(account.user_id)
+            credentials = previous.credentials if previous else ""
+            if login is not None:
+                # A later SMS login must not erase a remembered password.
+                if not login.password and credentials:
+                    try:
+                        remembered = unprotect_login(credentials)
+                    except ValueError:
+                        remembered = None
+                    if remembered:
+                        login = replace(login, password=remembered.password)
+                credentials = protect_login(login)
+            entry = SavedAccount(account.user_id, account.nickname, normalize_cookie(api.cookie_header),
+                                 note if note is not None else (previous.note if previous else ""), credentials)
+        except ValueError as exc:
+            wx.MessageBox(str(exc), "保存失败", wx.OK | wx.ICON_ERROR, parent or self)
+            return False
+        if not self._persist_accounts(self.account_state.updated(entry, activate=activate), parent):
+            return False
+        if activate:
+            if not self.account_logged_in or self.api.cookie_header != api.cookie_header:
+                self._change_account(api, account)
+            else:
+                self._mark_account_logged_in(account.nickname)
+                self._update_account_menu()
+            self.SetStatusText(f"已登录：{account.nickname}")
+        else:
+            self._update_account_menu()
+        return True
+
+    def _edit_saved_account(self, parent: wx.Window, saved: SavedAccount) -> bool:
+        dialog = LoginDialog(parent, MaoerApi(cookie=""), saved=saved)
+        try:
+            if dialog.ShowModal() == wx.ID_OK and dialog.account_info is not None:
+                return self._save_account(dialog.api, dialog.account_info, note=dialog.note, login=dialog.login,
+                                          activate=saved.user_id == self.account_state.active_user_id, parent=parent)
+        finally:
+            dialog.Destroy()
+        return False
+
+    def _remove_saved_account(self, saved: SavedAccount, parent: wx.Window) -> bool:
+        was_active = saved.user_id == self.account_state.active_user_id
+        if not self._persist_accounts(self.account_state.removed(saved.user_id), parent):
+            return False
+        if was_active:
+            self._change_account(MaoerApi(cookie=""))
+        else:
+            self._update_account_menu()
+        return True
+
+    def _change_account(self, api: MaoerApi, account: AccountInfo | None = None) -> None:
+        self._cancel_auto_play()
+        self._play_request = None
+        self._pending_track_key = None
+        self._playback_context = None
+        self._stop()
+        for window in tuple(self.comment_windows):
+            window.Close()
+        self.browser_player.shutdown()
+        self.api = api
+        self.browser_player.cookie = api.cookie_header
+        self._sync_follow_status_account()
+        self._publisher_request = object()
+        self._content_feature_request = None
+        self._vip_catalog_request = None
+        self.navigation_stack.clear()
+        self.homepage_state = None
+        self.page_state = None
+        self.items = []
+        self.list.DeleteAllItems()
+        self.account_logged_in = account is not None
+        self.SetTitle(f"{APP_TITLE} - 登录账号：{account.nickname}" if account else APP_TITLE)
+        self._update_account_menu()
+        self.load_homepage()
 
     def on_account_info(self, _event: wx.Event) -> None:
         self._run_background(
@@ -3075,30 +3206,35 @@ class MaoerFrame(wx.Frame):
         self._focus_account_dialog_content(dialog)
         button.Enable(False)
         self.SetStatusText("正在签到...")
+        api = self.api
+
+        def deliver(callback, *args) -> None:
+            if self and self.api is api:
+                callback(*args)
 
         def runner() -> None:
             try:
-                result = self.api.check_in()
+                result = api.check_in()
                 updated_account = None
                 if result.success:
                     try:
-                        updated_account = self.api.account_info()
+                        updated_account = api.account_info()
                     except (ApiError, requests.RequestException, ValueError) as exc:
                         debug_log(f"account refresh after check-in failed: {exc}")
                     except Exception as exc:
                         debug_log(f"account refresh after check-in failed: {type(exc).__name__}: {exc}")
             except ApiError as exc:
                 if str(exc) == "需要登录":
-                    wx.CallAfter(self._mark_account_logged_out, "需要登录")
-                wx.CallAfter(self.show_error, str(exc))
+                    wx.CallAfter(deliver, self._mark_account_logged_out, "需要登录", api)
+                wx.CallAfter(deliver, self.show_error, str(exc))
             except (requests.RequestException, ValueError) as exc:
-                wx.CallAfter(self.show_error, str(exc))
+                wx.CallAfter(deliver, self.show_error, str(exc))
             except Exception as exc:
-                wx.CallAfter(self.show_error, f"{type(exc).__name__}: {exc}")
+                wx.CallAfter(deliver, self.show_error, f"{type(exc).__name__}: {exc}")
             else:
-                wx.CallAfter(self._show_check_in_result, result, dialog, updated_account)
+                wx.CallAfter(deliver, self._show_check_in_result, result, dialog, updated_account)
             finally:
-                wx.CallAfter(self._finish_check_in_from_account_dialog, button, dialog)
+                wx.CallAfter(deliver, self._finish_check_in_from_account_dialog, button, dialog)
 
         threading.Thread(target=runner, daemon=True).start()
 
@@ -3243,26 +3379,29 @@ class MaoerFrame(wx.Frame):
             ),
         )
 
-    def on_account_logout(self, _event: wx.Event) -> None:
-        self.api.set_cookie("")
-        self._sync_follow_status_account()
-        self.api.clear_saved_cookie()
-        self.browser_player.cookie = ""
-        self.browser_player.shutdown()
-        self.account_logged_in = False
-        self._update_account_menu()
-        self.SetTitle(APP_TITLE)
+    def on_account_logout(self, _event: wx.Event) -> bool:
+        if not self._persist_accounts(replace(self.account_state, active_user_id=None)):
+            return False
+        self._change_account(MaoerApi(cookie=""))
         self.SetStatusText("已退出登录")
-        if self.current_title in {"我的收藏", "我的追剧", "我的播放历史", "我的关注", "剧集订阅", "已购广播剧"}:
-            self.load_homepage(focus_list=True)
+        return True
 
     def _refresh_account_title(self) -> None:
+        api = self.api
+
+        def ready(account: AccountInfo) -> None:
+            if self and self.api is api:
+                self._save_account(api, account)
+                manager = getattr(self, "_account_manager", None)
+                if manager:
+                    manager.refresh(self.account_state.active_user_id)
+
         def runner() -> None:
             try:
-                account = self.api.account_info()
+                account = validated_account(api)
             except ApiError as exc:
                 debug_log(f"account title refresh failed: {exc}")
-                wx.CallAfter(self._mark_account_logged_out, "登录状态失效，请重新登录")
+                wx.CallAfter(self._mark_account_logged_out, "登录状态失效，请重新登录", api)
                 return
             except (requests.RequestException, ValueError) as exc:
                 debug_log(f"account title refresh failed: {exc}")
@@ -3270,7 +3409,7 @@ class MaoerFrame(wx.Frame):
             except Exception as exc:
                 debug_log(f"account title refresh failed: {type(exc).__name__}: {exc}")
                 return
-            wx.CallAfter(self._mark_account_logged_in, account.nickname)
+            wx.CallAfter(ready, account)
 
         threading.Thread(target=runner, daemon=True).start()
 
@@ -3280,14 +3419,14 @@ class MaoerFrame(wx.Frame):
             self._update_account_menu()
         self.SetTitle(f"{APP_TITLE} - 登录账号：{nickname}")
 
-    def _mark_account_logged_out(self, status: str = "") -> None:
-        self.api.set_cookie("")
-        self._sync_follow_status_account()
-        self.browser_player.cookie = ""
+    def _mark_account_logged_out(self, status: str = "", expected_api: MaoerApi | None = None) -> None:
+        if not self or (expected_api is not None and self.api is not expected_api):
+            return
         if self.account_logged_in:
-            self.account_logged_in = False
-            self._update_account_menu()
-        self.SetTitle(APP_TITLE)
+            state = replace(self.account_state, active_user_id=None)
+            if not self._persist_accounts(state):
+                self.account_state = state
+            self._change_account(MaoerApi(cookie=""))
         if status:
             self.SetStatusText(status)
 
@@ -4935,39 +5074,46 @@ class MaoerFrame(wx.Frame):
     ) -> None:
         self.SetStatusText(status)
         self.search_button.Enable(False)
+        api = self.api
+
+        def deliver(callback, *args) -> None:
+            if self and not self.IsBeingDeleted() and self.api is api:
+                callback(*args)
 
         def runner() -> None:
             try:
+                if self.api is not api:
+                    return
                 result = work()
             except PurchaseRequired as exc:
                 if on_purchase_required is not None:
-                    wx.CallAfter(on_purchase_required, exc)
+                    wx.CallAfter(deliver, on_purchase_required, exc)
                 else:
-                    wx.CallAfter(self.show_purchase_required, str(exc))
+                    wx.CallAfter(deliver, self.show_purchase_required, str(exc))
             except DrmUnsupported as exc:
-                wx.CallAfter(self.show_error, str(exc))
+                wx.CallAfter(deliver, self.show_error, str(exc))
             except ApiError as exc:
                 if str(exc) == "需要登录":
-                    wx.CallAfter(self._mark_account_logged_out, "需要登录")
+                    wx.CallAfter(deliver, self._mark_account_logged_out, "需要登录", api)
                 if on_error is not None:
-                    wx.CallAfter(on_error, str(exc))
+                    wx.CallAfter(deliver, on_error, str(exc))
                 else:
-                    wx.CallAfter(self.show_error, str(exc))
+                    wx.CallAfter(deliver, self.show_error, str(exc))
             except (requests.RequestException, ValueError) as exc:
                 if on_error is not None:
-                    wx.CallAfter(on_error, str(exc))
+                    wx.CallAfter(deliver, on_error, str(exc))
                 else:
-                    wx.CallAfter(self.show_error, str(exc))
+                    wx.CallAfter(deliver, self.show_error, str(exc))
             except Exception as exc:
                 message = f"{type(exc).__name__}: {exc}"
                 if on_error is not None:
-                    wx.CallAfter(on_error, message)
+                    wx.CallAfter(deliver, on_error, message)
                 else:
-                    wx.CallAfter(self.show_error, message)
+                    wx.CallAfter(deliver, self.show_error, message)
             else:
-                wx.CallAfter(done, result)
+                wx.CallAfter(deliver, done, result)
             finally:
-                wx.CallAfter(self.search_button.Enable, True)
+                wx.CallAfter(deliver, self.search_button.Enable, True)
 
         threading.Thread(target=runner, daemon=True).start()
 

@@ -376,16 +376,27 @@ class MaoerApi:
             raise ApiError(self._payload_message(payload))
         return payload
 
-    def start_login_captcha(self) -> LoginCaptcha:
+    def _prepare_login(self) -> None:
+        # Let the cookie jar follow session updates during authentication.
+        self.session.headers.pop("Cookie", None)
         self.session.get(
             BASE_URL + "/member/login",
             params={"backurl": BASE_URL + "/"},
             timeout=self.timeout,
         ).raise_for_status()
-        login_cookie = self._session_cookie_header()
-        if login_cookie:
-            self.session.headers["Cookie"] = login_cookie
 
+    def login_regions(self) -> list[tuple[str, str]]:
+        data = self._get("/account/supportcountry")
+        regions = []
+        for item in data.get("info") or []:
+            if isinstance(item, dict) and item.get("code") and item.get("name") and item.get("value"):
+                regions.append((str(item["code"]), f'{item["name"]} +{item["value"]}'))
+        if not regions:
+            raise ApiError("没有获取到国家/地区列表，请稍后重试")
+        return regions
+
+    def start_login_captcha(self) -> LoginCaptcha:
+        self._prepare_login()
         data = self._get("/x/captcha/challenge", {"scene": "login"})
         info = data.get("info") or {}
         params = info.get("params") or {}
@@ -422,7 +433,7 @@ class MaoerApi:
             raise ApiError("没有拿到语音验证码地址，请重新点击获取验证码")
         return LoginCaptcha(gt=gt, challenge=challenge, voice_url=voice_url)
 
-    def send_login_sms_code(self, phone: str, captcha: LoginCaptcha, voice_answer: str) -> None:
+    def verify_login_captcha(self, captcha: LoginCaptcha, voice_answer: str) -> str:
         voice_answer = voice_answer.strip()
         if not voice_answer:
             raise ApiError("请输入语音验证码")
@@ -449,27 +460,35 @@ class MaoerApi:
         validate = _text(data.get("validate"))
         if not validate:
             raise ApiError("没有拿到验证码校验结果")
-        captcha_token = f"geetest|{captcha.challenge}|{validate}|{validate}|jordan"
+        return f"geetest|{captcha.challenge}|{validate}|{validate}|jordan"
+
+    def send_login_sms_code(
+        self, phone: str, captcha: LoginCaptcha, voice_answer: str, region: str = "CN",
+    ) -> None:
+        captcha_token = self.verify_login_captcha(captcha, voice_answer)
         self._post_form_json(
             "/account/sendcode",
             {
                 "login_name": phone,
                 "post_type": "16",
-                "region": "CN",
+                "region": region,
                 "captcha_token": captcha_token,
             },
         )
 
-    def sms_login(self, phone: str, sms_code: str) -> str:
+    def sms_login(self, phone: str, sms_code: str, region: str = "CN") -> str:
         self._post_form_json(
             "/account/smslogin",
             {
                 "mobile": phone,
                 "identify_code": sms_code,
                 "remember_me": "1",
-                "region": "CN",
+                "region": region,
             },
         )
+        return self._finish_login()
+
+    def _finish_login(self) -> str:
         cookie = self._session_cookie_header()
         if not cookie:
             raise ApiError("登录成功但没有拿到 Cookie")
@@ -1227,6 +1246,7 @@ class MaoerApi:
         return cookie_path(filename)
 
     def set_cookie(self, cookie: str) -> None:
+        self.session.cookies.clear()
         self._account_info_cache = None
         self._drama_detail_cache.clear()
         self._purchased_full_drama_ids_cache = None
@@ -1238,7 +1258,9 @@ class MaoerApi:
             self.session.headers.pop("Cookie", None)
 
     def clear_saved_cookie(self, filename: str = "cookey") -> None:
-        for path in (cookie_path(filename, create_parent=False), Path(__file__).with_name(filename)):
+        filenames = ("cookey", "cookies.txt") if filename == "cookey" else (filename,)
+        paths = tuple(cookie_path(name, create_parent=False) for name in filenames) + self._legacy_cookie_paths(*filenames)
+        for path in paths:
             try:
                 path.unlink()
             except FileNotFoundError:
@@ -1261,14 +1283,23 @@ class MaoerApi:
             },
             timeout=self.timeout,
         )
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError:
+            response.raise_for_status()
+            raise ApiError("登录接口返回格式不正确") from None
+        # Login uses HTTP 403 for structured validation errors as well.
+        # Preserve the site's reason instead of hiding it behind HTTPError.
         if isinstance(payload, dict) and payload.get("success") is False:
             raise ApiError(self._payload_message(payload))
+        response.raise_for_status()
+        if not isinstance(payload, dict):
+            raise ApiError("登录接口返回格式不正确")
         return payload
 
     def _session_cookie_header(self) -> str:
-        return "; ".join(f"{cookie.name}={cookie.value}" for cookie in self.session.cookies)
+        request = requests.Request("GET", BASE_URL + "/").prepare()
+        return requests.cookies.get_cookie_header(self.session.cookies, request) or ""
 
     @staticmethod
     def _jsonp_callback() -> str:

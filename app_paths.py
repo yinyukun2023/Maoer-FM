@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import time
@@ -28,8 +29,11 @@ def cookie_path(filename: str = "cookey", create_parent: bool = True) -> Path:
     return app_data_dir(create_parent) / filename
 
 
-def webview2_profile_dir(create: bool = True) -> Path:
+def webview2_profile_dir(create: bool = True, *, cookie: str | None = None) -> Path:
     path = app_data_dir(create) / "webview2_profile"
+    if cookie is not None:
+        # A new account or logout must never reuse the previous browser session.
+        path /= hashlib.sha256(cookie.encode("utf-8")).hexdigest() if cookie else "guest"
     if create:
         path.mkdir(parents=True, exist_ok=True)
     return path

@@ -8,6 +8,7 @@ from wx import html2
 
 from browser_player import CONTROL_SCRIPT, HiddenBrowserPlayer
 from maoer_api import PlaybackInfo
+from uia_live_region import HIDDEN_WEBVIEW_SCRIPT
 
 
 @unittest.skipUnless(shutil.which("node"), "Node.js is needed to execute the browser control script")
@@ -518,7 +519,7 @@ class AutoplaySchedulingTests(unittest.TestCase):
 @unittest.skipUnless(shutil.which("node"), "Node.js is needed to execute the browser script")
 class HiddenBrowserAccessibilityTests(unittest.TestCase):
     def test_page_is_hidden_from_accessibility_without_stopping_media(self) -> None:
-        script = HiddenBrowserPlayer._hide_embedded_page_from_screen_readers_script()
+        script = HIDDEN_WEBVIEW_SCRIPT
         fixture = """
 var handlers = {};
 var root = {attrs: {}, getAttribute: function(name) { return this.attrs[name]; },
@@ -536,13 +537,14 @@ document.documentElement = root;
 document.body = body;
 handlers.DOMContentLoaded();
 root.setAttribute('aria-hidden', 'false');
+root.inert = false;
 observer();
 console.log(JSON.stringify({root: root.attrs['aria-hidden'],
-  body: body.attrs['aria-hidden'], playing: media.playing}));
+  body: body.attrs['aria-hidden'], inert: root.inert, playing: media.playing}));
 """],
             capture_output=True, text=True, check=True, timeout=5,
         )
-        self.assertEqual(json.loads(result.stdout), {"root": "true", "body": "true", "playing": True})
+        self.assertEqual(json.loads(result.stdout), {"root": "true", "body": "true", "inert": True, "playing": True})
 
     def test_accessibility_guard_runs_at_document_start(self) -> None:
         player = HiddenBrowserPlayer(None)
@@ -550,8 +552,7 @@ console.log(JSON.stringify({root: root.attrs['aria-hidden'],
         player._install_user_scripts(webview)
         self.assertEqual(
             webview.AddUserScript.call_args_list[0].args,
-            (player._hide_embedded_page_from_screen_readers_script(),
-             html2.WEBVIEW_INJECT_AT_DOCUMENT_START),
+            (HIDDEN_WEBVIEW_SCRIPT, html2.WEBVIEW_INJECT_AT_DOCUMENT_START),
         )
 
 
