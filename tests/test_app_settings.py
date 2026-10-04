@@ -9,6 +9,19 @@ from app_settings import AppSettings, SubtitleFilterPreset, SubtitleFilterRules,
 
 
 class AppSettingsTests(unittest.TestCase):
+    def test_subtitle_offset_defaults_and_persists_without_changing_other_options(self):
+        self.assertEqual(load_settings().subtitle_offset_seconds, 0.0)
+        for value in (-0.5, 0.0, 1.25):
+            settings = AppSettings(read_subtitle=True, playback_mode="stop", subtitle_offset_seconds=value)
+            save_settings(settings)
+            self.assertEqual(load_settings(), settings)
+
+    def test_invalid_subtitle_offsets_fall_back_to_zero(self):
+        for value in (None, True, "1.5", [], {}, float("nan"), float("inf"), -3601, 3601, 10**400):
+            with self.subTest(value=value):
+                (self.path / "settings.json").write_text(json.dumps({"subtitle_offset_seconds": value}), encoding="utf-8")
+                self.assertEqual(load_settings().subtitle_offset_seconds, 0.0)
+
     def test_playback_modes_persist_and_invalid_or_old_values_default_to_sequential(self):
         for mode in ("single_loop", "sequential", "stop"):
             save_settings(AppSettings(playback_mode=mode))

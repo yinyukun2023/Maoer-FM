@@ -20,6 +20,40 @@ def debug_log(message: str) -> None:
         print(f"[uia] {message}", flush=True)
 
 
+def set_native_accessible_name(window: Any, name: str) -> bool:
+    """Label a native editor on the UI thread without adding static dialog text."""
+    window.SetName(name)
+    if os.name != "nt":
+        return False
+    try:
+        import wx
+
+        handle = int(window.GetHandle())
+        if not handle:
+            return False
+        objects = _automation_objects()
+        service = objects["comtypes"].CoCreateInstance(
+            objects["CLSID_AccPropServices"], objects["IAccPropServices"], objects["CLSCTX_INPROC_SERVER"],
+        )
+        name_property = objects["Name_Property_GUID"]
+        service.SetHwndPropStr(handle, OBJID_CLIENT_DWORD, CHILDID_SELF, name_property, name)
+
+        def clear_name(event: Any) -> None:
+            if event.GetEventObject() is window:
+                try:
+                    service.ClearHwndProps(handle, OBJID_CLIENT_DWORD, CHILDID_SELF,
+                                           ctypes.byref(name_property), 1)
+                except Exception as exc:
+                    debug_log(f"clear accessible name failed: {type(exc).__name__}: {exc}")
+            event.Skip()
+
+        window.Bind(wx.EVT_WINDOW_DESTROY, clear_name)
+        return True
+    except Exception as exc:
+        debug_log(f"set accessible name failed: {type(exc).__name__}: {exc}")
+        return False
+
+
 class ScreenReaderAnnouncer:
     def __init__(self, live_region: Any, *, native_only: bool = False) -> None:
         self.live_region = live_region
@@ -194,6 +228,7 @@ def _automation_objects() -> dict[str, Any]:
         "CLSID_AccPropServices": GUID("{B5F8350B-0548-48B1-A6EE-88BD00B4A5E7}"),
         "IAccPropServices": IAccPropServices,
         "LiveSetting_Property_GUID": GUID("{C12BCD8E-2A8E-4950-8AE7-3625111D58EB}"),
+        "Name_Property_GUID": GUID("{608D3DF8-8128-4AA7-A428-F55E49267291}"),
         "VARIANT": VARIANT,
         "user32": user32,
     }

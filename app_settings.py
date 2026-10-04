@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -11,6 +12,15 @@ from app_paths import app_data_dir
 
 SETTINGS_FILENAME = "settings.json"
 PLAYBACK_MODES = (("single_loop", "单曲循环"), ("sequential", "顺序播放"), ("stop", "不播放"))
+MAX_SUBTITLE_OFFSET_SECONDS = 3600.0
+
+
+def normalize_subtitle_offset(value: object) -> float:
+    if type(value) not in (int, float):
+        return 0.0
+    if not -MAX_SUBTITLE_OFFSET_SECONDS <= value <= MAX_SUBTITLE_OFFSET_SECONDS:
+        return 0.0
+    return round(float(value), 2) if math.isfinite(value) else 0.0
 
 
 @dataclass(frozen=True)
@@ -51,6 +61,7 @@ class AppSettings:
     filter_presets_version: int = 2
     output_device_id: str = ""
     playback_mode: str = "sequential"
+    subtitle_offset_seconds: float = 0.0
 
 
 def _clean_strings(value: object, fallback: tuple[str, ...]) -> tuple[str, ...]:
@@ -130,6 +141,7 @@ def load_settings() -> AppSettings:
     values["output_device_id"] = device_id if isinstance(device_id, str) else ""
     mode = data.get("playback_mode")
     values["playback_mode"] = mode if mode in tuple(key for key, _label in PLAYBACK_MODES) else defaults.playback_mode
+    values["subtitle_offset_seconds"] = normalize_subtitle_offset(data.get("subtitle_offset_seconds"))
     return AppSettings(**values)
 
 

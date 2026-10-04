@@ -478,7 +478,8 @@ class PlaybackMenuTests(unittest.TestCase):
             self.assertEqual(
                 [item.GetItemLabelText() for item in items if not item.IsSeparator()],
                 ["上一集", "下一集", "快退 5 秒", "快进 5 秒", "跳转时间…", "播放倍速", "播放结束后",
-                 "朗读字幕", "过滤模式（实验性功能）", "过滤方案", "朗读弹幕"],
+                 "朗读字幕", *(["字幕时间偏移…"] if self.frame.read_subtitle_enabled else []),
+                 "过滤模式（实验性功能）", "过滤方案", "朗读弹幕"],
             )
             named = {item.GetItemLabelText(): item for item in items if not item.IsSeparator()}
             self.assertEqual(named['朗读字幕'].IsChecked(), self.frame.read_subtitle_enabled)
@@ -508,6 +509,7 @@ class PlaybackMenuTests(unittest.TestCase):
         event = Mock()
         event.GetKeyCode.return_value = wx.WXK_CONTROL_F if control_code else ord("F")
         event.ControlDown.return_value = control
+        event.ShiftDown.return_value = event.AltDown.return_value = False
         self.frame.on_char_hook(event)
         event.Skip.assert_not_called()
 
@@ -1302,6 +1304,20 @@ class PlaybackMenuTests(unittest.TestCase):
         self.frame._seek_relative(15)
         self.assertIsNone(self.frame.book_filter_last_role)
 
+    def test_role_only_announces_once_per_consecutive_speaker_run(self):
+        self.frame.subtitle_filter_rules = SubtitleFilterRules(dialogue_mode="role")
+        self.frame.subtitle_filter_enabled = True
+        captions = [DanmakuItem(float(i), text, DANMAKU_MODE_SUBTITLE)
+                    for i, text in enumerate(("叶修：你们先走", "叶修：我随后就到",
+                                              "黄少天：知道了", "黄少天：走吧", "叶修：好"), 1)]
+        canvas = self.frame.danmaku_canvas
+        self.frame._set_danmaku_items(self.frame.load_generation, captions)
+        for caption in captions:
+            canvas.position = caption.time
+            canvas._spawn_due_items()
+        self.assertEqual([call.args[0] for call in self.frame.screen_reader.announce.call_args_list],
+                         ["叶修", "黄少天", "叶修"])
+
     def test_role_only_does_not_repeat_name_for_inferred_dialogue_continuation(self):
         self.frame.subtitle_filter_rules = SubtitleFilterRules()
         self.press_f(control=True)
@@ -1313,6 +1329,62 @@ class PlaybackMenuTests(unittest.TestCase):
         for caption in captions:
             self.frame._on_subtitle_due(caption)
         self.frame.screen_reader.announce.assert_called_once_with("叶修")
+
+    def test_role_run_predicate_is_pure_and_user_resets_reannounce_name(self):
+        self.frame.playback = PlaybackInfo(1, "测试", "fixture")
+        self.frame.subtitle_filter_rules = SubtitleFilterRules(dialogue_mode="role")
+        self.frame.subtitle_filter_enabled = True
+        rows = [DanmakuItem(1, "甲：第一句", DANMAKU_MODE_SUBTITLE),
+                DanmakuItem(2, "甲：第二句", DANMAKU_MODE_SUBTITLE)]
+        self.frame._set_danmaku_items(self.frame.load_generation, rows)
+        self.assertTrue(self.frame._should_read_subtitle(rows[0]))
+        self.assertTrue(self.frame._should_read_subtitle(rows[0]))
+        self.frame._on_subtitle_due(rows[0])
+        self.assertFalse(self.frame._should_read_subtitle(rows[1]))
+        for reset in (lambda: self.frame._seek_relative(-5),
+                      lambda: self.frame._jump_to_time_done(self.frame.load_generation, 1, {"ok": True, "position": 1}),
+                      lambda: (self.frame._toggle_subtitle_filter_mode(), self.frame._toggle_subtitle_filter_mode())):
+            with self.subTest(reset=reset):
+                reset()
+                self.assertTrue(self.frame._should_read_subtitle(rows[1]))
+                self.frame._on_subtitle_due(rows[1])
+                self.assertFalse(self.frame._should_read_subtitle(rows[1]))
+
+    def test_role_runs_follow_subtitles_even_when_another_speaker_is_filtered_out(self):
+        self.frame.subtitle_filter_rules = SubtitleFilterRules(dialogue_mode="role", keywords=("过滤词",))
+        self.frame.subtitle_filter_enabled = True
+        rows = [DanmakuItem(i + 1, text, DANMAKU_MODE_SUBTITLE) for i, text in enumerate(
+            ("甲：第一句", "甲：过滤词", "甲：还是甲", "乙：过滤词", "甲：重新是甲"))]
+        self.frame._set_danmaku_items(self.frame.load_generation, rows)
+        for row in rows:
+            self.frame.danmaku_canvas.position = row.time
+            self.frame.danmaku_canvas._spawn_due_items()
+        self.assertEqual([c.args[0] for c in self.frame.screen_reader.announce.call_args_list], ["甲", "甲"])
+
+    def test_role_runs_do_not_change_full_reading_or_subtitle_list(self):
+        self.frame.subtitle_filter_rules = SubtitleFilterRules(dialogue_mode="role")
+        self.frame.subtitle_filter_enabled = False
+        rows = [DanmakuItem(i + 1, text, DANMAKU_MODE_SUBTITLE) for i, text in enumerate(
+            ("甲：第一句", "甲：第二句", "甲：（OS）内心话", "甲：（OS）内心话续行"))]
+        self.frame._set_danmaku_items(self.frame.load_generation, rows)
+        for row in rows:
+            self.frame.danmaku_canvas.position = row.time
+            self.frame.danmaku_canvas._spawn_due_items()
+        self.assertEqual([c.args[0] for c in self.frame.screen_reader.announce.call_args_list], [r.text for r in rows])
+        self.assertEqual([r.text for r in self.frame.danmaku_canvas.items], [r.text for r in rows])
+
+    def test_role_runs_preserve_os_notices_and_reset_after_other_information(self):
+        self.frame.subtitle_filter_rules = SubtitleFilterRules(dialogue_mode="role", os_body=True, info_label_only=False)
+        self.frame.subtitle_filter_enabled = True
+        rows = [DanmakuItem(i + 1, text, DANMAKU_MODE_SUBTITLE) for i, text in enumerate(
+            ("甲：第一句", "甲：第二句", "甲：（OS）心里话", "甲：（OS）接着想",
+             "甲：普通台词", "旁白：天亮了", "甲：再见"))]
+        self.frame._set_danmaku_items(self.frame.load_generation, rows)
+        for row in rows:
+            self.frame.danmaku_canvas.position = row.time
+            self.frame.danmaku_canvas._spawn_due_items()
+        self.assertEqual([c.args[0] for c in self.frame.screen_reader.announce.call_args_list],
+                         ["甲", "甲：（OS）", "甲", "旁白：天亮了", "甲"])
 
     def test_main_keyboard_digits_select_available_presets_up_to_ten(self):
         presets = list(default_filter_presets())
@@ -1691,6 +1763,7 @@ class PlaybackJumpTests(unittest.TestCase):
         frame.player.seek_to.side_effect = lambda seconds, callback, **kwargs: callback({"ok": True, "position": seconds, "paused": False})
         event = Mock()
         event.GetKeyCode.return_value = ord("j")
+        event.ControlDown.return_value = event.ShiftDown.return_value = event.AltDown.return_value = False
         dialog = Mock()
         dialog.ShowModal.return_value = wx.ID_OK
         dialog.seconds = 250
@@ -1741,6 +1814,43 @@ class PlaybackJumpTests(unittest.TestCase):
 
 
 class SettingsMenuTests(unittest.TestCase):
+    def test_default_subtitle_offset_is_saved_without_changing_active_window(self):
+        dialog = Mock(offset_seconds=-0.5)
+        dialog.ShowModal.return_value = wx.ID_OK
+        active = Mock(subtitle_offset_seconds=1.5)
+        self.frame.player_frame = active
+        with patch("app.SubtitleOffsetDialog", return_value=dialog) as factory:
+            self.frame.on_default_subtitle_offset(Mock())
+        factory.assert_called_once_with(self.frame, 0.0, is_default=True)
+        self.assertEqual(load_settings().subtitle_offset_seconds, -0.5)
+        self.assertEqual(self.frame.settings.subtitle_offset_seconds, -0.5)
+        self.assertEqual(active.subtitle_offset_seconds, 1.5)
+        active.danmaku_canvas.set_subtitle_offset.assert_not_called()
+        dialog.Destroy.assert_called_once()
+        self.assertEqual(self.menu_item(self.frame.settings_subtitle_offset_menu_id).GetItemLabelText(), "默认字幕偏移…")
+
+    def test_default_subtitle_offset_cancel_or_save_failure_preserves_setting(self):
+        for result in (wx.ID_CANCEL, wx.ID_OK):
+            with self.subTest(result=result):
+                dialog = Mock(offset_seconds=2.0)
+                dialog.ShowModal.return_value = result
+                with patch("app.SubtitleOffsetDialog", return_value=dialog), \
+                        patch("app.save_settings", side_effect=OSError("disk full")) as save, \
+                        patch.object(self.frame, "show_error") as error:
+                    self.frame.on_default_subtitle_offset(Mock())
+                self.assertEqual(self.frame.settings.subtitle_offset_seconds, 0.0)
+                self.assertEqual(load_settings().subtitle_offset_seconds, 0.0)
+                self.assertEqual(save.call_count, int(result == wx.ID_OK))
+                self.assertEqual(error.call_count, int(result == wx.ID_OK))
+                dialog.Destroy.assert_called_once()
+
+    def test_new_playback_window_receives_saved_subtitle_offset(self):
+        self.frame.settings = replace(self.frame.settings, subtitle_offset_seconds=-0.7)
+        self.frame.player_frame = None
+        with patch("app.PlaybackFrame") as frame_type, patch("app.wx.CallAfter"):
+            self.frame._play(PlaybackInfo(1, "测试", "fixture"))
+        self.assertEqual(frame_type.call_args.kwargs["subtitle_offset_seconds"], -0.7)
+
     def test_playback_context_menu_settings_and_q_share_one_saved_mode(self):
         owner = self.frame
         with patch('app.ScreenReaderAnnouncer', side_effect=lambda *args, **kwargs: Mock()):

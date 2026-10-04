@@ -12,6 +12,37 @@ from maoer_api import PlaybackInfo
 
 @unittest.skipUnless(shutil.which("node"), "Node.js is needed to execute the browser control script")
 class AutoplayScriptTests(unittest.TestCase):
+    def test_recovery_loads_uninitialized_media_without_playing_from_zero(self):
+        for use_media in (False, True):
+            with self.subTest(use_media=use_media):
+                fixture = """
+var loads = 0, plays = 0;
+var sound = {position: 0, duration: 0, readyState: 0, paused: true,
+  load: function(options) {
+    if (options.autoPlay !== false) throw Error('must not autoplay');
+    loads++; this.readyState = 3; this.duration = 300000;
+  }, play: function() { plays++; }};
+var media = {currentTime: 0, duration: NaN, readyState: 0, paused: true, src: 'test.mp3',
+  load: function() { loads++; this.readyState = 1; this.duration = 300; },
+  play: function() { plays++; }};
+var window = USE_MEDIA ? {} : {index: {mo: {soundDemo: sound}}};
+window.__maoerResumeHold = true;
+var index = window.index;
+var document = {querySelectorAll: function(selector) {
+  return USE_MEDIA && selector === 'video,audio' ? [media] : [];
+}};
+""".replace("USE_MEDIA", json.dumps(use_media))
+                script = fixture + "\nvar control = " + CONTROL_SCRIPT + ";\n"
+                script += "control('prepare_resume'); control('prepare_resume');"
+                script += "console.log(JSON.stringify({loads: loads, plays: plays, hold: window.__maoerResumeHold, status: JSON.parse(control('status'))}));"
+                result = subprocess.run([shutil.which("node"), "-"], input=script,
+                                        capture_output=True, text=True, check=True, timeout=5)
+                actual = json.loads(result.stdout)
+                self.assertEqual(actual["loads"], 1)
+                self.assertEqual(actual["plays"], 0)
+                self.assertTrue(actual["hold"])
+                self.assertEqual(actual["status"]["duration"], 300)
+
     def run_autoplay(self, *, paused: bool, media: bool = False, action: str = "autoplay") -> dict:
         # Model the site's toggle button and the two supported player backends.
         fixture = """
@@ -41,7 +72,7 @@ var document = {
         script += f"for (var i=0; i<3; i++) {{ control({json.dumps(action)}, 100); }}\n"
         script += "console.log(JSON.stringify({paused: target.paused, calls: calls, position: target.currentTime || target.position / 1000}));"
         result = subprocess.run(
-            [shutil.which("node"), "-e", script],
+            [shutil.which("node"), "-"], input=script,
             capture_output=True, text=True, check=True, timeout=5,
         )
         return json.loads(result.stdout)
@@ -90,7 +121,7 @@ var document = {querySelectorAll: function(selector) {
                 script += "console.log(JSON.stringify({response: response, position: USE_MEDIA ? media.currentTime : sound.position}));"
                 script = script.replace("USE_MEDIA", json.dumps(use_media))
                 result = subprocess.run(
-                    [shutil.which("node"), "-e", script],
+                    [shutil.which("node"), "-"], input=script,
                     capture_output=True, text=True, check=True, timeout=5,
                 )
                 output = json.loads(result.stdout)
@@ -112,7 +143,7 @@ var document = {querySelectorAll: function(selector) {
                 script += f"var response = JSON.parse(control('rate', {rate}));\n"
                 script += "console.log(JSON.stringify({response: response, rate: media.playbackRate}));"
                 result = subprocess.run(
-                    [shutil.which("node"), "-e", script],
+                    [shutil.which("node"), "-"], input=script,
                     capture_output=True, text=True, check=True, timeout=5,
                 )
                 output = json.loads(result.stdout)
@@ -225,12 +256,19 @@ class LongPauseRecoveryTests(unittest.TestCase):
         self.player._webview.LoadURL.assert_not_called()
 
     def test_idle_backend_reset_to_zero_does_not_erase_saved_pause_position(self):
-        self.player.status(Mock())
+        callback = Mock()
+        self.player.status(callback)
         self.respond("status", ok=True, paused=True, position=0)
         self.assertEqual(self.player._last_position, 123.5)
+        self.assertEqual(callback.call_args.args[0]["position"], 123.5,
+                         "The UI must not receive the expired backend's zero position")
         self.player.toggle_pause()
-        self.respond("status", ok=True, paused=True, position=0)
+        with patch("browser_player.wx.CallLater"):
+            self.respond("status", ok=True, paused=True, position=0)
         self.assertEqual(self.player._resume_request.position, 123.5)
+        self.assertFalse(any(action == "resume" for action, _, _ in self.pending),
+                         "A backend reset to zero must be restored before it can play")
+        self.player._webview.LoadURL.assert_called_once()
 
     def test_explicit_seek_to_zero_updates_saved_position(self):
         self.player.seek_to(0, Mock())
@@ -279,6 +317,111 @@ class LongPauseRecoveryTests(unittest.TestCase):
             (status["position"], status["paused"], status["ended"]), (123.5, True, False)))
         _action, _value, callback = self.pending.pop()
         callback({"ok": False, "position": 0, "ended": True})
+
+    def test_reload_retries_position_restore_when_media_is_not_seekable_yet(self):
+        player = self.player
+        engine = {"stale": True, "paused": True, "position": 123.5, "seeks": 0}
+        scheduled = []
+
+        def control(action, value=None):
+            if action == "resume" and not engine["stale"]:
+                engine["paused"] = False
+            elif action == "pause_only":
+                engine["paused"] = True
+            elif action == "seek_to":
+                engine["seeks"] += 1
+                # Metadata may be ready before a freshly loaded player can seek.
+                if engine["seeks"] >= 2:
+                    engine["position"] = value
+            elif action == "status" and not engine["paused"]:
+                engine["position"] += 0.5
+            return {"ok": True, "paused": engine["paused"], "position": engine["position"],
+                    "duration": 1800, "ended": False}
+
+        player._webview.LoadURL.side_effect = lambda url: engine.update(stale=False, position=0)
+        player._run_control = Mock(side_effect=control)
+        player._run_control_callback = Mock(side_effect=lambda action, value, callback: callback(control(action, value)))
+        with patch("browser_player.wx.CallLater", side_effect=lambda delay, fn, *args: scheduled.append((fn, args))), \
+                patch.object(player, "_apply_volume"):
+            player.toggle_pause()
+            for _ in range(150):
+                if not scheduled:
+                    break
+                fn, args = scheduled.pop(0)
+                fn(*args)
+        self.assertEqual(scheduled, [])
+        self.assertFalse(player.is_paused(), "Recovery must retry a seek rejected during initial loading")
+        self.assertGreaterEqual(engine["position"], 123.5)
+        player._webview.LoadURL.assert_called_once()
+
+    def test_failed_recovery_keeps_saved_progress_for_ui_and_the_next_space(self):
+        self.player.toggle_pause()
+        request = self.player._resume_request
+        self.pending.clear()
+        self.player._last_position = 0
+        self.player._fail_pause_resume(request)
+        callback = Mock()
+        self.player.status(callback)
+        self.respond("status", ok=True, paused=True, position=0, ended=False)
+        self.assertEqual(callback.call_args.args[0]["position"], 123.5)
+        self.player.toggle_pause()
+        self.assertEqual(self.player._resume_request.position, 123.5)
+
+    def test_recovery_retries_rejected_seek_and_preserves_volume_and_speed(self):
+        self.player._playback_rate = 1.75
+        self.player._volume = 43
+        self.player.toggle_pause()
+        request = self.player._resume_request
+        self.pending.clear()
+        scheduled = []
+        with patch("browser_player.wx.CallLater", side_effect=lambda delay, fn, *args: scheduled.append((fn, args))):
+            self.player._restore_paused_position(request, 2)
+            self.respond("status", ok=True, duration=1800)
+            self.respond("seek_to", ok=False)
+            fn, args = scheduled.pop(0)
+            fn(*args)
+            self.respond("status", ok=True, duration=1800)
+            self.respond("seek_to", ok=True)
+            with patch.object(self.player, "_apply_volume") as volume:
+                self.respond("status", ok=True, position=123.5)
+                volume.assert_called_once_with(43)
+            self.respond("resume", ok=True)
+            self.respond("status", ok=True, position=124, paused=False, ended=False)
+        self.assertIsNone(self.player._resume_request)
+        self.player._run_control.assert_any_call("rate", 1.75)
+        self.assertFalse(self.player.is_paused())
+
+    def test_unseekable_recovery_is_bounded_and_does_not_discard_pause_position(self):
+        self.player.toggle_pause()
+        request = self.player._resume_request
+        self.pending.clear()
+        scheduled = []
+        self.player._run_control_callback = Mock(side_effect=lambda action, value, callback: callback(
+            {"ok": action == "status", "duration": 1800, "position": 0, "paused": True}))
+        with patch("browser_player.wx.CallLater", side_effect=lambda delay, fn, *args: scheduled.append((fn, args))):
+            self.player._restore_paused_position(request, 2)
+            for _ in range(10):
+                if not scheduled:
+                    break
+                fn, args = scheduled.pop(0)
+                fn(*args)
+        self.assertEqual(scheduled, [])
+        self.assertTrue(self.player.is_paused())
+        self.assertEqual(self.player._last_position, 123.5)
+        self.assertIsNone(self.player._resume_request)
+        self.assertEqual(sum(c.args[0] == "seek_to" for c in self.player._run_control_callback.call_args_list), 3)
+
+    def test_reload_navigation_error_keeps_episode_and_position_for_retry(self):
+        current = self.player._current
+        self.player.toggle_pause()
+        self.pending.clear()
+        self.player._on_error(Mock())
+        self.assertIs(self.player._current, current)
+        self.assertIsNone(self.player._resume_request)
+        self.assertTrue(self.player.is_paused())
+        self.assertEqual(self.player._last_position, 123.5)
+        self.player.toggle_pause()
+        self.assertEqual(self.player._resume_request.position, 123.5)
 
     def test_space_recovers_an_idle_player_that_accepts_play_but_does_not_advance(self):
         player = HiddenBrowserPlayer(None)

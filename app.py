@@ -18,6 +18,7 @@ from audio_output import AudioOutputRouter, SYSTEM_OUTPUT
 from app_settings import (
     AppSettings, SubtitleFilterPreset, SubtitleFilterRules, default_filter_presets,
     load_settings, save_settings, PLAYBACK_MODES,
+    MAX_SUBTITLE_OFFSET_SECONDS, normalize_subtitle_offset,
 )
 from browser_player import (
     HiddenBrowserPlayer,
@@ -48,7 +49,7 @@ from maoer_api import (
     SoundPurchaseInfo,
 )
 from startup_sound import play_startup_sound
-from uia_live_region import ScreenReaderAnnouncer
+from uia_live_region import ScreenReaderAnnouncer, set_native_accessible_name
 from updater import handle_update_cli, run_startup_update_check
 from _build_info import APP_VERSION
 
@@ -981,6 +982,9 @@ class DanmakuCanvas(wx.Panel):
         root.Add(self.bitmap_view, 1, wx.EXPAND)
         self.SetSizer(root)
         self.items: list[DanmakuItem] = []
+        self.subtitle_offset_seconds = 0.0
+        self._scheduled_items: list[DanmakuItem] = []
+        self._emitted_ids: set[int] = set()
         self.active: list[DanmakuSprite] = []
         self.next_index = 0
         self.next_lane = 0
@@ -1000,6 +1004,8 @@ class DanmakuCanvas(wx.Panel):
 
     def reset(self, message: str = "") -> None:
         self.items = []
+        self._scheduled_items = []
+        self._emitted_ids.clear()
         self.pending_loaded_subtitle = None
         self.active = []
         self.next_index = 0
@@ -1014,6 +1020,8 @@ class DanmakuCanvas(wx.Panel):
 
     def set_items(self, items: list[DanmakuItem]) -> None:
         self.items = sorted(items, key=lambda item: item.time)
+        self._scheduled_items = sorted(self.items, key=self._output_time)
+        self._emitted_ids.clear()
         self.active = []
         self.next_index = self._first_index_at_or_after(self.position)
         self.pending_loaded_subtitle = None
@@ -1021,9 +1029,9 @@ class DanmakuCanvas(wx.Panel):
         # recent caption once, but never replay a long-stale opening scene.
         if 0 < self.position <= self.INITIAL_SUBTITLE_CATCHUP_SECONDS:
             for index in range(self.next_index - 1, -1, -1):
-                candidate = self.items[index]
+                candidate = self._scheduled_items[index]
                 if candidate.mode == DANMAKU_MODE_SUBTITLE:
-                    if self.position - candidate.time <= self.INITIAL_SUBTITLE_CATCHUP_SECONDS:
+                    if self.position - self._output_time(candidate) <= self.INITIAL_SUBTITLE_CATCHUP_SECONDS:
                         self.pending_loaded_subtitle = candidate
                     break
         self.next_lane = 0
@@ -1032,9 +1040,30 @@ class DanmakuCanvas(wx.Panel):
 
     def set_error(self, message: str) -> None:
         self.items = []
+        self._scheduled_items = []
+        self._emitted_ids.clear()
         self.pending_loaded_subtitle = None
         self.active = []
         self.message = f"弹幕加载失败: {message or '未知错误'}"
+        self._render_frame()
+
+    def _output_time(self, item: DanmakuItem) -> float:
+        return max(0.0, item.time + self.subtitle_offset_seconds) if item.mode == DANMAKU_MODE_SUBTITLE else item.time
+
+    def set_subtitle_offset(self, seconds: float) -> None:
+        seconds = normalize_subtitle_offset(seconds)
+        if seconds == self.subtitle_offset_seconds:
+            return
+        self._advance_position()
+        self.subtitle_offset_seconds = seconds
+        # Retain original items/identities: filtering and subtitle jumps use
+        # the source timeline. Only display/speech scheduling is shifted.
+        self._scheduled_items = sorted(self.items, key=self._output_time)
+        self.next_index = self._first_index_at_or_after(self.position)
+        self.pending_loaded_subtitle = None
+        self.active = [sprite for sprite in self.active if sprite.item.mode != DANMAKU_MODE_SUBTITLE]
+        # Do not replay previously emitted items if a delay moves them ahead
+        # of the cursor again. Explicit seeks reset this pass independently.
         self._render_frame()
 
     def set_paused(self, paused: bool) -> None:
@@ -1059,6 +1088,7 @@ class DanmakuCanvas(wx.Panel):
             self.playback_rate = self._normalised_playback_rate(playback_rate)
         if abs(self.position - target) > 0.75:
             self.position = target
+            self._emitted_ids.clear()
             self.active = []
             self.next_index = self._first_index_at_or_after(self.position)
             self.pending_loaded_subtitle = None
@@ -1069,6 +1099,7 @@ class DanmakuCanvas(wx.Panel):
 
     def seek(self, seconds: int) -> None:
         self.position = max(0.0, self.position + float(seconds))
+        self._emitted_ids.clear()
         self.active = []
         self.next_index = self._first_index_at_or_after(self.position)
         self.pending_loaded_subtitle = None
@@ -1141,12 +1172,16 @@ class DanmakuCanvas(wx.Panel):
             return
         now = self.position
         stale_before = max(0.0, now - 0.4)
-        while self.next_index < len(self.items) and self.items[self.next_index].time < stale_before:
+        while self.next_index < len(self._scheduled_items) and self._output_time(self._scheduled_items[self.next_index]) < stale_before:
             self.next_index += 1
         first_danmaku: DanmakuItem | None = None
         first_subtitle: DanmakuItem | None = None
-        while self.next_index < len(self.items) and self.items[self.next_index].time <= now:
-            item = self.items[self.next_index]
+        while self.next_index < len(self._scheduled_items) and self._output_time(self._scheduled_items[self.next_index]) <= now:
+            item = self._scheduled_items[self.next_index]
+            self.next_index += 1
+            if id(item) in self._emitted_ids:
+                continue
+            self._emitted_ids.add(id(item))
             if item.mode == DANMAKU_MODE_SUBTITLE:
                 if first_subtitle is None and (
                     self.should_read_subtitle is None or self.should_read_subtitle(item)
@@ -1155,10 +1190,11 @@ class DanmakuCanvas(wx.Panel):
             elif first_danmaku is None:
                 first_danmaku = item
             self._spawn_item(item)
-            self.next_index += 1
         pending = self.pending_loaded_subtitle
         self.pending_loaded_subtitle = None
-        if first_subtitle is None and pending is not None and now - pending.time <= self.INITIAL_SUBTITLE_CATCHUP_SECONDS:
+        if (first_subtitle is None and pending is not None and id(pending) not in self._emitted_ids
+                and 0 <= now - self._output_time(pending) <= self.INITIAL_SUBTITLE_CATCHUP_SECONDS):
+            self._emitted_ids.add(id(pending))
             if self.should_read_subtitle is None or self.should_read_subtitle(pending):
                 first_subtitle = pending
         if first_danmaku is not None and self.on_danmaku_due is not None:
@@ -1198,16 +1234,68 @@ class DanmakuCanvas(wx.Panel):
         return 4 + (lane % self._lane_count()) * self._lane_height()
 
     def _first_index_at_or_after(self, seconds: float) -> int:
-        for index, item in enumerate(self.items):
-            if item.time >= seconds:
+        for index, item in enumerate(self._scheduled_items):
+            if self._output_time(item) >= seconds:
                 return index
-        return len(self.items)
+        return len(self._scheduled_items)
 
     @staticmethod
     def _item_colour(item: DanmakuItem) -> wx.Colour:
         if item.color <= 0:
             return wx.Colour(255, 255, 255)
         return wx.Colour((item.color >> 16) & 0xFF, (item.color >> 8) & 0xFF, item.color & 0xFF)
+
+
+class SubtitleOffsetDialog(wx.Dialog):
+    def __init__(self, parent: wx.Window, seconds: float, *, is_default: bool = False) -> None:
+        super().__init__(parent, title="默认字幕偏移" if is_default else "字幕时间偏移")
+        self.offset_seconds = normalize_subtitle_offset(seconds)
+        panel = wx.Panel(self)
+        root = wx.BoxSizer(wx.VERTICAL)
+        description_text = "以秒为单位，负数提前，正数延后"
+        description = wx.StaticText(panel, label=description_text)
+        description.Wrap(460)
+        root.Add(description, 0, wx.ALL, 12)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        self.offset = wx.SpinCtrlDouble(panel, min=-MAX_SUBTITLE_OFFSET_SECONDS,
+                                       max=MAX_SUBTITLE_OFFSET_SECONDS, initial=self.offset_seconds,
+                                       inc=0.1, size=(130, -1), style=wx.SP_ARROW_KEYS)
+        self.offset.SetDigits(2)
+        self.offset.SetName("字幕偏移（秒），负数提前，正数延后")
+        # SpinCtrlDouble is composite: focus lands in its native TextCtrl.
+        # SetName on the outer control alone is not exposed to Windows readers.
+        for child in self.offset.GetChildren():
+            if isinstance(child, wx.TextCtrl):
+                set_native_accessible_name(child, self.offset.GetName())
+        row.Add(self.offset, 0, wx.ALIGN_CENTER_VERTICAL)
+        root.Add(row, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
+        buttons = wx.StdDialogButtonSizer()
+        ok = wx.Button(panel, wx.ID_OK, "确定")
+        cancel = wx.Button(panel, wx.ID_CANCEL, "取消")
+        buttons.AddButton(ok)
+        buttons.AddButton(cancel)
+        buttons.Realize()
+        ok.SetDefault()
+        root.Add(buttons, 0, wx.ALIGN_RIGHT | wx.ALL, 12)
+        panel.SetSizer(root)
+        outer = wx.BoxSizer(wx.VERTICAL)
+        outer.Add(panel, 1, wx.EXPAND)
+        self.SetSizerAndFit(outer)
+        self.Bind(wx.EVT_BUTTON, self._accept, id=wx.ID_OK)
+        self.offset.SetFocus()
+
+    def _accept(self, _event: wx.Event) -> None:
+        try:
+            value = float(self.offset.GetTextValue().strip())
+            if not math.isfinite(value) or not -MAX_SUBTITLE_OFFSET_SECONDS <= value <= MAX_SUBTITLE_OFFSET_SECONDS:
+                raise ValueError
+        except ValueError:
+            wx.MessageBox("请输入 -3600 至 3600 之间的秒数，负数提前，正数延后。这里不是 J 的分.秒格式。",
+                          "字幕时间偏移", wx.OK | wx.ICON_WARNING, self)
+            self.offset.SetFocus()
+            return
+        self.offset_seconds = normalize_subtitle_offset(value)
+        self.EndModal(wx.ID_OK)
 
 
 class SubtitleJumpDialog(wx.Dialog):
@@ -1385,6 +1473,7 @@ class PlaybackFrame(wx.Frame):
         on_restart_finished: Callable[["PlaybackFrame", PlaybackInfo], None] | None = None,
         get_playback_mode: Callable[[], str] | None = None,
         on_set_playback_mode: Callable[[str], None] | None = None,
+        subtitle_offset_seconds: float = 0.0,
     ) -> None:
         super().__init__(parent, title="", size=(760, 480))
         self.api = api
@@ -1397,6 +1486,7 @@ class PlaybackFrame(wx.Frame):
         self.read_subtitle_default = read_subtitle_default
         self.read_danmaku_enabled = read_danmaku_default
         self.read_subtitle_enabled = read_subtitle_default
+        self.subtitle_offset_seconds = normalize_subtitle_offset(subtitle_offset_seconds)
         self.subtitle_filter_enabled = False
         self.subtitle_filter_presets = subtitle_filter_presets or default_filter_presets()
         self.subtitle_filter_slot = subtitle_filter_slot if 0 <= subtitle_filter_slot < len(self.subtitle_filter_presets) else 0
@@ -1406,6 +1496,8 @@ class PlaybackFrame(wx.Frame):
         self.subtitle_os_items: set[int] = set()
         self.subtitle_os_segments: dict[int, int] = {}
         self.last_spoken_os_segment: int | None = None
+        self.subtitle_dialogue_segments: dict[int, int] = {}
+        self.last_spoken_dialogue: tuple[int | None, str] | None = None
         self.on_filter_slot_changed = on_filter_slot_changed
         self.on_filter_rules = on_filter_rules
         self.on_cycle_output = on_cycle_output
@@ -1424,6 +1516,7 @@ class PlaybackFrame(wx.Frame):
 
         root = wx.BoxSizer(wx.VERTICAL)
         self.danmaku_canvas = DanmakuCanvas(self)
+        self.danmaku_canvas.set_subtitle_offset(self.subtitle_offset_seconds)
         self.danmaku_canvas.on_danmaku_due = self._on_danmaku_due
         self.danmaku_canvas.on_subtitle_due = self._on_subtitle_due
         self.danmaku_canvas.should_read_subtitle = self._should_read_subtitle
@@ -1449,6 +1542,28 @@ class PlaybackFrame(wx.Frame):
         self.danmaku_canvas.bitmap_view.Bind(wx.EVT_RIGHT_UP, self.on_playback_right_up)
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
+        self._disable_playback_ime()
+
+    def _disable_playback_ime(self) -> None:
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            imm32 = ctypes.WinDLL("imm32", use_last_error=True)
+            associate = imm32.ImmAssociateContextEx
+            associate.argtypes = (wintypes.HWND, wintypes.HANDLE, wintypes.DWORD)
+            associate.restype = wintypes.BOOL
+            # Only this playback HWND and its existing display children.
+            # Leave the thread's shared context untouched: search fields and
+            # editor dialogs created later must retain normal Chinese input.
+            for flags in (0, 1):  # current window, then IACE_CHILDREN
+                if not associate(self.GetHandle(), None, flags):
+                    debug_log(f"disable playback IME failed: flags={flags}")
+        except Exception as exc:
+            debug_log(f"disable playback IME failed: {type(exc).__name__}: {exc}")
+
     def play(self, playback: PlaybackInfo) -> None:
         if self.playback is None or self.playback.sound_id != playback.sound_id:
             self.read_danmaku_enabled = self.read_danmaku_default
@@ -1458,6 +1573,8 @@ class PlaybackFrame(wx.Frame):
         self.subtitle_os_items = set()
         self.subtitle_os_segments = {}
         self.last_spoken_os_segment = None
+        self.subtitle_dialogue_segments = {}
+        self.last_spoken_dialogue = None
         self.playback = playback
         self.load_generation += 1
         self.time_announcement_generation += 1
@@ -1498,6 +1615,9 @@ class PlaybackFrame(wx.Frame):
         os_segments: dict[int, int] = {}
         os_run: tuple[str, str] | None = None
         os_segment = 0
+        dialogue_segments: dict[int, int] = {}
+        dialogue_role = ""
+        dialogue_segment = 0
         for item in sorted(marked, key=lambda entry: entry.time):
             if item.mode != DANMAKU_MODE_SUBTITLE:
                 continue
@@ -1508,6 +1628,15 @@ class PlaybackFrame(wx.Frame):
             # Use only the selected track, including its role/OS boundaries.
             text = item.text.strip()
             explicit_os = SUBTITLE_OS_MARKER.search(text) or self._subtitle_os_role(item)
+            if not explicit_os and is_character_dialogue_subtitle(item):
+                speaker = role or item.role.strip()
+                if speaker != dialogue_role:
+                    dialogue_segment += 1
+                    dialogue_role = speaker
+                dialogue_segments[id(item)] = dialogue_segment
+            else:
+                # A filtered-out speaker/other subtitle still ends a run.
+                dialogue_role = ""
             if explicit_os:
                 # Segment identity follows the subtitle timeline, not which
                 # lines happened to be spoken (ordinary dialogue may be muted).
@@ -1536,6 +1665,8 @@ class PlaybackFrame(wx.Frame):
         self.subtitle_os_items = os_items
         self.subtitle_os_segments = os_segments
         self.last_spoken_os_segment = None
+        self.subtitle_dialogue_segments = dialogue_segments
+        self.last_spoken_dialogue = None
         self.danmaku_canvas.set_items(marked)
 
     def _set_danmaku_failed(self, generation: int, message: str) -> None:
@@ -1579,16 +1710,25 @@ class PlaybackFrame(wx.Frame):
             if key in (ord("D"), ord("d")):
                 self._toggle_danmaku_reader()
                 return
-            if key == wx.WXK_CONTROL_F or (key in (ord("F"), ord("f")) and event.ControlDown()):
+            if (key == wx.WXK_CONTROL_J or (key in (ord("J"), ord("j")) and event.ControlDown())) \
+                    and not (event.ShiftDown() or event.AltDown()):
+                focus = wx.Window.FindFocus()
+                if focus is not None and wx.GetTopLevelParent(focus) is not self:
+                    event.Skip()
+                    return
+                self._edit_subtitle_offset()
+                return
+            if (key == wx.WXK_CONTROL_F or (key in (ord("F"), ord("f")) and event.ControlDown())) \
+                    and not (event.ShiftDown() or event.AltDown()):
                 self._toggle_subtitle_filter_mode()
                 return
-            if key in (ord("F"), ord("f")):
+            if key in (ord("F"), ord("f")) and not (event.ControlDown() or event.AltDown()):
                 self._toggle_subtitle_reader()
                 return
             if key in (ord("T"), ord("t")):
                 self._announce_playback_time()
                 return
-            if key in (ord("J"), ord("j")):
+            if key in (ord("J"), ord("j")) and not (event.ControlDown() or event.AltDown()):
                 self._prompt_jump_to_time()
                 return
             if key in (ord("R"), ord("r")) and not (
@@ -1705,6 +1845,8 @@ class PlaybackFrame(wx.Frame):
         subtitle_id = new_id()
         menu.AppendCheckItem(subtitle_id, "朗读字幕").Check(self.read_subtitle_enabled)
         actions[int(subtitle_id)] = self._toggle_subtitle_reader
+        if self.read_subtitle_enabled:
+            add_action("字幕时间偏移…", self._edit_subtitle_offset)
         filter_id = new_id()
         menu.AppendCheckItem(filter_id, "过滤模式（实验性功能）").Check(self.subtitle_filter_enabled)
         actions[int(filter_id)] = self._toggle_subtitle_filter_mode
@@ -1741,6 +1883,19 @@ class PlaybackFrame(wx.Frame):
         self.danmaku_canvas.seek(seconds)
         self.book_filter_last_role = None
         self.last_spoken_os_segment = None
+        self.last_spoken_dialogue = None
+
+    def _edit_subtitle_offset(self) -> None:
+        if not self.read_subtitle_enabled:
+            return
+        dialog = SubtitleOffsetDialog(self, self.subtitle_offset_seconds)
+        try:
+            if dialog.ShowModal() != wx.ID_OK:
+                return
+            self.subtitle_offset_seconds = dialog.offset_seconds
+            self.danmaku_canvas.set_subtitle_offset(self.subtitle_offset_seconds)
+        finally:
+            dialog.Destroy()
 
     def _toggle_danmaku_reader(self) -> None:
         self.read_danmaku_enabled = not self.read_danmaku_enabled
@@ -1752,6 +1907,7 @@ class PlaybackFrame(wx.Frame):
         self.subtitle_filter_enabled = False
         self.book_filter_last_role = None
         self.last_spoken_os_segment = None
+        self.last_spoken_dialogue = None
         message = "字幕朗读已开启" if self.read_subtitle_enabled else "字幕朗读已关闭"
         self._announce_status(message)
 
@@ -1761,6 +1917,7 @@ class PlaybackFrame(wx.Frame):
         self.subtitle_filter_enabled = not self.subtitle_filter_enabled
         self.book_filter_last_role = None
         self.last_spoken_os_segment = None
+        self.last_spoken_dialogue = None
         message = "字幕过滤模式已开启" if self.subtitle_filter_enabled else "已恢复朗读全部字幕"
         self._announce_status(message)
 
@@ -1773,6 +1930,7 @@ class PlaybackFrame(wx.Frame):
         self.subtitle_filter_enabled = True
         self.book_filter_last_role = None
         self.last_spoken_os_segment = None
+        self.last_spoken_dialogue = None
         saved = self.on_filter_slot_changed(slot) if self.on_filter_slot_changed is not None else True
         message = preset.name
         if saved is False:
@@ -1887,7 +2045,8 @@ class PlaybackFrame(wx.Frame):
                 # the explicit first line already announced its speaker.
                 if item.role.strip() and item.content.strip() == text and explicit_role is None:
                     return ""
-                return role
+                segment = getattr(self, "subtitle_dialogue_segments", {}).get(id(item))
+                return role if (segment, role) != getattr(self, "last_spoken_dialogue", None) else ""
         return text
 
     def _change_playback_rate(self, direction: int) -> None:
@@ -1941,6 +2100,14 @@ class PlaybackFrame(wx.Frame):
                 segment = getattr(self, "subtitle_os_segments", {}).get(id(item))
                 if segment is not None:
                     self.last_spoken_os_segment = segment
+                if not self.subtitle_filter_rules.speaker_transitions_only:
+                    role = self._book_subtitle_context_role(item) or item.role.strip()
+                    if (self.subtitle_filter_rules.dialogue_mode == "role"
+                            and is_character_dialogue_subtitle(item) and text == role):
+                        segment = getattr(self, "subtitle_dialogue_segments", {}).get(id(item))
+                        self.last_spoken_dialogue = (segment, role)
+                    else:
+                        self.last_spoken_dialogue = None
             if self.subtitle_filter_enabled and self.subtitle_filter_rules.speaker_transitions_only:
                 role = (self._book_filter_role(item, self.subtitle_filter_rules)
                         or self.book_filter_context_roles.get(id(item), "")
@@ -2073,6 +2240,7 @@ class PlaybackFrame(wx.Frame):
         self.book_filter_last_role = None
         self.time_announcement_generation += 1
         self.last_spoken_os_segment = None
+        self.last_spoken_dialogue = None
         message = f"已跳转到{self._format_spoken_time(seconds)}"
         if result.get("resume_error"):
             message += "，但未能开始播放，请按空格重试"
@@ -2318,6 +2486,7 @@ class MaoerFrame(wx.Frame):
         self.settings_subtitle_menu_id = wx.NewIdRef()
         self.settings_danmaku_menu_id = wx.NewIdRef()
         self.settings_subtitle_filter_menu_id = wx.NewIdRef()
+        self.settings_subtitle_offset_menu_id = wx.NewIdRef()
         self._playback_mode_id_refs = [wx.NewIdRef() for _ in PLAYBACK_MODES]
         self.playback_mode_menu_ids = {int(item_id): mode for item_id, (mode, _label) in zip(self._playback_mode_id_refs, PLAYBACK_MODES)}
         self.help_hotkeys_menu_id = wx.NewIdRef()
@@ -2388,6 +2557,7 @@ class MaoerFrame(wx.Frame):
         )
         settings_menu.AppendSeparator()
         settings_menu.Append(self.settings_subtitle_filter_menu_id, "字幕过滤规则（实验性功能）(&R)…")
+        settings_menu.Append(self.settings_subtitle_offset_menu_id, "默认字幕偏移…")
         self.output_device_menu = wx.Menu()
         self._populate_output_device_menu()
         settings_menu.AppendSubMenu(self.output_device_menu, "默认播放设备(&O)")
@@ -2441,6 +2611,7 @@ class MaoerFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_setting_changed, id=self.settings_subtitle_menu_id)
         self.Bind(wx.EVT_MENU, self.on_setting_changed, id=self.settings_danmaku_menu_id)
         self.Bind(wx.EVT_MENU, self.on_subtitle_filter_rules, id=self.settings_subtitle_filter_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_default_subtitle_offset, id=self.settings_subtitle_offset_menu_id)
         for item_id in self.playback_mode_menu_ids:
             self.Bind(wx.EVT_MENU, self.on_playback_mode_changed, id=item_id)
         self.Bind(wx.EVT_MENU_OPEN, self._on_output_menu_open)
@@ -2672,6 +2843,22 @@ class MaoerFrame(wx.Frame):
                 self.player_frame.read_danmaku_enabled = enabled
         self.SetStatusText(f"{label}已{'开启' if enabled else '关闭'}，设置已保存")
 
+    def on_default_subtitle_offset(self, _event: wx.CommandEvent) -> None:
+        dialog = SubtitleOffsetDialog(self, self.settings.subtitle_offset_seconds, is_default=True)
+        try:
+            if dialog.ShowModal() != wx.ID_OK:
+                return
+            updated = replace(self.settings, subtitle_offset_seconds=dialog.offset_seconds)
+            try:
+                save_settings(updated)
+            except OSError as exc:
+                self.show_error(f"保存字幕偏移失败：{exc}")
+                return
+            self.settings = updated
+            self.SetStatusText("默认字幕偏移已保存，下次打开播放窗口时生效")
+        finally:
+            dialog.Destroy()
+
     def on_playback_mode_changed(self, event: wx.CommandEvent) -> None:
         mode = self.playback_mode_menu_ids.get(event.GetId())
         if mode is not None:
@@ -2812,6 +2999,7 @@ class MaoerFrame(wx.Frame):
             self.player_frame.subtitle_filter_rules = presets[slot].rules
             self.player_frame.book_filter_last_role = None
             self.player_frame.last_spoken_os_segment = None
+            self.player_frame.last_spoken_dialogue = None
         self.SetStatusText(f"过滤方案{(slot + 1) % 10}已保存")
 
     def _on_filter_slot_changed(self, slot: int) -> bool:
@@ -4361,6 +4549,7 @@ class MaoerFrame(wx.Frame):
                 self._on_playback_finished,
                 read_danmaku_default=self.settings.read_danmaku,
                 read_subtitle_default=self.settings.read_subtitle,
+                subtitle_offset_seconds=self.settings.subtitle_offset_seconds,
                 subtitle_filter_presets=self.settings.subtitle_filter_presets,
                 subtitle_filter_slot=self.settings.active_subtitle_filter_slot,
                 on_filter_slot_changed=self._on_filter_slot_changed,

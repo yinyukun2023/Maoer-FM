@@ -952,6 +952,29 @@ CONTROL_SCRIPT = r"""
       return result({ok: false, error: "no-player"});
     }
 
+    if (action === "prepare_resume") {
+      // The recovery hold blocks play(), including lazy initialization. Load
+      // without autoplay so metadata/buffering can finish before restoring time.
+      var loadingSound = demo();
+      var loadingMedia = currentMedia();
+      if (window.__maoerResumeHold) {
+        if (loadingSound && !loadingSound.__maoerResumeLoadRequested &&
+            (!loadingSound.readyState || loadingSound.readyState === 2) &&
+            typeof loadingSound.load === "function") {
+          loadingSound.__maoerResumeLoadRequested = true;
+          loadingSound.load({autoPlay: false});
+        }
+        if (loadingMedia && !loadingMedia.__maoerResumeLoadRequested &&
+            (loadingMedia.readyState === 0 || loadingMedia.error) &&
+            typeof loadingMedia.load === "function") {
+          loadingMedia.__maoerResumeLoadRequested = true;
+          loadingMedia.preload = "auto";
+          loadingMedia.load();
+        }
+      }
+      return result({ok: !!(loadingSound || loadingMedia)});
+    }
+
     if (action === "autoplay" || action === "play") {
       return autoplay();
     }
@@ -1212,6 +1235,11 @@ class HiddenBrowserPlayer:
                     return
                 if status and status.get("ok"):
                     position = self._float_value(status.get("position"))
+                    if position is not None and position < request.position - 0.25:
+                        # A disposed player must not start audibly at 00:00
+                        # while we wait for the normal progress check to fail.
+                        self._reload_for_resume(request)
+                        return
                     if position is not None and position > 0:
                         request.position = position
                 self._request_pause_resume(request)
@@ -1293,12 +1321,16 @@ class HiddenBrowserPlayer:
                 if not self._resume_is_current(request):
                     return
                 if not result or not result.get("ok"):
-                    self._fail_pause_resume(request)
+                    if attempts:
+                        wx.CallLater(300, self._restore_paused_position, request, attempts - 1)
+                    else:
+                        self._fail_pause_resume(request)
                     return
-                self._confirm_restored_position(request, 10)
+                self._confirm_restored_position(request, attempts)
 
             self._run_control_callback("seek_to", request.position, sought)
 
+        self._run_control("prepare_resume")
         self._run_control_callback("status", None, ready)
 
     def _confirm_restored_position(self, request: _PauseResume, attempts: int) -> None:
@@ -1314,7 +1346,9 @@ class HiddenBrowserPlayer:
                 self._apply_volume(self._volume)
                 self._request_pause_resume(request)
             elif attempts:
-                wx.CallLater(150, self._confirm_restored_position, request, attempts - 1)
+                # setPosition can report success before the newly loaded media
+                # accepts seeks. Reissue the seek, not only the status query.
+                wx.CallLater(300, self._restore_paused_position, request, attempts - 1)
             else:
                 self._fail_pause_resume(request)
 
@@ -1324,6 +1358,7 @@ class HiddenBrowserPlayer:
         if self._resume_is_current(request):
             self._run_control("pause_only")
             self._paused = True
+            self._last_position = request.position
             self._resume_request = None
 
     def is_paused(self) -> bool:
@@ -1347,6 +1382,10 @@ class HiddenBrowserPlayer:
                 position = self._float_value(status.get("position"))
                 if position is not None and (position > 0 or not self._paused or self._last_position == 0):
                     self._last_position = position
+                elif self._paused and position == 0 and status.get("paused"):
+                    # Retaining it internally is not enough: the canvas/time
+                    # query must not see a disposed backend's temporary zero.
+                    status = {**status, "position": self._last_position, "paused": True, "ended": False}
             callback(status)
 
         self._run_control_callback("status", None, done)
@@ -1588,7 +1627,12 @@ class HiddenBrowserPlayer:
             self._page_loaded = True
 
     def _on_error(self, event: wx.Event) -> None:
-        self._current = None
+        if self._resume_request is not None:
+            # A failed recovery navigation must still allow Space to retry
+            # this episode, using the same saved position.
+            self._fail_pause_resume(self._resume_request)
+        else:
+            self._current = None
         self._page_loaded = False
         event.Skip()
 
