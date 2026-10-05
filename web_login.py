@@ -14,6 +14,8 @@ from comtypes import COMObject, COMMETHOD, GUID, HRESULT, IUnknown
 import wx
 import wx.html2 as html2
 
+from ui_dialogs import message_box
+
 from account_store import normalize_cookie
 from app_paths import webview2_profile_dir
 from login_dialog import CaptchaAudioPlayer, LOGIN_PROVIDERS, LoginDialog, run_dialog_task, validated_account
@@ -414,7 +416,7 @@ class BrowserLoginDialog(wx.Dialog):
         self.check_button.Enable()
         self.announcer.announce("请在官方网页完成登录，再按“完成登录”。")
         if manual and exc:
-            wx.MessageBox("尚未确认登录成功，请完成官网验证或检查网络后重试。",
+            message_box("尚未确认登录成功，请完成官网验证或检查网络后重试。",
                           "登录未完成", wx.OK | wx.ICON_INFORMATION, self)
             self.webview.SetFocus()
 
@@ -620,7 +622,7 @@ class NativePasswordLoginDialog(BrowserLoginDialog):
             return
         answer = self.voice_box.GetValue().strip()
         if len(answer) != self._answer_length or not answer.isascii() or not answer.isdigit():
-            wx.MessageBox(f"请输入 {self._answer_length} 位语音验证码", "验证码", wx.OK | wx.ICON_INFORMATION, self)
+            message_box(f"请输入 {self._answer_length} 位语音验证码", "验证码", wx.OK | wx.ICON_INFORMATION, self)
             self.voice_box.SetFocus()
             return
         self._pending_answer = answer

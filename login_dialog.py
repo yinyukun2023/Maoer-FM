@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING
 import requests
 import wx
 
+from ui_dialogs import message_box
+
 from account_store import LoginCredentials, SavedAccount, normalize_cookie, unprotect_login
 from maoer_api import AccountInfo, ApiError, LoginCaptcha, MaoerApi, USER_AGENT
 from uia_live_region import ScreenReaderAnnouncer, set_native_accessible_name
@@ -99,7 +101,7 @@ class CaptchaAudioPlayer:
 
     def _report_error(self, exc: Exception) -> None:
         if not self._closed and self.parent and not self.parent.IsBeingDeleted():
-            wx.MessageBox(f"验证码播放失败：{exc}", "播放失败", wx.OK | wx.ICON_ERROR, self.parent)
+            message_box(f"验证码播放失败：{exc}", "播放失败", wx.OK | wx.ICON_ERROR, self.parent)
 
     def _download_audio(self, audio_url: str) -> Path:
         if self._cached_url == audio_url and self._audio_file and self._audio_file.exists():
@@ -232,7 +234,7 @@ class VoiceCaptchaDialog(wx.Dialog):
             return
         voice_answer = self.voice_box.GetValue().strip()
         if not voice_answer:
-            wx.MessageBox("请输入语音验证码", "错误", wx.OK | wx.ICON_ERROR, self)
+            message_box("请输入语音验证码", "错误", wx.OK | wx.ICON_ERROR, self)
             self.voice_box.SetFocus()
             return
 
@@ -247,7 +249,7 @@ class VoiceCaptchaDialog(wx.Dialog):
 
         def failed(exc: Exception) -> None:
             self._set_busy(False)
-            wx.MessageBox(str(exc) or type(exc).__name__, "错误", wx.OK | wx.ICON_ERROR, self)
+            message_box(str(exc) or type(exc).__name__, "错误", wx.OK | wx.ICON_ERROR, self)
             self.voice_box.SetFocus()
 
         self._run_async(work, done, failed)
@@ -399,6 +401,9 @@ class LoginDialog(wx.Dialog):
             current = self.password_region if password else self.sms_region
             dialog = wx.SingleChoiceDialog(self, "选择国家/地区", "国家/地区", [label for _, label in regions])
             try:
+                dialog.FindWindow(wx.ID_OK).SetLabel("确定")
+                dialog.FindWindow(wx.ID_CANCEL).SetLabel("取消")
+                dialog.Layout()
                 dialog.SetSelection(next((i for i, (code, _) in enumerate(regions) if code == current), 0))
                 if dialog.ShowModal() == wx.ID_OK:
                     code, label = regions[dialog.GetSelection()]
@@ -593,7 +598,7 @@ class LoginDialog(wx.Dialog):
         self.login_button.SetFocus()
 
     def _show_error(self, message: str) -> None:
-        wx.MessageBox(message or "操作失败", "登录失败", wx.OK | wx.ICON_ERROR, self)
+        message_box(message or "操作失败", "登录失败", wx.OK | wx.ICON_ERROR, self)
 
 
 class CookieLoginDialog(wx.Dialog):
@@ -637,9 +642,11 @@ class CookieLoginDialog(wx.Dialog):
             return
         self.api.set_cookie(cookie)
         self._busy = True
-        self.ok_button.Disable()
+        # Keep a focused, named control while waiting instead of moving focus to Cancel.
+        # _busy prevents a repeated Enter/click from submitting another request.
+        self.ok_button.SetLabel("正在登录")
+        self.ok_button.SetFocus()
         self.cookie_box.Disable()
-        self.SetTitle("正在验证 Cookie…")
         run_dialog_task(self, lambda: validated_account(self.api), self._ready, self._failed)
 
     def _ready(self, account: AccountInfo) -> None:
@@ -649,10 +656,11 @@ class CookieLoginDialog(wx.Dialog):
 
     def _failed(self, exc: Exception) -> None:
         self._busy = False
+        self.ok_button.SetLabel("确定")
         self.ok_button.Enable()
         self.cookie_box.Enable()
         self.SetTitle("Cookie 登录")
-        wx.MessageBox(str(exc) or "Cookie 验证失败", "登录失败", wx.OK | wx.ICON_ERROR, self)
+        message_box(str(exc) or "Cookie 验证失败", "登录失败", wx.OK | wx.ICON_ERROR, self)
         self.cookie_box.SetFocus()
 
 
@@ -679,14 +687,22 @@ class AccountManagerDialog(wx.Dialog):
         self.edit_button = wx.Button(panel, label="编辑(&E)")
         self.delete_button = wx.Button(panel, label="删除(&D)")
         self.login_button = wx.Button(panel, label="登录所选账号")
-        self.logout_button = wx.Button(panel, label="退出当前账号(&O)")
         self.copy_cookie_button = wx.Button(panel, label="复制 Cookie(&C)")
+        self.move_up_button = wx.Button(panel, label="上移(&U)")
+        self.move_down_button = wx.Button(panel, label="下移(&J)")
+        self.move_first_button = wx.Button(panel, label="移至最前(&T)")
+        self.move_last_button = wx.Button(panel, label="移至末尾(&G)")
+        self.logout_button = wx.Button(panel, label="退出当前登录账号(&O)")
         self.close_button = wx.Button(panel, wx.ID_CANCEL, "关闭(&X)")
         for button, handler in (
             (self.add_button, self.on_add), (self.edit_button, self.on_edit),
             (self.delete_button, self.on_delete), (self.login_button, self.on_login),
-            (self.logout_button, self.on_logout),
             (self.copy_cookie_button, self.on_copy_cookie),
+            (self.move_up_button, lambda event: self._move_selected("up")),
+            (self.move_down_button, lambda event: self._move_selected("down")),
+            (self.move_first_button, lambda event: self._move_selected("first")),
+            (self.move_last_button, lambda event: self._move_selected("last")),
+            (self.logout_button, self.on_logout),
         ):
             button.Bind(wx.EVT_BUTTON, handler)
             buttons.Add(button, 0, wx.RIGHT | wx.BOTTOM, 6)
@@ -698,6 +714,7 @@ class AccountManagerDialog(wx.Dialog):
         self.SetSizer(outer)
         self.SetMinSize((540, 320))
         self.list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_login)
+        self.list.Bind(wx.EVT_KEY_DOWN, self.on_list_key_down)
         self.list.Bind(wx.EVT_LIST_ITEM_SELECTED, lambda event: self._update_buttons())
         self.list.Bind(wx.EVT_LIST_ITEM_DESELECTED, lambda event: self._update_buttons())
         self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
@@ -716,7 +733,7 @@ class AccountManagerDialog(wx.Dialog):
         active_id = self.owner.account_state.active_user_id if self.owner.account_logged_in else None
         self.list.DeleteAllItems()
         for index, account in enumerate(self._rows):
-            label = account.nickname + ("（当前登录）" if account.user_id == active_id else "")
+            label = account.nickname + ("（当前登录账号）" if account.user_id == active_id else "")
             self.list.InsertItem(index, label)
             self.list.SetItem(index, 1, account.note)
             self.list.SetItem(index, 2, str(account.user_id))
@@ -725,7 +742,7 @@ class AccountManagerDialog(wx.Dialog):
             self.list.Select(index)
             self.list.Focus(index)
             self.list.EnsureVisible(index)
-        status = message or ("当前未登录" if active_id is None else "已标记当前登录账号")
+        status = message or ("当前未登录" if active_id is None else f"共 {len(self._rows)} 个已保存账号")
         self.status.SetLabel(status)
         if message:
             self.announcer.announce(message)
@@ -738,12 +755,67 @@ class AccountManagerDialog(wx.Dialog):
         self.delete_button.Enable(not self._busy and account is not None)
         self.login_button.Enable(not self._busy and account is not None
                                  and account.user_id != self.owner.account_state.active_user_id)
-        self.logout_button.Enable(not self._busy and self.owner.account_logged_in)
         self.copy_cookie_button.Enable(not self._busy and account is not None)
+        index = self.list.GetFirstSelected()
+        can_move_up = not self._busy and account is not None and index > 0
+        can_move_down = not self._busy and account is not None and index < len(self._rows) - 1
+        self.move_up_button.Enable(can_move_up)
+        self.move_first_button.Enable(can_move_up)
+        self.move_down_button.Enable(can_move_down)
+        self.move_last_button.Enable(can_move_down)
+        can_logout = (account is not None and self.owner.account_logged_in
+                      and account.user_id == self.owner.account_state.active_user_id)
+        if self.logout_button.IsShown() != can_logout:
+            self.logout_button.Show(can_logout)
+            self.logout_button.GetParent().Layout()
+            self.Layout()
+        self.logout_button.Enable(can_logout and not self._busy)
+
+    def on_list_key_down(self, event: wx.KeyEvent) -> None:
+        key, modifiers = event.GetKeyCode(), event.GetModifiers()
+        if key in (wx.WXK_DELETE, wx.WXK_NUMPAD_DELETE) and not modifiers:
+            self.on_delete(event)
+            return
+        direction = None
+        if not modifiers:
+            direction = {
+                wx.WXK_PAGEUP: "up", wx.WXK_NUMPAD_PAGEUP: "up",
+                wx.WXK_PAGEDOWN: "down", wx.WXK_NUMPAD_PAGEDOWN: "down",
+            }.get(key)
+        elif modifiers == wx.MOD_CONTROL:
+            direction = {
+                wx.WXK_HOME: "first", wx.WXK_NUMPAD_HOME: "first",
+                wx.WXK_END: "last", wx.WXK_NUMPAD_END: "last",
+            }.get(key)
+        if direction is not None:
+            self._move_selected(direction)
+            return
+        event.Skip()
+
+    def _move_selected(self, direction: str) -> None:
+        account = self.selected()
+        if self._busy or account is None:
+            return
+        accounts = self.owner.account_state.accounts
+        index = next((i for i, saved in enumerate(accounts) if saved.user_id == account.user_id), None)
+        if index is None:
+            return
+        position, message = {
+            "up": (index - 1, "已上移"),
+            "down": (index + 1, "已下移"),
+            "first": (0, "已移至最前"),
+            "last": (len(accounts) - 1, "已移至末尾"),
+        }[direction]
+        if self.owner._move_saved_account(account, position, self):
+            self.refresh(account.user_id, f"{message}，第 {position + 1} 项，共 {len(accounts)} 项")
+        self.list.SetFocus()
 
     def on_add(self, _event: wx.Event) -> None:
         choices = wx.SingleChoiceDialog(self, "选择登录方式", "新增账号", ["账号登录", "Cookie 登录"])
         try:
+            choices.FindWindow(wx.ID_OK).SetLabel("确定")
+            choices.FindWindow(wx.ID_CANCEL).SetLabel("取消")
+            choices.Layout()
             if choices.ShowModal() == wx.ID_OK:
                 if self.owner._show_account_login(self, cookie_login=choices.GetSelection() == 1):
                     self.EndModal(wx.ID_OK)
@@ -762,12 +834,12 @@ class AccountManagerDialog(wx.Dialog):
 
     def on_delete(self, _event: wx.Event) -> None:
         account = self.selected()
-        if account is None:
+        if self._busy or account is None:
             return
         message = f"删除已保存账号“{account.nickname}”？此操作只移除本机保存的登录信息。"
         if account.user_id == self.owner.account_state.active_user_id:
             message += "\n当前账号将同时退出登录。"
-        if wx.MessageBox(message, "删除账号", wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION, self) == wx.YES:
+        if message_box(message, "删除账号", wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION, self) == wx.YES:
             if self.owner._remove_saved_account(account, self):
                 self.refresh(message="账号已删除")
         self.list.SetFocus()
@@ -799,7 +871,7 @@ class AccountManagerDialog(wx.Dialog):
             self._busy = False
             self._update_buttons()
             self.status.SetLabel("登录失败，可使用“编辑”重新填写账号密码并登录")
-            wx.MessageBox(str(exc) or "登录失败", "登录失败", wx.OK | wx.ICON_ERROR, self)
+            message_box(str(exc) or "登录失败", "登录失败", wx.OK | wx.ICON_ERROR, self)
             self.list.SetFocus()
 
         run_dialog_task(self, lambda: validated_account(api), ready, failed)
@@ -809,7 +881,7 @@ class AccountManagerDialog(wx.Dialog):
         if self._busy or account is None:
             return
         if not wx.TheClipboard.Open():
-            wx.MessageBox("剪贴板暂时不可用，请重试。", "复制失败", wx.OK | wx.ICON_ERROR, self)
+            message_box("剪贴板暂时不可用，请重试。", "复制失败", wx.OK | wx.ICON_ERROR, self)
             return
         try:
             copied = wx.TheClipboard.SetData(wx.TextDataObject(account.cookie))
@@ -821,11 +893,15 @@ class AccountManagerDialog(wx.Dialog):
             self.status.SetLabel("Cookie 已复制")
             self.announcer.announce("Cookie 已复制")
         else:
-            wx.MessageBox("无法复制 Cookie，请重试。", "复制失败", wx.OK | wx.ICON_ERROR, self)
+            message_box("无法复制 Cookie，请重试。", "复制失败", wx.OK | wx.ICON_ERROR, self)
 
-    def on_logout(self, _event: wx.Event) -> None:
-        if self.owner.on_account_logout(_event):
-            self.refresh(message="已退出当前账号，保存的账号仍可使用")
+    def on_logout(self, event: wx.Event) -> None:
+        account = self.selected()
+        if (self._busy or account is None or not self.owner.account_logged_in
+                or account.user_id != self.owner.account_state.active_user_id):
+            return
+        if self.owner.on_account_logout(event):
+            self.refresh(account.user_id, "已退出登录，保存的账号仍可使用")
             self.list.SetFocus()
 
     def _on_destroy(self, event: wx.WindowDestroyEvent) -> None:

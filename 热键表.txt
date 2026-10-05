@@ -8,14 +8,24 @@ Alt+Shift+Enter：在网页中打开选中的音频或广播剧
 Backspace：返回上一级；搜索结果页返回首页
 菜单键 或 Shift+F10：打开选中项目的内容菜单
 
+账号菜单（Alt+A 打开）
+L：展开“登录账号”，可选择账号登录或 Cookie 登录（仅未登录时显示）
+O：退出当前登录账号，保留已保存账号（仅登录后显示）
+
 账号管理
 Alt+N：新增账号
 Alt+E：编辑选中的账号
-Alt+D：删除选中的账号（需确认）
-Alt+O：退出当前账号
+Delete 或 Alt+D：删除选中的账号（需确认；Delete 仅在账号列表中生效）
+PageUp 或 Alt+U：选中账号上移一项
+PageDown 或 Alt+J：选中账号下移一项
+Ctrl+Home 或 Alt+T：选中账号移至最前
+Ctrl+End 或 Alt+G：选中账号移至末尾
+Alt+O：退出当前登录账号（仅选中当前登录账号时显示按钮并生效）
 Alt+C：复制选中账号的 Cookie
 Alt+X 或 Esc：关闭账号管理
 Enter：在账号列表中登录所选账号，成功后返回主界面
+移动后焦点跟随账号，顺序自动保存，不切换当前登录账号。
+PageUp、PageDown、Ctrl+Home、Ctrl+End 仅在账号列表中用于排序，不影响播放界面的上一集、下一集快捷键。
 
 评论窗口
 Enter：打开选中评论的回复

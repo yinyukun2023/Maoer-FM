@@ -175,6 +175,17 @@ class AccountState:
             None if self.active_user_id == user_id else self.active_user_id,
         )
 
+    def moved(self, user_id: int, position: int) -> AccountState:
+        index = next((i for i, account in enumerate(self.accounts) if account.user_id == user_id), None)
+        if index is None:
+            return self
+        position = max(0, min(position, len(self.accounts) - 1))
+        if index == position:
+            return self
+        accounts = list(self.accounts)
+        accounts.insert(position, accounts.pop(index))
+        return AccountState(tuple(accounts), self.active_user_id)
+
 
 def load_accounts() -> AccountState | None:
     """A missing file permits legacy migration; an empty saved state means logged out."""

@@ -291,7 +291,7 @@ class SubtitleOffsetTests(unittest.TestCase):
         try:
             for value in ("", "abc", "nan", "inf", "-3601", "3601", "1:20", "--0.5", "+-0.5"):
                 with patch.object(dialog.offset, "GetTextValue", return_value=value), \
-                        patch.object(dialog, "EndModal") as end, patch("app.wx.MessageBox") as message:
+                        patch.object(dialog, "EndModal") as end, patch("app.message_box") as message:
                     dialog._accept(Mock())
                 end.assert_not_called()
                 message.assert_called_once()

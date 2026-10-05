@@ -13,6 +13,8 @@ from typing import Callable
 import requests
 import wx
 
+from ui_dialogs import message_box, message_dialog
+
 from app_paths import clear_webview2_profile
 from account_store import (
     AccountState, LoginCredentials, SavedAccount, load_accounts, normalize_cookie,
@@ -784,7 +786,7 @@ class CommentsFrame(wx.Frame):
             return
         self.loading = False
         self.SetStatusText("评论加载失败")
-        wx.MessageBox(message or "评论加载失败", "错误", wx.OK | wx.ICON_ERROR, self)
+        message_box(message or "评论加载失败", "错误", wx.OK | wx.ICON_ERROR, self)
 
     def _replace_list_items(self, items: list[CommentItem]) -> None:
         self.comment_list.Freeze()
@@ -1294,7 +1296,7 @@ class SubtitleOffsetDialog(wx.Dialog):
             if not math.isfinite(value) or not -MAX_SUBTITLE_OFFSET_SECONDS <= value <= MAX_SUBTITLE_OFFSET_SECONDS:
                 raise ValueError
         except ValueError:
-            wx.MessageBox("请输入 -3600 至 3600 之间的秒数，负数提前，正数延后。这里不是 J 的分.秒格式。",
+            message_box("请输入 -3600 至 3600 之间的秒数，负数提前，正数延后。这里不是 J 的分.秒格式。",
                           "字幕时间偏移", wx.OK | wx.ICON_WARNING, self)
             self.offset.SetFocus()
             return
@@ -1321,6 +1323,7 @@ class SubtitleJumpDialog(wx.Dialog):
         root.Add(self.subtitle_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
         root.Add(self.CreateButtonSizer(wx.OK | wx.CANCEL), 0, wx.ALL | wx.ALIGN_RIGHT, 10)
         self.FindWindow(wx.ID_OK).SetLabel("跳转")
+        self.FindWindow(wx.ID_CANCEL).SetLabel("取消")
         self.FindWindow(wx.ID_OK).Enable(bool(self.items))
         self.SetSizer(root)
         if self.items:
@@ -1375,6 +1378,7 @@ class JumpTimeDialog(wx.Dialog):
         root.Add(self.subtitle_button, 0, wx.ALL, 12)
         root.Add(self.CreateButtonSizer(wx.OK | wx.CANCEL), 0, wx.ALL | wx.ALIGN_RIGHT, 12)
         self.FindWindow(wx.ID_OK).SetLabel("跳转")
+        self.FindWindow(wx.ID_CANCEL).SetLabel("取消")
         self.SetSizerAndFit(root)
         self.SetMinSize(self.GetSize())
         self.time_input.SetFocus()
@@ -1426,7 +1430,7 @@ class JumpTimeDialog(wx.Dialog):
         try:
             seconds = PlaybackFrame._parse_jump_time(self.time_input.GetValue())
         except ValueError:
-            wx.MessageBox("请输入分.秒格式的时间", "时间格式错误", wx.OK | wx.ICON_WARNING, self)
+            message_box("请输入分.秒格式的时间", "时间格式错误", wx.OK | wx.ICON_WARNING, self)
             self.time_input.SetFocus()
             return
         if self.total_seconds is not None and seconds >= self.total_seconds:
@@ -1439,7 +1443,7 @@ class JumpTimeDialog(wx.Dialog):
         dialog = SubtitleJumpDialog(self, self.subtitle_items(), self.current_seconds)
         try:
             if not dialog.items:
-                wx.MessageBox("当前暂无字幕可供跳转。如果字幕正在加载，请稍后重试。",
+                message_box("当前暂无字幕可供跳转。如果字幕正在加载，请稍后重试。",
                               "按字幕跳转", wx.OK | wx.ICON_INFORMATION, self)
                 return
             if dialog.ShowModal() != wx.ID_OK:
@@ -1772,7 +1776,7 @@ class PlaybackFrame(wx.Frame):
                 return
         except PlayerUnavailable as exc:
             self._set_parent_status("操作失败")
-            wx.MessageBox(str(exc), "错误", wx.OK | wx.ICON_ERROR, self)
+            message_box(str(exc), "错误", wx.OK | wx.ICON_ERROR, self)
             return
         event.Skip()
 
@@ -1876,7 +1880,7 @@ class PlaybackFrame(wx.Frame):
                 action()
             except PlayerUnavailable as exc:
                 self._set_parent_status("操作失败")
-                wx.MessageBox(str(exc), "错误", wx.OK | wx.ICON_ERROR, self)
+                message_box(str(exc), "错误", wx.OK | wx.ICON_ERROR, self)
 
     def _request_track_change(self, direction: int) -> None:
         if self.playback is not None and self.on_change_track is not None:
@@ -2219,7 +2223,7 @@ class PlaybackFrame(wx.Frame):
         if duration and seconds >= duration:
             message = self._jump_range_message(duration)
             self._set_parent_status(message)
-            wx.MessageBox(message, "输入超出范围", wx.OK | wx.ICON_WARNING, self)
+            message_box(message, "输入超出范围", wx.OK | wx.ICON_WARNING, self)
             return
         self.player.seek_to(
             seconds,
@@ -2519,23 +2523,22 @@ class MaoerFrame(wx.Frame):
         account_menu = wx.Menu()
         if self.account_state.accounts or self.account_logged_in:
             account_menu.Append(self.account_manage_menu_id, "账号管理(&M)…")
-        else:
+        if not self.account_logged_in:
             login_menu = wx.Menu()
             login_menu.Append(self.account_login_menu_id, "账号登录(&A)…")
             login_menu.Append(self.account_cookie_login_menu_id, "Cookie 登录(&C)…")
-            account_menu.AppendSubMenu(login_menu, "登录(&L)")
-        account_menu.AppendSeparator()
+            account_menu.AppendSubMenu(login_menu, "登录账号(&L)")
         if self.account_logged_in:
+            account_menu.AppendSeparator()
             account_menu.Append(self.account_info_menu_id, "我的信息(&I)")
             account_menu.Append(self.account_favorites_menu_id, "我的收藏(&F)")
             account_menu.Append(self.account_subscriptions_menu_id, "我的追剧(&S)")
             account_menu.Append(self.account_history_menu_id, "我的播放历史(&H)")
             account_menu.Append(self.account_following_menu_id, "我的关注(&G)")
             account_menu.Append(self.account_purchased_dramas_menu_id, "已购广播剧(&P)")
-        else:
-            account_menu.Append(self.account_history_menu_id, "我的播放历史(&H)")
-            account_menu.Append(self.account_following_menu_id, "我的关注(&G)")
         account_menu.AppendSeparator()
+        if self.account_logged_in:
+            account_menu.Append(self.account_logout_menu_id, "退出当前登录账号(&O)")
         account_menu.Append(self.account_exit_menu_id, "退出程序(&Q)")
         menu_bar.Append(account_menu, "账号(&A)")
 
@@ -2740,6 +2743,8 @@ class MaoerFrame(wx.Frame):
             selectors.append((choice, options))
         buttons = dialog.CreateSeparatedButtonSizer(wx.OK | wx.CANCEL)
         if buttons is not None:
+            dialog.FindWindow(wx.ID_OK).SetLabel("确定")
+            dialog.FindWindow(wx.ID_CANCEL).SetLabel("取消")
             root.Add(buttons, 0, wx.EXPAND | wx.ALL, 12)
         dialog.SetSizerAndFit(root)
         dialog.SetMinSize((420, dialog.GetSize().height))
@@ -3042,7 +3047,7 @@ class MaoerFrame(wx.Frame):
         self._open_text_file("更新日志", UPDATE_TEXT_NAME)
 
     def on_help_about(self, _event: wx.Event) -> None:
-        wx.MessageBox(
+        message_box(
             f"{APP_TITLE}版本：{APP_VERSION}\n作者：{APP_AUTHOR}",
             "关于本程序",
             wx.OK | wx.ICON_INFORMATION,
@@ -3053,7 +3058,7 @@ class MaoerFrame(wx.Frame):
         directory = Path(__file__).resolve().parent if bundled else program_dir()
         path = directory / filename
         if not path.exists():
-            wx.MessageBox(f"未找到文件：{filename}", title, wx.OK | wx.ICON_ERROR, self)
+            message_box(f"未找到文件：{filename}", title, wx.OK | wx.ICON_ERROR, self)
             return
         try:
             if os.name == "nt":
@@ -3061,7 +3066,7 @@ class MaoerFrame(wx.Frame):
             elif not wx.LaunchDefaultApplication(str(path)):
                 raise OSError("系统没有可用的默认打开方式")
         except OSError:
-            wx.MessageBox(f"无法打开文件：{filename}", title, wx.OK | wx.ICON_ERROR, self)
+            message_box(f"无法打开文件：{filename}", title, wx.OK | wx.ICON_ERROR, self)
 
     def on_account_login(self, _event: wx.Event) -> None:
         self._show_account_login(self)
@@ -3094,7 +3099,7 @@ class MaoerFrame(wx.Frame):
                 raise ValueError(self._account_store_error)
             save_accounts(state)
         except (OSError, ValueError) as exc:
-            wx.MessageBox(f"无法保存账号：{exc}", "保存失败", wx.OK | wx.ICON_ERROR, parent or self)
+            message_box(f"无法保存账号：{exc}", "保存失败", wx.OK | wx.ICON_ERROR, parent or self)
             return False
         self.account_state = state
         # The new file is authoritative, including an explicitly logged-out state.
@@ -3127,7 +3132,7 @@ class MaoerFrame(wx.Frame):
             entry = SavedAccount(account.user_id, account.nickname, normalize_cookie(api.cookie_header),
                                  note if note is not None else (previous.note if previous else ""), credentials)
         except ValueError as exc:
-            wx.MessageBox(str(exc), "保存失败", wx.OK | wx.ICON_ERROR, parent or self)
+            message_box(str(exc), "保存失败", wx.OK | wx.ICON_ERROR, parent or self)
             return False
         if not self._persist_accounts(self.account_state.updated(entry, activate=activate), parent):
             return False
@@ -3151,6 +3156,12 @@ class MaoerFrame(wx.Frame):
         finally:
             dialog.Destroy()
         return False
+
+    def _move_saved_account(self, saved: SavedAccount, position: int, parent: wx.Window) -> bool:
+        state = self.account_state.moved(saved.user_id, position)
+        if state is self.account_state:
+            return False
+        return self._persist_accounts(state, parent)
 
     def _remove_saved_account(self, saved: SavedAccount, parent: wx.Window) -> bool:
         was_active = saved.user_id == self.account_state.active_user_id
@@ -3282,7 +3293,7 @@ class MaoerFrame(wx.Frame):
                 parent = None
         self.SetStatusText(message)
         message_parent = parent or self
-        wx.MessageBox(message, title, wx.OK | wx.ICON_INFORMATION, message_parent)
+        message_box(message, title, wx.OK | wx.ICON_INFORMATION, message_parent)
         try:
             message_parent.Raise()
             if isinstance(message_parent, AccountInfoDialog):
@@ -3316,7 +3327,7 @@ class MaoerFrame(wx.Frame):
     def on_account_history(self, _event: wx.Event) -> None:
         cookie = self.api.cookie_header
         if not cookie:
-            wx.MessageBox("请先登录账号", "提示", wx.OK | wx.ICON_INFORMATION, self)
+            message_box("请先登录账号", "提示", wx.OK | wx.ICON_INFORMATION, self)
             return
         previous_state = self._account_list_previous_state()
 
@@ -3337,7 +3348,7 @@ class MaoerFrame(wx.Frame):
     def on_account_following(self, _event: wx.Event) -> None:
         cookie = self.api.cookie_header
         if not cookie:
-            wx.MessageBox("请先登录账号", "提示", wx.OK | wx.ICON_INFORMATION, self)
+            message_box("请先登录账号", "提示", wx.OK | wx.ICON_INFORMATION, self)
             return
         previous_state = self._account_list_previous_state()
 
@@ -3720,7 +3731,7 @@ class MaoerFrame(wx.Frame):
         if choice != int(action_id):
             return
         if not cookie:
-            wx.MessageBox("请先登录账号", "提示", wx.OK | wx.ICON_INFORMATION, self)
+            message_box("请先登录账号", "提示", wx.OK | wx.ICON_INFORMATION, self)
             return
         follow = not profile.followed
         self._run_background(
@@ -3754,7 +3765,7 @@ class MaoerFrame(wx.Frame):
                     state.items = [item for item in state.items if item.id != profile.user_id]
                     state.selected_index = min(state.selected_index, len(state.items) - 1)
         self.SetStatusText(message)
-        wx.MessageBox(message, "提示", wx.OK | wx.ICON_INFORMATION, self)
+        message_box(message, "提示", wx.OK | wx.ICON_INFORMATION, self)
 
     def _display_item_menu(self, position: wx.Point, item: MediaItem, followed: bool | None) -> None:
         if item.kind == "category":
@@ -4313,7 +4324,7 @@ class MaoerFrame(wx.Frame):
         return self._confirm_purchase(message, "购买单集")
 
     def _confirm_purchase(self, message: str, title: str) -> bool:
-        dialog = wx.MessageDialog(
+        dialog = message_dialog(
             self.player_frame if getattr(self, "player_frame", None) is not None else self,
             message,
             title,
@@ -4336,7 +4347,7 @@ class MaoerFrame(wx.Frame):
     ) -> None:
         self._mark_drama_purchased_in_items(drama_id)
         message = "本剧已购买" if already_owned else "购买成功，已解锁本剧"
-        wx.MessageBox(message, "购买成功", wx.OK | wx.ICON_INFORMATION, self)
+        message_box(message, "购买成功", wx.OK | wx.ICON_INFORMATION, self)
         if play_after is not None:
             play_after.need_pay = False
             if on_play is not None:
@@ -4351,7 +4362,7 @@ class MaoerFrame(wx.Frame):
     ) -> None:
         item.need_pay = False
         self._mark_sound_purchased_in_items(item.id)
-        wx.MessageBox("购买成功，正在播放。", "购买成功", wx.OK | wx.ICON_INFORMATION, self)
+        message_box("购买成功，正在播放。", "购买成功", wx.OK | wx.ICON_INFORMATION, self)
         self.SetStatusText("购买成功，正在播放")
         if on_play is not None:
             on_play()
@@ -4369,7 +4380,7 @@ class MaoerFrame(wx.Frame):
             text = "购买失败。"
         else:
             text = f"购买失败：{text}"
-        wx.MessageBox(text, "购买失败", wx.OK | wx.ICON_INFORMATION, self)
+        message_box(text, "购买失败", wx.OK | wx.ICON_INFORMATION, self)
 
     def _mark_drama_purchased_in_items(self, drama_id: int) -> None:
         selected_index = self._selected_index()
@@ -4536,9 +4547,9 @@ class MaoerFrame(wx.Frame):
         if expected_followed is not None and followed != expected_followed:
             message = "追剧状态已变化，请重新打开右键菜单。"
             self.SetStatusText(message)
-            wx.MessageBox(message, "追剧状态已变化", wx.OK | wx.ICON_INFORMATION, self)
+            message_box(message, "追剧状态已变化", wx.OK | wx.ICON_INFORMATION, self)
             return
-        if followed and wx.MessageBox(
+        if followed and message_box(
             "确定取消追剧吗？",
             "取消追剧",
             wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION,
@@ -4573,7 +4584,7 @@ class MaoerFrame(wx.Frame):
         self._follow_status_pending.pop(item.id, None)
         message = result.message.strip() or ("已加入追剧列表" if target else "已移出追剧列表")
         self.SetStatusText(message)
-        wx.MessageBox(
+        message_box(
             message,
             "追剧成功" if target else "取消追剧",
             wx.OK | wx.ICON_INFORMATION,
@@ -5252,11 +5263,11 @@ class MaoerFrame(wx.Frame):
     def show_purchase_required(self, message: str) -> None:
         if not message.startswith("《"):
             message = f"《{message}》为付费内容。"
-        wx.MessageBox(message, "需要购买", wx.OK | wx.ICON_INFORMATION, self)
+        message_box(message, "需要购买", wx.OK | wx.ICON_INFORMATION, self)
 
     def show_error(self, message: str) -> None:
         self.SetStatusText("操作失败")
-        wx.MessageBox(message or "未知错误", "错误", wx.OK | wx.ICON_ERROR, self)
+        message_box(message or "未知错误", "错误", wx.OK | wx.ICON_ERROR, self)
 
     def on_close(self, event: wx.CloseEvent) -> None:
         self._publisher_request = object()

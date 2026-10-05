@@ -1633,7 +1633,7 @@ class JumpDialogTests(unittest.TestCase):
     def test_invalid_and_out_of_range_inputs_keep_dialog_open_for_correction(self):
         dialog = JumpTimeDialog(None, "请输入跳转时间", 120, 0, lambda: [])
         self.addCleanup(dialog.Destroy)
-        with patch.object(dialog, "EndModal") as end, patch("app.wx.MessageBox") as message:
+        with patch.object(dialog, "EndModal") as end, patch("app.message_box") as message:
             for value in ("2", "3.70", "9" * 100):
                 dialog.time_input.SetValue(value)
                 dialog._accept_time(None)
@@ -1652,7 +1652,7 @@ class JumpDialogTests(unittest.TestCase):
     def test_range_is_announced_while_typing_without_enter_or_focus_change(self):
         dialog = JumpTimeDialog(None, "请输入跳转时间", 120, 0, lambda: [])
         self.addCleanup(dialog.Destroy)
-        with patch("app.wx.MessageBox") as popup, patch.object(dialog, "EndModal") as end:
+        with patch("app.message_box") as popup, patch.object(dialog, "EndModal") as end:
             dialog.time_input.SetValue("3")
             dialog.screen_reader.announce.assert_called_once_with("输入超出范围，当前音频总时长为2分00秒")
             self.assertFalse(dialog.FindWindow(wx.ID_OK).IsEnabled())
@@ -1730,7 +1730,7 @@ class JumpDialogTests(unittest.TestCase):
     def test_no_loaded_subtitles_does_not_open_empty_modal_or_close_time_dialog(self):
         dialog = JumpTimeDialog(None, "跳转时间", None, 0, lambda: [])
         self.addCleanup(dialog.Destroy)
-        with patch.object(dialog, "EndModal") as end, patch("app.wx.MessageBox") as message:
+        with patch.object(dialog, "EndModal") as end, patch("app.message_box") as message:
             dialog._choose_subtitle(None)
         end.assert_not_called()
         self.assertIn("当前暂无字幕", message.call_args.args[0])
@@ -1805,7 +1805,7 @@ class PlaybackJumpTests(unittest.TestCase):
         frame.player = Mock()
         frame._set_parent_status = Mock()
 
-        with patch("app.wx.MessageBox") as message_box:
+        with patch("app.message_box") as message_box:
             frame._jump_to_time_ready(2, 250, {"ok": True, "duration": 120, "paused": False})
         self.assertEqual(message_box.call_args.args[0], "输入超出范围，当前音频总时长为2分00秒")
 
@@ -2180,9 +2180,9 @@ class SettingsMenuTests(unittest.TestCase):
 
     def test_account_history_prompts_login_when_signed_out(self):
         frame = self.frame
-        self.assertEqual(self.menu_item(frame.account_history_menu_id).GetItemLabelText(), "我的播放历史")
+        self.assertIsNone(self.menu_item(frame.account_history_menu_id))
         frame._run_background = Mock()
-        with patch("app.wx.MessageBox") as message_box:
+        with patch("app.message_box") as message_box:
             frame.on_account_history(None)
         self.assertIn("请先登录", message_box.call_args.args[0])
         frame._run_background.assert_not_called()
@@ -2199,7 +2199,7 @@ class SettingsMenuTests(unittest.TestCase):
 
         status, work, done = frame._run_background.call_args.args
         self.assertEqual(status, "正在加载我的播放历史...")
-        with patch("app.wx.MessageBox") as message_box:
+        with patch("app.message_box") as message_box:
             done(work())
         message_box.assert_not_called()
         self.assertEqual(frame._enter_items.call_args.args[0], items)
@@ -2210,9 +2210,9 @@ class SettingsMenuTests(unittest.TestCase):
 
     def test_my_following_requires_login_and_opens_account_list(self):
         frame = self.frame
-        self.assertEqual(self.menu_item(frame.account_following_menu_id).GetItemLabelText(), "我的关注")
+        self.assertIsNone(self.menu_item(frame.account_following_menu_id))
         frame._run_background = Mock()
-        with patch("app.wx.MessageBox") as message_box:
+        with patch("app.message_box") as message_box:
             frame.on_account_following(None)
         self.assertIn("请先登录", message_box.call_args.args[0])
         frame._run_background.assert_not_called()
@@ -2393,7 +2393,7 @@ class SettingsMenuTests(unittest.TestCase):
             frame.api.publisher_profile.assert_not_called()
             _status, work, done = frame._run_background.call_args.args
             frame.api.set_publisher_follow.return_value = "取消关注成功"
-            with patch("app.wx.MessageBox"):
+            with patch("app.message_box"):
                 done(work())
             self.assertFalse(profile.followed)
             self.assertEqual(profile.followers, 4)
@@ -2433,7 +2433,7 @@ class SettingsMenuTests(unittest.TestCase):
                 return menu.GetMenuItems()[0].GetId()
 
             frame.list.GetPopupMenuSelectionFromUser.side_effect = choose
-            with patch("app.wx.MessageBox") as message_box:
+            with patch("app.message_box") as message_box:
                 frame._display_publisher_follow_menu(wx.Point(1, 1), profile)
             self.assertIn("请先登录", message_box.call_args.args[0])
             frame._run_background.assert_not_called()
@@ -2868,7 +2868,7 @@ class PurchaseSwitchFlowTests(unittest.TestCase):
                 self.frame.api.buy_drama_episode.assert_not_called()
                 # Main list may be rebuilt after purchase; preserve source queue and select target.
                 self.frame.items = self.frame.items.copy()
-                with patch('app.wx.MessageBox'):
+                with patch('app.message_box'):
                     self.driver.complete_next_job()  # Mock purchase succeeds, enqueue playback.
                 self.driver.complete_next_job()
                 self.assertEqual(self.frame._play.call_args.args[0].sound_id, 2)
@@ -2904,7 +2904,7 @@ class PurchaseSwitchFlowTests(unittest.TestCase):
         self.driver.complete_next_job()
         work, done, _ = self.jobs.pop(0)
         self.frame._play_sound_item(self.frame.items[3])
-        with patch('app.wx.MessageBox'):
+        with patch('app.message_box'):
             done(work())
         self.assertEqual(self.frame._pending_track_key, ('sound', 3))
         self.assertEqual(len(self.jobs), 1)
@@ -3103,7 +3103,7 @@ class PublisherColumnTests(unittest.TestCase):
 
 class DramaFollowButtonTests(unittest.TestCase):
     def test_episode_list_has_no_tab_focusable_follow_button(self):
-        app = wx.App(False)
+        app = wx.GetApp() or wx.App(False)
         api = Mock(cookie_header="test-cookie")
         with patch("app.MaoerApi", return_value=api), patch("app.HiddenBrowserPlayer"), \
              patch.object(MaoerFrame, "load_homepage"), \
@@ -3132,7 +3132,7 @@ class DramaFollowButtonTests(unittest.TestCase):
 
 class DramaWorkMenuTests(unittest.TestCase):
     def test_context_menu_opens_immediately_when_follow_status_is_unknown(self):
-        app = wx.App(False)
+        app = wx.GetApp() or wx.App(False)
         frame = MaoerFrame.__new__(MaoerFrame)
         frame.api = Mock(cookie_header="test-cookie")
         frame.api.cached_drama_follow_status.return_value = None
@@ -3158,7 +3158,7 @@ class DramaWorkMenuTests(unittest.TestCase):
         app.Yield()
 
     def test_context_menu_uses_verified_cache_over_stale_list_flag(self):
-        app = wx.App(False)
+        app = wx.GetApp() or wx.App(False)
         frame = MaoerFrame.__new__(MaoerFrame)
         frame.api = Mock(cookie_header="test-cookie")
         frame.api.cached_drama_follow_status.return_value = None
@@ -3183,7 +3183,7 @@ class DramaWorkMenuTests(unittest.TestCase):
         app.Yield()
 
     def test_unknown_follow_status_keeps_other_menu_actions_available(self):
-        app = wx.App(False)
+        app = wx.GetApp() or wx.App(False)
         frame = MaoerFrame.__new__(MaoerFrame)
         frame.api = Mock(cookie_header="test-cookie")
         frame._selected_index = Mock(return_value=0)
@@ -3209,7 +3209,7 @@ class DramaWorkMenuTests(unittest.TestCase):
         app.Yield()
 
     def test_unknown_follow_menu_uses_existing_verified_action(self):
-        app = wx.App(False)
+        app = wx.GetApp() or wx.App(False)
         frame = MaoerFrame.__new__(MaoerFrame)
         frame.api = Mock(cookie_header="test-cookie")
         frame._selected_index = Mock(return_value=0)
@@ -3229,7 +3229,7 @@ class DramaWorkMenuTests(unittest.TestCase):
         app.Yield()
 
     def test_known_follow_menu_preserves_the_action_user_saw(self):
-        app = wx.App(False)
+        app = wx.GetApp() or wx.App(False)
         frame = MaoerFrame.__new__(MaoerFrame)
         frame.api = Mock(cookie_header="test-cookie")
         frame.api.cached_drama_follow_status.return_value = True
@@ -3265,7 +3265,7 @@ class DramaWorkMenuTests(unittest.TestCase):
         self.assertTrue(frame._known_follow_status(item))
 
     def test_list_selection_starts_prefetch_and_following_list_seeds_cache(self):
-        app = wx.App(False)
+        app = wx.GetApp() or wx.App(False)
         api = Mock(cookie_header="test-cookie")
         api.cached_drama_follow_status.return_value = None
         with patch("app.MaoerApi", return_value=api), patch("app.HiddenBrowserPlayer"), patch("app.wx.CallAfter"), \
@@ -3321,7 +3321,7 @@ class DramaWorkMenuTests(unittest.TestCase):
         frame.SetStatusText = Mock()
         item = MediaItem(kind="drama", id=12, title="剧")
 
-        with patch("app.wx.MessageBox") as notify:
+        with patch("app.message_box") as notify:
             frame._confirm_work_menu_follow(item, True, "test-cookie", expected_followed=False)
 
         frame._run_background.assert_not_called()
@@ -3329,7 +3329,7 @@ class DramaWorkMenuTests(unittest.TestCase):
         notify.assert_called_once()
 
     def test_context_menu_routes_purchase_from_drama_not_episode(self):
-        app = wx.App(False)
+        app = wx.GetApp() or wx.App(False)
         frame = MaoerFrame.__new__(MaoerFrame)
         frame.api = Mock(cookie_header="test-cookie")
         frame._selected_index = Mock(return_value=0)
@@ -3441,7 +3441,7 @@ class DramaWorkMenuTests(unittest.TestCase):
         frame.api.set_drama_follow_result.return_value = DramaFollowResult(
             True, "喵！自己追的剧，跪着也要看完哦！",
         )
-        with patch("app.wx.MessageBox") as notify:
+        with patch("app.message_box") as notify:
             finished(change())
         frame.api.set_drama_follow_result.assert_called_once_with(12, follow=True)
         self.assertEqual(item.raw["like"], 1)
@@ -3450,7 +3450,7 @@ class DramaWorkMenuTests(unittest.TestCase):
 
 class ItemContextMenuTests(unittest.TestCase):
     def test_sound_and_drama_have_distinct_detail_actions(self):
-        app = wx.App(False)
+        app = wx.GetApp() or wx.App(False)
         frame = MaoerFrame.__new__(MaoerFrame)
         frame.api = Mock(cookie_header="")
         frame._selected_index = Mock(return_value=0)
@@ -3513,7 +3513,7 @@ class ItemContextMenuTests(unittest.TestCase):
         frame.api.drama_detail_text.assert_not_called()
         frame._show_item_detail_dialog.assert_called_once_with(item, "单集简介", "音频简介")
 
-        app = wx.App(False)
+        app = wx.GetApp() or wx.App(False)
         dialog = MediaDetailDialog(None, item.title, "单集简介", "音频简介")
         try:
             self.assertEqual(dialog.GetTitle(), "音频简介 - 第一集")
