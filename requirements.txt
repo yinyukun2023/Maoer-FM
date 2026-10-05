@@ -1,3 +1,4 @@
 requests>=2.32
 wxPython>=4.2
 comtypes>=1.4
+av>=16.1

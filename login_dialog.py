@@ -270,11 +270,13 @@ class VoiceCaptchaDialog(wx.Dialog):
 
 
 class LoginDialog(wx.Dialog):
-    def __init__(self, parent: wx.Window, api: MaoerApi, *, saved: SavedAccount | None = None) -> None:
-        super().__init__(parent, title="编辑账号" if saved else "账号登录",
+    def __init__(self, parent: wx.Window, api: MaoerApi, *, saved: SavedAccount | None = None,
+                 relogin: bool = False) -> None:
+        super().__init__(parent, title="重新登录账号" if relogin else ("编辑账号" if saved else "账号登录"),
                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.api = api
         self.saved = saved
+        self.relogin = relogin
         self.login: LoginCredentials | None = None
         self.note = saved.note if saved else ""
         self._saved_login = None
@@ -310,6 +312,15 @@ class LoginDialog(wx.Dialog):
             self.login_name_box.SetFocus()
         else:
             self.notebook.SetFocus()
+        if relogin:
+            self.status.SetLabel(message or "登录状态已失效，请重新登录。")
+            if self._saved_login and self._saved_login.password:
+                # The account manager's Enter/button already requested login.
+                wx.CallAfter(self._start_saved_login)
+
+    def _start_saved_login(self) -> None:
+        if self and self.IsModal() and self.IsShown():
+            self._password_login()
 
     @staticmethod
     def _text_field(page, sizer, label: str, style: int = 0) -> wx.TextCtrl:
@@ -363,7 +374,7 @@ class LoginDialog(wx.Dialog):
         self.announcer = ScreenReaderAnnouncer(self.status, native_only=True)
         root.Add(self.status, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         buttons = wx.BoxSizer(wx.HORIZONTAL)
-        self.login_button = wx.Button(panel, wx.ID_OK, label="保存" if self.saved else "登录")
+        self.login_button = wx.Button(panel, wx.ID_OK, label="保存" if self.saved and not self.relogin else "登录")
         self.cancel_button = wx.Button(panel, wx.ID_CANCEL, label="取消")
         buttons.AddStretchSpacer()
         buttons.Add(self.login_button, 0, wx.RIGHT, 8)
@@ -388,7 +399,7 @@ class LoginDialog(wx.Dialog):
 
     def on_method_changed(self, event: wx.Event) -> None:
         index = self.notebook.GetSelection()
-        self.login_button.SetLabel(("保存" if self.saved else "登录") if index < 2
+        self.login_button.SetLabel(("保存" if self.saved and not self.relogin else "登录") if index < 2
                                    else f"打开{LOGIN_PROVIDERS[index - 2][1]}登录")
         event.Skip()
 
@@ -483,7 +494,7 @@ class LoginDialog(wx.Dialog):
         region = self.password_region
         login = LoginCredentials(name, password, region,
                                  self.password_region_button.GetLabel().removeprefix("国家/地区："))
-        if (self.saved and self.note_box.GetValue().strip() != self.saved.note
+        if (self.saved and not self.relogin and self.note_box.GetValue().strip() != self.saved.note
                 and login == (self._saved_login or LoginCredentials(""))):
             self.api.set_cookie(self.saved.cookie)
             self._login_success(AccountInfo(self.saved.user_id, self.saved.nickname, ""))
@@ -753,8 +764,7 @@ class AccountManagerDialog(wx.Dialog):
         self.add_button.Enable(not self._busy)
         self.edit_button.Enable(not self._busy and account is not None)
         self.delete_button.Enable(not self._busy and account is not None)
-        self.login_button.Enable(not self._busy and account is not None
-                                 and account.user_id != self.owner.account_state.active_user_id)
+        self.login_button.Enable(not self._busy and account is not None)
         self.copy_cookie_button.Enable(not self._busy and account is not None)
         index = self.list.GetFirstSelected()
         can_move_up = not self._busy and account is not None and index > 0
@@ -848,9 +858,6 @@ class AccountManagerDialog(wx.Dialog):
         account = self.selected()
         if self._busy or account is None:
             return
-        if self.owner.account_logged_in and account.user_id == self.owner.account_state.active_user_id:
-            self.EndModal(wx.ID_OK)
-            return
         self._busy = True
         self._update_buttons()
         self.announcer.announce("正在登录所选账号")
@@ -868,9 +875,23 @@ class AccountManagerDialog(wx.Dialog):
             self._update_buttons()
 
         def failed(exc: Exception) -> None:
+            if isinstance(exc, ApiError) and str(exc) == "需要登录":
+                # Another website login can invalidate this cookie after a delay.
+                # Resume the normal flow only for an explicit authentication rejection.
+                if (account.user_id == self.owner.account_state.active_user_id
+                        and self.owner.api.cookie_header == account.cookie):
+                    self.owner._mark_account_logged_out("登录状态失效，请重新登录", self.owner.api)
+                if self.owner._show_account_login(self, saved=account):
+                    self._busy = False
+                    self.EndModal(wx.ID_OK)
+                    return
+                self._busy = False
+                self.refresh(account.user_id, "未完成登录，已保存的账号信息仍然保留")
+                self.list.SetFocus()
+                return
             self._busy = False
             self._update_buttons()
-            self.status.SetLabel("登录失败，可使用“编辑”重新填写账号密码并登录")
+            self.status.SetLabel("登录失败，请检查提示后重试")
             message_box(str(exc) or "登录失败", "登录失败", wx.OK | wx.ICON_ERROR, self)
             self.list.SetFocus()
 

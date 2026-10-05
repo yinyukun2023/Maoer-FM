@@ -79,6 +79,8 @@ class PlaybackInfo:
     drm: bool = False
     duration_ms: int | None = None
     subtitle_url: str = ""
+    dash_audio: dict[str, Any] = field(default_factory=dict, repr=False)
+    video_url: str = field(default="", repr=False)
 
 
 @dataclass(slots=True)
@@ -2522,6 +2524,9 @@ class MaoerApi:
             drm=self._is_bili_drm_sound(sound),
             duration_ms=_duration_ms(sound.get("duration")) or item.duration_ms,
             subtitle_url=_text(sound.get("subtitle_url")),
+            dash_audio=next((audio for audio in (sound.get("dash") or {}).get("audio", [])
+                             if isinstance(audio, dict) and audio.get("base_url")), {}),
+            video_url=_text(sound.get("videourl")),
         )
 
     @staticmethod

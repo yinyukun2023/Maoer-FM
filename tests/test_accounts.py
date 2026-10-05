@@ -786,7 +786,8 @@ class AccountInterfaceTests(unittest.TestCase):
             task.assert_not_called()
             dialog.on_login(None)
             _, work, done, failed = task.call_args.args
-            with patch("login_dialog.message_box"):
+            with patch("login_dialog.message_box"), \
+                    patch.object(self.frame, '_show_account_login', return_value=False):
                 failed(ApiError("需要登录"))
             end.assert_not_called()
             self.assertIs(self.frame.api, current)
@@ -795,6 +796,101 @@ class AccountInterfaceTests(unittest.TestCase):
             done(AccountInfo(1, "账号1", ""))
             end.assert_called_once_with(wx.ID_OK)
         self.assertEqual(self.frame.account_state.active_user_id, 1)
+
+    def test_expired_saved_login_recovers_from_enter_without_editing(self):
+        credentials = LoginCredentials('person@example.test', 'remembered password')
+        self.save(1, note='备注', login=credentials)
+        self.save(2)
+        saved = self.frame.account_state.get(1)
+        dialog = AccountManagerDialog(self.frame)
+        self.addCleanup(dialog.Destroy)
+        dialog.list.Select(0)
+        with patch('login_dialog.run_dialog_task') as task, \
+                patch('app.LoginDialog') as recover, \
+                patch.object(dialog, 'EndModal') as end, patch('login_dialog.message_box') as error:
+            recover.return_value.ShowModal.return_value = wx.ID_OK
+            recover.return_value.api = MaoerApi(cookie='token=renewed')
+            recover.return_value.account_info = AccountInfo(1, '账号1', '')
+            recover.return_value.login = credentials
+            recover.return_value.note = saved.note
+            dialog.on_login(None)
+            task.call_args.args[3](ApiError('需要登录'))
+            self.assertEqual(recover.call_args.kwargs, {'saved': saved, 'relogin': True})
+            end.assert_called_once_with(wx.ID_OK)
+            error.assert_not_called()
+            recover.return_value.Destroy.assert_called_once()
+        self.assertEqual(self.frame.account_state.active_user_id, 1)
+        self.assertEqual(self.frame.api.cookie_header, 'token=renewed')
+        refreshed = load_accounts().get(1)
+        self.assertEqual(refreshed.note, saved.note)
+        self.assertEqual(unprotect_login(refreshed.credentials), credentials)
+
+    def test_current_account_enter_rechecks_server_instead_of_trusting_old_login_flag(self):
+        self.save(1)
+        dialog = AccountManagerDialog(self.frame)
+        self.addCleanup(dialog.Destroy)
+        with patch('login_dialog.run_dialog_task') as task, patch.object(dialog, 'EndModal') as end, \
+                patch('login_dialog.validated_account', return_value=AccountInfo(1, '账号1', '')) as validate:
+            dialog.on_login(None)
+            task.assert_called_once()
+            end.assert_not_called()
+            self.assertEqual(task.call_args.args[1]().user_id, 1)
+            validate.assert_called_once()
+
+    def test_relogin_submits_saved_password_through_native_flow_even_when_note_changes(self):
+        credentials = LoginCredentials('person@example.test', 'remembered password')
+        self.save(1, note='旧备注', login=credentials)
+        saved = self.frame.account_state.get(1)
+        with patch('login_dialog.wx.CallAfter') as later:
+            dialog = LoginDialog(self.frame, MaoerApi(cookie=''), saved=saved, relogin=True)
+        self.addCleanup(dialog.Destroy)
+        self.assertEqual(dialog.GetTitle(), '重新登录账号')
+        self.assertEqual(dialog.login_button.GetLabel(), '登录')
+        self.assertEqual(dialog.password_box.GetValue(), credentials.password)
+        later.assert_called_once_with(dialog._start_saved_login)
+        dialog.note_box.SetValue('新备注')
+        with patch('web_login.NativePasswordLoginDialog') as native, \
+                patch.object(dialog, 'IsModal', return_value=True), \
+                patch.object(dialog, 'IsShown', return_value=True), patch.object(dialog, 'EndModal') as end:
+            dialog._start_saved_login()
+            native.assert_called_once_with(dialog, None, login_name=credentials.username,
+                                           password=credentials.password, region_label=credentials.region_label)
+            end.assert_not_called()
+            native.return_value.api = MaoerApi(cookie='token=renewed')
+            native.return_value.account_info = AccountInfo(1, '账号1', '')
+            native.return_value.start.call_args.args[0](wx.ID_OK, '')
+            end.assert_called_once_with(wx.ID_OK)
+            self.assertEqual(dialog.cookie_header, 'token=renewed')
+            self.assertEqual(dialog.login, credentials)
+            self.assertEqual(dialog.note, '新备注')
+
+    def test_relogin_cancel_keeps_saved_accounts_and_network_errors_do_not_reauthenticate(self):
+        for active in (False, True):
+            with self.subTest(active=active):
+                self.save(1, login=LoginCredentials('person@example.test', 'remembered password'))
+                current = self.frame.api if active else self.save(2)
+                original = self.frame.account_state
+                dialog = AccountManagerDialog(self.frame)
+                try:
+                    dialog.list.Select(0)
+                    with patch('login_dialog.run_dialog_task') as task, \
+                            patch.object(self.frame, '_show_account_login', return_value=False) as recover, \
+                            patch.object(dialog, 'EndModal') as end, patch('login_dialog.message_box'):
+                        dialog.on_login(None)
+                        task.call_args.args[3](requests.Timeout())
+                        recover.assert_not_called()
+                        self.assertEqual(self.frame.account_state, original)
+                        dialog.on_login(None)
+                        task.call_args.args[3](ApiError('需要登录'))
+                        recover.assert_called_once_with(dialog, saved=original.get(1))
+                        end.assert_not_called()
+                        self.assertFalse(dialog._busy)
+                        self.assertEqual(self.frame.account_state.accounts, original.accounts)
+                        self.assertEqual(self.frame.account_state.active_user_id, None if active else 2)
+                        if not active:
+                            self.assertIs(self.frame.api, current)
+                finally:
+                    dialog.Destroy()
 
     def test_copy_cookie_uses_selected_account_and_never_logs_in(self):
         self.save(1, cookie="token=selected==; uid=1")

@@ -7,6 +7,18 @@ from app_settings import AppSettings
 
 
 class StartupSoundTests(unittest.TestCase):
+    def test_download_completed_sound_uses_the_supplied_wave_asynchronously(self):
+        with patch("startup_sound.winsound.PlaySound") as play:
+            startup_sound.play_download_completed_sound()
+        self.assertTrue(startup_sound.DOWNLOAD_COMPLETED_SOUND.is_file())
+        self.assertEqual(startup_sound.DOWNLOAD_COMPLETED_SOUND.name, "DownloadCompleted.wav")
+        play.assert_called_once_with(
+            str(startup_sound.DOWNLOAD_COMPLETED_SOUND),
+            startup_sound.winsound.SND_FILENAME
+            | startup_sound.winsound.SND_ASYNC
+            | startup_sound.winsound.SND_NODEFAULT,
+        )
+
     def test_startup_sound_uses_nonblocking_windows_wave_playback(self):
         with patch("startup_sound.winsound.PlaySound") as play:
             startup_sound.play_startup_sound()

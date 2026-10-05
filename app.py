@@ -30,6 +30,8 @@ from browser_player import (
     HiddenBrowserPlayer,
     PlayerUnavailable,
 )
+from download_dialog import DownloadDialog
+from downloads import load_selection, download_error
 from login_dialog import AccountManagerDialog, CookieLoginDialog, LoginDialog, validated_account
 from maoer_api import (
     AccountInfo,
@@ -2513,6 +2515,8 @@ class MaoerFrame(wx.Frame):
         self.help_update_log_menu_id = wx.NewIdRef()
         self.help_about_menu_id = wx.NewIdRef()
         self.item_detail_shortcut_id = wx.NewIdRef()
+        self.item_download_shortcut_id = wx.NewIdRef()
+        self.drama_download_shortcut_id = wx.NewIdRef()
         self.item_comments_shortcut_id = wx.NewIdRef()
         self.item_browser_shortcut_id = wx.NewIdRef()
         self._update_account_menu()
@@ -2645,6 +2649,8 @@ class MaoerFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_help_update_log, id=self.help_update_log_menu_id)
         self.Bind(wx.EVT_MENU, self.on_help_about, id=self.help_about_menu_id)
         self.Bind(wx.EVT_MENU, self.on_item_detail_shortcut, id=self.item_detail_shortcut_id)
+        self.Bind(wx.EVT_MENU, self.on_item_download_shortcut, id=self.item_download_shortcut_id)
+        self.Bind(wx.EVT_MENU, self.on_drama_download_shortcut, id=self.drama_download_shortcut_id)
         self.Bind(wx.EVT_MENU, self.on_item_comments_shortcut, id=self.item_comments_shortcut_id)
         self.Bind(wx.EVT_MENU, self.on_item_browser_shortcut, id=self.item_browser_shortcut_id)
         self.SetAcceleratorTable(wx.AcceleratorTable([
@@ -2652,6 +2658,8 @@ class MaoerFrame(wx.Frame):
             for key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER)
             for modifiers, item_id in (
                 (wx.ACCEL_SHIFT, self.item_detail_shortcut_id),
+                (wx.ACCEL_CTRL, self.item_download_shortcut_id),
+                (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, self.drama_download_shortcut_id),
                 (wx.ACCEL_ALT, self.item_comments_shortcut_id),
                 (wx.ACCEL_ALT | wx.ACCEL_SHIFT, self.item_browser_shortcut_id),
             )
@@ -3074,11 +3082,15 @@ class MaoerFrame(wx.Frame):
     def on_cookie_login(self, _event: wx.Event) -> None:
         self._show_account_login(self, cookie_login=True)
 
-    def _show_account_login(self, parent: wx.Window, *, cookie_login: bool = False) -> bool:
-        dialog = CookieLoginDialog(parent) if cookie_login else LoginDialog(parent, MaoerApi(cookie=""))
+    def _show_account_login(
+        self, parent: wx.Window, *, cookie_login: bool = False, saved: SavedAccount | None = None,
+    ) -> bool:
+        dialog = (CookieLoginDialog(parent) if cookie_login else
+                  LoginDialog(parent, MaoerApi(cookie=""), saved=saved, relogin=saved is not None))
         try:
             if dialog.ShowModal() == wx.ID_OK and dialog.account_info is not None:
-                return self._save_account(dialog.api, dialog.account_info, login=dialog.login, parent=parent)
+                return self._save_account(dialog.api, dialog.account_info, login=dialog.login,
+                                          note=dialog.note if saved else None, parent=parent)
         finally:
             dialog.Destroy()
         return False
@@ -3784,6 +3796,8 @@ class MaoerFrame(wx.Frame):
         publisher_id = wx.NewIdRef()
         purchase_id = wx.NewIdRef()
         follow_id = wx.NewIdRef()
+        download_id = wx.NewIdRef()
+        download_drama_id = wx.NewIdRef()
         purchase_label = self._drama_purchase_menu_label(item)
         if can_show_item_menu:
             menu.Append(open_id, "用网页打开")
@@ -3791,6 +3805,11 @@ class MaoerFrame(wx.Frame):
             if item.kind == "sound":
                 menu.Append(drama_id, "查看该剧集")
             menu.Append(publisher_id, "查看发布者")
+        if item.kind in {"sound", "drama"}:
+            menu.AppendSeparator()
+            if item.kind == "sound":
+                menu.Append(download_id, "下载本集(&D)\tCtrl+Enter")
+            menu.Append(download_drama_id, "下载该剧集(&W)\tCtrl+Shift+Enter")
         if item.kind == "drama":
             menu.AppendSeparator()
             if purchase_label is not None:
@@ -3822,6 +3841,10 @@ class MaoerFrame(wx.Frame):
                 self.show_drama_detail(item)
         elif item.kind == "sound" and choice == int(drama_id):
             self.show_sound_drama(item)
+        elif item.kind == "sound" and choice == int(download_id):
+            self.show_download(item)
+        elif item.kind in {"sound", "drama"} and choice == int(download_drama_id):
+            self.show_download(item, whole_drama=True)
         elif can_show_item_menu and choice == int(publisher_id):
             self.show_item_publisher(item)
         elif item.kind == "drama" and purchase_label is not None and choice == int(purchase_id):
@@ -5139,6 +5162,44 @@ class MaoerFrame(wx.Frame):
             return self.items[index]
         return None
 
+    def show_download(self, item: MediaItem, *, whole_drama: bool = False) -> None:
+        token = self._download_request = object()
+        cookie = self.api.cookie_header
+
+        def load():
+            api = MaoerApi(cookie=cookie)
+            try:
+                return load_selection(api, item, whole_drama)
+            except Exception as exc:
+                raise ApiError(download_error(exc)) from None
+            finally:
+                api.session.close()
+
+        def ready(selection):
+            if self._download_request is not token:
+                return
+            self.SetStatusText("下载列表已加载")
+            dialog = DownloadDialog(self, selection, cookie, program_dir() / "下载")
+            try:
+                dialog.ShowModal()
+            finally:
+                dialog.Destroy()
+                self.list.SetFocus()
+
+        self._run_background("正在获取下载列表…", load, ready,
+                             on_error=lambda message: self.show_error(message)
+                             if self._download_request is token else None)
+
+    def on_item_download_shortcut(self, _event: wx.CommandEvent) -> None:
+        item = self._selected_shortcut_item()
+        if item is not None and item.kind in {"sound", "drama"}:
+            self.show_download(item, whole_drama=item.kind == "drama")
+
+    def on_drama_download_shortcut(self, _event: wx.CommandEvent) -> None:
+        item = self._selected_shortcut_item()
+        if item is not None and item.kind in {"sound", "drama"}:
+            self.show_download(item, whole_drama=True)
+
     def on_item_detail_shortcut(self, _event: wx.CommandEvent) -> None:
         item = self._selected_shortcut_item()
         if item is None or not self._can_show_item_menu(item):
@@ -5165,7 +5226,8 @@ class MaoerFrame(wx.Frame):
                 self._show_selected_item_menu(wx.Point(10, 10))
                 return
             if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
-                if event.GetModifiers() in (wx.MOD_SHIFT, wx.MOD_ALT, wx.MOD_ALT | wx.MOD_SHIFT):
+                if event.GetModifiers() in (wx.MOD_SHIFT, wx.MOD_ALT, wx.MOD_ALT | wx.MOD_SHIFT,
+                                           wx.MOD_CONTROL, wx.MOD_CONTROL | wx.MOD_SHIFT):
                     # Let the frame accelerator consume the key before the native list control.
                     event.Skip()
                     return

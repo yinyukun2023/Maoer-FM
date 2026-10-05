@@ -157,6 +157,11 @@ class _CookieResult(COMObject):
 
 def read_webview_cookies(webview: html2.WebView, url: str, callback):
     """Read URL-scoped cookies, including HttpOnly, from this WebView only."""
+    return call_webview_devtools(webview, "Network.getCookies", {"urls": [url]}, callback)
+
+
+def call_webview_devtools(webview: html2.WebView, method: str, params: dict, callback):
+    """Call this WebView's native asynchronous API, retaining the returned handler."""
     backend = webview.GetNativeBackend()
     if not backend:
         raise ApiError("登录网页尚未准备好，请稍后重试")
@@ -167,7 +172,7 @@ def read_webview_cookies(webview: html2.WebView, url: str, callback):
     invoke = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_wchar_p,
                                ctypes.c_wchar_p, ctypes.c_void_p)(vtable[36])
     handler = _CookieResult(callback)
-    result = invoke(pointer, "Network.getCookies", json.dumps({"urls": [url]}),
+    result = invoke(pointer, method, json.dumps(params),
                     handler.QueryInterface(_DevToolsCompleted))
     if result < 0:
         raise ApiError("无法读取网页登录结果，请重试")
