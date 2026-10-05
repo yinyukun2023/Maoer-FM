@@ -19,6 +19,8 @@ from urllib.parse import urljoin, urlparse
 import requests
 import wx
 
+from ui_dialogs import message_box, message_dialog
+
 from _build_info import APP_VERSION, UPDATE_MANIFEST_URL
 from app_paths import app_data_dir
 
@@ -183,7 +185,7 @@ class UpdateDownloadDialog(wx.Dialog):
     def _confirm_cancel(self) -> None:
         if self._cancel_requested:
             return
-        dialog = wx.MessageDialog(
+        dialog = message_dialog(
             self,
             "更新正在进行，确定要终止本次更新吗？",
             "取消更新",
@@ -229,7 +231,7 @@ def run_startup_update_check() -> bool:
     except UpdateCancelled:
         return False
     except Exception as exc:
-        wx.MessageBox(
+        message_box(
             f"更新失败，程序将退出。请重新打开后重试。\n\n{exc}",
             "更新失败",
             wx.OK | wx.ICON_ERROR,
@@ -874,8 +876,9 @@ def _version_parts(version: str) -> list[int | str]:
 
 def _message_box(message: str, title: str, icon: str = "info") -> None:
     if os.name == "nt":
-        flags = 0x40 if icon == "info" else 0x10
-        ctypes.windll.user32.MessageBoxW(None, message, title, flags)
+        # Update entry points already own a wx.App on the main thread.
+        flags = wx.ICON_INFORMATION if icon == "info" else wx.ICON_ERROR
+        message_box(message, title, wx.OK | flags)
         return
     print(f"{title}: {message}", file=sys.stderr)
 

@@ -416,6 +416,8 @@ def launch_build_ui() -> int:
     except ImportError as exc:
         raise SystemExit("wxPython is not installed. Install it with: python -m pip install wxPython") from exc
 
+    from ui_dialogs import message_box
+
     class NamedTextAccessible(wx.Accessible):
         def __init__(self, window: wx.Window, name: str) -> None:
             super().__init__(window)
@@ -498,7 +500,7 @@ def launch_build_ui() -> int:
             try:
                 version = validate_version(self.version.GetValue())
             except SystemExit as exc:
-                wx.MessageBox(str(exc), "版本号无效", wx.OK | wx.ICON_ERROR, self)
+                message_box(str(exc), "版本号无效", wx.OK | wx.ICON_ERROR, self)
                 return
 
             self._running = True
@@ -558,7 +560,7 @@ def launch_build_ui() -> int:
             self.notes.Enable()
             self.status_label.SetLabel("生成成功")
             self.Layout()
-            wx.MessageBox(
+            message_box(
                 (
                     "文件生成成功。\n\n"
                     f"更新配置：{UPDATE_PACKAGE_DIR / UPDATE_CONFIG_NAME}\n"
@@ -577,11 +579,11 @@ def launch_build_ui() -> int:
             self.notes.Enable()
             self.status_label.SetLabel("生成失败")
             self.Layout()
-            wx.MessageBox(message, "生成失败", wx.OK | wx.ICON_ERROR, self)
+            message_box(message, "生成失败", wx.OK | wx.ICON_ERROR, self)
 
         def _on_close(self, event: wx.CloseEvent) -> None:
             if self._running:
-                wx.MessageBox("正在生成文件，请稍候。", "正在生成", wx.OK | wx.ICON_INFORMATION, self)
+                message_box("正在生成文件，请稍候。", "正在生成", wx.OK | wx.ICON_INFORMATION, self)
                 if event.CanVeto():
                     event.Veto()
                 return

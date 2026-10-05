@@ -8,6 +8,8 @@ from urllib.parse import quote
 
 import wx
 
+from ui_dialogs import message_box
+
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT = ROOT / "dist" / "更新包" / "update-config.json"
@@ -149,10 +151,10 @@ class UpdateConfigGenerator(wx.Frame):
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
         except OSError as exc:
-            wx.MessageBox(f"写入配置失败：\n{exc}", "生成失败", wx.OK | wx.ICON_ERROR, self)
+            message_box(f"写入配置失败：\n{exc}", "生成失败", wx.OK | wx.ICON_ERROR, self)
             return
         self.preview.SetValue(json.dumps(config, ensure_ascii=False, indent=2))
-        wx.MessageBox(f"已生成更新配置：\n{output}", "生成完成", wx.OK | wx.ICON_INFORMATION, self)
+        message_box(f"已生成更新配置：\n{output}", "生成完成", wx.OK | wx.ICON_INFORMATION, self)
 
     def _refresh_preview(self, show_errors: bool) -> None:
         config = self._build_config(show_errors=show_errors)
@@ -193,7 +195,7 @@ class UpdateConfigGenerator(wx.Frame):
 
     def _fail(self, message: str, show_errors: bool) -> None:
         if show_errors:
-            wx.MessageBox(message, "配置不完整", wx.OK | wx.ICON_ERROR, self)
+            message_box(message, "配置不完整", wx.OK | wx.ICON_ERROR, self)
         return None
 
 
