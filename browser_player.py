@@ -26,6 +26,40 @@ MAX_PLAYBACK_RATE = 2.0
 ScriptCallback = Callable[[dict[str, object] | None], None]
 
 
+HIGHEST_AUDIO_QUALITY_SCRIPT = r"""
+(() => {
+  function install() {
+    const player = window.R && window.R.player;
+    if (!player || typeof player.createPlayer !== 'function' || player.__maoerHighestAudio) return;
+    // Select before the official loader obtains its key or buffers audio.
+    // The website sorts DASH entries by bandwidth, so reordering is not enough.
+    window.R.player = Object.create(player, {
+      __maoerHighestAudio: {value: true},
+      createPlayer: {value: function(sound) {
+        const audio = sound && sound.dash && sound.dash.audio;
+        if (Array.isArray(audio)) {
+          let best = null, bandwidth = -Infinity;
+          audio.forEach(item => {
+            if (!item || !item.base_url) return;
+            const value = Number(item.bandwidth);
+            const rate = Number.isFinite(value) ? value : 0;
+            if (!best || rate > bandwidth) { best = item; bandwidth = rate; }
+          });
+          if (best) sound.dash.audio = [best];
+        }
+        return player.createPlayer.apply(this, arguments);
+      }}
+    });
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', install, {once: true});
+  } else {
+    install();
+  }
+})();
+"""
+
+
 @dataclass
 class _PauseResume:
     generation: int
@@ -1500,6 +1534,7 @@ class HiddenBrowserPlayer:
         except Exception:
             pass
         webview.AddUserScript(HIDDEN_WEBVIEW_SCRIPT, html2.WEBVIEW_INJECT_AT_DOCUMENT_START)
+        webview.AddUserScript(HIGHEST_AUDIO_QUALITY_SCRIPT, html2.WEBVIEW_INJECT_AT_DOCUMENT_START)
         if self._resume_request is not None and self._resume_request.reloaded:
             # Prevent the site's own autoplay from sounding at 00:00 during
             # reload; explicit resume releases this only after restoring time.

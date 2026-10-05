@@ -14,6 +14,7 @@ a = Analysis(
     pathex=[],
     binaries=[(webview2_loader, 'wx')],
     datas=[('assets/startup_mia.wav', 'assets'), ('assets/DownloadCompleted.wav', 'assets'),
+           ('assets/DownloadFailed.wav', 'assets'),
            ('热键表.txt', '.'), ('tolk_x86', 'tolk_x86')],
     hiddenimports=[],
     hookspath=[],

@@ -9,6 +9,7 @@ import re
 import struct
 import tempfile
 import threading
+import time
 from typing import Callable
 from urllib.parse import urlsplit
 
@@ -22,12 +23,95 @@ class DownloadCancelled(Exception):
     pass
 
 
+class DownloadControl(threading.Event):
+    """Cancellation plus cooperative pause; active time excludes pauses."""
+    def __init__(self) -> None:
+        super().__init__()
+        self._gate = threading.Event()
+        self._gate.set()
+        self._pause_lock = threading.Lock()
+        self._paused_at: float | None = None
+        self._paused_seconds = 0.0
+
+    def pause(self) -> None:
+        with self._pause_lock:
+            if self._paused_at is None and not self.is_set():
+                self._paused_at = time.monotonic()
+                self._gate.clear()
+
+    def resume(self) -> None:
+        with self._pause_lock:
+            if self._paused_at is not None:
+                self._paused_seconds += time.monotonic() - self._paused_at
+                self._paused_at = None
+            self._gate.set()
+
+    def is_paused(self) -> bool:
+        return not self._gate.is_set()
+
+    def active_time(self) -> float:
+        with self._pause_lock:
+            now = self._paused_at if self._paused_at is not None else time.monotonic()
+            return now - self._paused_seconds
+
+    def set(self) -> None:
+        super().set()
+        self.resume()
+
+    def checkpoint(self) -> None:
+        while not self._gate.wait(0.1):
+            if self.is_set():
+                raise DownloadCancelled()
+        if self.is_set():
+            raise DownloadCancelled()
+
+
 @dataclass
 class DownloadSelection:
     title: str
     publisher: str
     items: list[MediaItem]
     checked: list[int]
+    number_width: int = 2
+
+
+EPISODE_NUMBER = re.compile(r'(第\s*)([0-9０-９零〇一二两三四五六七八九十百千万]+)(\s*[集期])')
+
+
+def _episode_match(item: MediaItem):
+    if item.subtitle.rsplit('/', 1)[-1].strip() in {'花絮', '音乐'}:
+        return None
+    match = EPISODE_NUMBER.search(item.title)
+    if match and not re.search(r'番外|预告|花絮|小剧场|片花', item.title[:match.start()]):
+        return match
+    return None
+
+
+def _chinese_number(value: str) -> int:
+    digits = dict(zip('零〇一二两三四五六七八九', (0, 0, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9)))
+    if value.isdecimal():
+        return int(value)
+    if all(char in digits for char in value):
+        return int(''.join(str(digits[char]) for char in value))
+    total = section = number = 0
+    for char in value:
+        if char in digits:
+            number = digits[char]
+        elif char == '万':
+            total += (section + number) * 10000
+            section = number = 0
+        else:
+            section += (number or 1) * {'十': 10, '百': 100, '千': 1000}[char]
+            number = 0
+    return total + section + number
+
+
+def numbered_title(item: MediaItem, width: int) -> str:
+    match = _episode_match(item)
+    if match is None:
+        return item.title
+    start, end = match.span(2)
+    return item.title[:start] + str(_chinese_number(match[2])).zfill(width) + item.title[end:]
 
 
 def load_selection(api: MaoerApi, item: MediaItem, whole_drama: bool) -> DownloadSelection:
@@ -46,6 +130,10 @@ def load_selection(api: MaoerApi, item: MediaItem, whole_drama: bool) -> Downloa
     episodes = list({entry.id: entry for entry in api.drama_episodes(drama.id)}.values())
     if not episodes:
         raise ApiError("该剧集没有可下载的音频")
+    main_count = sum(entry.subtitle.rsplit('/', 1)[-1].strip() == '正剧' for entry in episodes)
+    if not main_count:
+        main_count = sum(_episode_match(entry) is not None for entry in episodes)
+    number_width = 3 if main_count >= 100 else 2
     if item.kind == "sound":
         current = next((entry for entry in episodes if entry.id == item.id), None)
         if current is None:
@@ -54,8 +142,8 @@ def load_selection(api: MaoerApi, item: MediaItem, whole_drama: bool) -> Downloa
             episodes = [current]
         checked = [i for i, entry in enumerate(episodes) if entry.id == item.id]
     else:
-        checked = list(range(len(episodes)))
-    return DownloadSelection(drama.title, api.publisher_name_for_item(drama), episodes, checked)
+        checked = []
+    return DownloadSelection(drama.title, api.publisher_name_for_item(drama), episodes, checked, number_width)
 
 
 def file_name(title: str) -> str:
@@ -78,6 +166,8 @@ def folder_name(selection: DownloadSelection, include_publisher: bool) -> str:
 
 
 def check_cancel(cancel: threading.Event) -> None:
+    if isinstance(cancel, DownloadControl):
+        cancel.checkpoint()
     if cancel.is_set():
         raise DownloadCancelled()
 
@@ -205,7 +295,7 @@ def remux_audio(source_file, destination: Path, key: bytes | None,
 
 def download_audio(api: MaoerApi, item: MediaItem, folder: Path, cancel: threading.Event,
                    get_key: Callable[[PlaybackInfo], bytes],
-                   progress: Callable[[str, int], None]) -> Path:
+                   progress: Callable[[str, int], None], *, number_width: int | None = None) -> Path:
     check_cancel(cancel)
     progress('正在检查播放权限', 0)
     playback = api.playback_info(item)
@@ -221,7 +311,8 @@ def download_audio(api: MaoerApi, item: MediaItem, folder: Path, cancel: threadi
     if urlsplit(url).scheme not in {'http', 'https'}:
         raise ApiError("官网返回的音频地址无效")
     folder.mkdir(parents=True, exist_ok=True)
-    final = folder / (file_name(item.title) + extension)
+    title = numbered_title(item, number_width) if number_width is not None else item.title
+    final = folder / (file_name(title) + extension)
     if final.exists():
         raise FileExistsError()
     check_cancel(cancel)

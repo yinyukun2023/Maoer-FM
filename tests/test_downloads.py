@@ -16,7 +16,7 @@ import av
 import wx
 
 from app import MaoerFrame
-from download_dialog import DownloadDialog, _DownloadPlayer
+from download_dialog import DownloadDialog, DownloadProgressDialog, DownloadRequest, _DownloadPlayer
 from downloads import (DownloadCancelled, DownloadSelection, download_audio, file_name,
                        folder_name, load_selection, normalize_empty_saiz, remux_audio)
 from maoer_api import ApiError, MaoerApi, MediaItem, PlaybackInfo, PurchaseRequired
@@ -24,36 +24,29 @@ from maoer_api import ApiError, MaoerApi, MediaItem, PlaybackInfo, PurchaseRequi
 
 class DownloadTests(unittest.TestCase):
     def test_completion_sound_plays_for_each_completed_file_before_batch_finishes(self):
-        dialog = DownloadDialog.__new__(DownloadDialog)
-        dialog.cancel = threading.Event()
-        dialog.cookie = ''
-        dialog.player = None
-        dialog._key_done = Mock()
-        dialog._enable_options = Mock()
-        dialog.close_button = Mock()
-        dialog._status = Mock()
-        dialog.close_requested = False
-        dialog.results = Mock()
-        dialog.list = Mock()
-        dialog.path = Mock()
-        dialog.publisher = Mock()
-        dialog.publisher.GetValue.return_value = False
+        app = wx.GetApp() or wx.App(False)
         for outcomes in ((None,), (None, None, None),
                          (None, ApiError('失败'), FileExistsError(), None, DownloadCancelled())):
             with self.subTest(outcomes=outcomes), tempfile.TemporaryDirectory() as directory:
-                dialog.running = False
-                dialog.path.GetValue.return_value = directory
-                dialog.selection = DownloadSelection('剧名', '',
-                    [MediaItem('sound', i, str(i)) for i in range(len(outcomes))], [])
-                dialog.list.GetCheckedItems.return_value = tuple(range(len(outcomes)))
+                request = DownloadRequest('剧名',
+                    [MediaItem('sound', i, str(i)) for i in range(len(outcomes))], Path(directory), '')
+                dialog = DownloadProgressDialog(None, request)
+                self.addCleanup(dialog.Destroy)
+                self.addCleanup(dialog.timer.Stop)
+                dialog.running = True
+                queued = []
                 with patch('download_dialog.MaoerApi'), \
-                        patch('download_dialog.threading.Thread') as worker, \
-                        patch('download_dialog.wx.CallAfter', side_effect=lambda f, *a, **kw: f(*a, **kw)), \
+                        patch('download_dialog.wx.CallAfter', side_effect=lambda f, *a, **kw: queued.append((f, a, kw))), \
+                        patch('download_dialog.message_box'), \
+                        patch('download_dialog.play_download_failed_sound'), \
                         patch('download_dialog.play_download_completed_sound') as play, \
                         patch('download_dialog.download_audio') as download:
-                    def finish_file(api, item, folder, cancel, get_key, progress):
-                        # Earlier files must already have sounded, even if a later file fails.
-                        self.assertEqual(play.call_count, sum(value is None for value in outcomes[:item.id]))
+                    def finish_file(api, item, folder, cancel, get_key, progress, **options):
+                        # Each completed file queues its own cue before the next
+                        # task; queued GUI work is replayed on the main thread.
+                        cues = sum(callback.__name__ == '_task_result' and args[1] == 'complete'
+                                   for callback, args, kwargs in queued)
+                        self.assertEqual(cues, sum(value is None for value in outcomes[:item.id]))
                         outcome = outcomes[item.id]
                         if isinstance(outcome, DownloadCancelled):
                             cancel.set()
@@ -61,8 +54,9 @@ class DownloadTests(unittest.TestCase):
                             raise outcome
                         return folder / (item.title + '.m4a')
                     download.side_effect = finish_file
-                    dialog._start(None)
-                    worker.call_args.kwargs['target']()
+                    dialog._run()
+                    for callback, args, kwargs in queued:
+                        callback(*args, **kwargs)
                     self.assertEqual(play.call_count, sum(value is None for value in outcomes))
 
     @unittest.skipUnless(sys.platform == 'win32', 'Windows native accessibility')
@@ -105,7 +99,7 @@ class DownloadTests(unittest.TestCase):
                 self.assertEqual(dialog.destination.GetLabel(), '剧集文件夹：剧名【发布者】')
                 download.assert_not_called()
             self.assertEqual(dialog.path.GetName(), '下载路径')
-            self.assertEqual(dialog.results.GetName(), '下载结果')
+            self.assertFalse(hasattr(dialog, 'results'))
             frame = MaoerFrame.__new__(MaoerFrame)
             frame.api = Mock(cookie_header='')
             frame.list = Mock()
@@ -130,7 +124,6 @@ class DownloadTests(unittest.TestCase):
                 silent._queue_system_volume(0)
             volume.assert_not_called()
         finally:
-            dialog.reader.close()
             dialog.Destroy()
             owner.Destroy()
 
@@ -150,7 +143,7 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(single.checked, [0])
         self.assertEqual(batch.checked, [1])
         self.assertEqual(batch.items, episodes)
-        self.assertEqual(all_items.checked, [0, 1, 2])
+        self.assertEqual(all_items.checked, [])
         self.assertEqual(single.items[0].raw['vip'], 2)
         self.assertEqual(folder_name(single, False), '官网剧名')
         self.assertEqual(folder_name(single, True), '官网剧名【发布者】')

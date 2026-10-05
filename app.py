@@ -30,7 +30,7 @@ from browser_player import (
     HiddenBrowserPlayer,
     PlayerUnavailable,
 )
-from download_dialog import DownloadDialog
+from download_dialog import show_download_dialog
 from downloads import load_selection, download_error
 from login_dialog import AccountManagerDialog, CookieLoginDialog, LoginDialog, validated_account
 from maoer_api import (
@@ -5179,11 +5179,9 @@ class MaoerFrame(wx.Frame):
             if self._download_request is not token:
                 return
             self.SetStatusText("下载列表已加载")
-            dialog = DownloadDialog(self, selection, cookie, program_dir() / "下载")
             try:
-                dialog.ShowModal()
+                show_download_dialog(self, selection, cookie, program_dir() / "下载")
             finally:
-                dialog.Destroy()
                 self.list.SetFocus()
 
         self._run_background("正在获取下载列表…", load, ready,

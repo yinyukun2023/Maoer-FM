@@ -2524,8 +2524,9 @@ class MaoerApi:
             drm=self._is_bili_drm_sound(sound),
             duration_ms=_duration_ms(sound.get("duration")) or item.duration_ms,
             subtitle_url=_text(sound.get("subtitle_url")),
-            dash_audio=next((audio for audio in (sound.get("dash") or {}).get("audio", [])
-                             if isinstance(audio, dict) and audio.get("base_url")), {}),
+            dash_audio=max((audio for audio in (sound.get("dash") or {}).get("audio") or []
+                            if isinstance(audio, dict) and audio.get("base_url")),
+                           key=lambda audio: _to_int(audio.get("bandwidth"), 0), default={}),
             video_url=_text(sound.get("videourl")),
         )
 
