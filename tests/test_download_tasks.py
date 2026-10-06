@@ -116,13 +116,14 @@ class DownloadTaskTests(unittest.TestCase):
             selector.ShowModal.return_value = wx.ID_OK
             selector.Destroy.side_effect = lambda: events.append('selector destroyed')
             progress = Mock()
-            def create(*args):
+            def create(*args, **kwargs):
                 self.assertEqual(events, ['selector destroyed'])
                 return progress
             progress_type.side_effect = create
-            show_download_dialog(None, Mock(), '', self.root)
-            progress.ShowModal.assert_called_once()
-            progress.Destroy.assert_called_once()
+            self.assertIs(show_download_dialog(None, Mock(), '', self.root), progress)
+            progress.Show.assert_called_once()
+            progress.ShowModal.assert_not_called()
+            progress.Destroy.assert_not_called()
 
     def test_task_lists_preserve_selection_and_have_no_live_announcements(self):
         dialog = self.progress()
@@ -266,7 +267,7 @@ class DownloadTaskTests(unittest.TestCase):
             event = wx.CommandEvent(wx.EVT_BUTTON.typeId, wx.ID_CANCEL)
             event.SetEventObject(target)
             with patch('download_dialog.message_box', return_value=wx.NO) as confirm, \
-                    patch.object(dialog, 'EndModal') as close:
+                    patch.object(dialog, '_finish_window') as close:
                 target.GetEventHandler().ProcessEvent(event)
                 confirm.assert_called_once()
                 close.assert_not_called()
@@ -288,7 +289,7 @@ class DownloadTaskTests(unittest.TestCase):
             dialog._cancel_download(False)
         self.assertTrue(dialog.cancel.is_set())
         self.assertFalse(dialog.cancel.is_paused())
-        with patch('download_dialog.message_box') as message, patch.object(dialog, 'EndModal') as close:
+        with patch('download_dialog.message_box') as message, patch.object(dialog, '_finish_window') as close:
             dialog._finished(True)
         message.assert_not_called()
         close.assert_not_called()
@@ -302,14 +303,14 @@ class DownloadTaskTests(unittest.TestCase):
                 task.state, task.status = 'complete', '完成'
             dialog.auto_close.SetValue(close_after)
             with patch('download_dialog.message_box', return_value=wx.OK) as message, \
-                    patch.object(dialog, 'EndModal') as close:
+                    patch.object(dialog, '_finish_window') as close:
                 dialog._finished(False)
                 message.assert_called_once()
                 self.assertIn('恭喜，下载任务已完成', message.call_args.args[0])
                 self.assertEqual(close.call_count, int(close_after))
         dialog = self.progress()
         dialog.running = True
-        with patch('download_dialog.message_box', return_value=wx.YES), patch.object(dialog, 'EndModal') as close:
+        with patch('download_dialog.message_box', return_value=wx.YES), patch.object(dialog, '_finish_window') as close:
             dialog._close(None)
             close.assert_not_called()
             dialog._finished(True)

@@ -421,7 +421,7 @@ class DownloadControlTests(unittest.TestCase):
     def test_close_waits_until_clear_is_finished(self):
         dialog = self.dialog()
         dialog._clearing = True
-        with patch.object(dialog, 'EndModal') as end:
+        with patch.object(dialog, '_finish_window') as end:
             dialog._close(None)
             end.assert_not_called()
             dialog._clear_finished([], {})

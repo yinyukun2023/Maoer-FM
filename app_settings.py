@@ -52,6 +52,18 @@ def default_filter_presets() -> tuple[SubtitleFilterPreset, ...]:
 
 
 @dataclass(frozen=True)
+class DownloadSettings:
+    directory: str = ""
+    create_drama_folder: bool = True
+    # Keep the persisted key so existing opt-outs survive. Now covers both
+    # visible and hidden per-audio success/failure live-region notifications.
+    announce_hidden_complete: bool = True
+    play_sound: bool = True
+    auto_close_hidden: bool = True
+    escape_hides: bool = True
+
+
+@dataclass(frozen=True)
 class AppSettings:
     startup_sound: bool = True
     read_subtitle: bool = False
@@ -62,6 +74,7 @@ class AppSettings:
     output_device_id: str = ""
     playback_mode: str = "sequential"
     subtitle_offset_seconds: float = 0.0
+    downloads: DownloadSettings = field(default_factory=DownloadSettings)
 
 
 def _clean_strings(value: object, fallback: tuple[str, ...]) -> tuple[str, ...]:
@@ -142,6 +155,20 @@ def load_settings() -> AppSettings:
     mode = data.get("playback_mode")
     values["playback_mode"] = mode if mode in tuple(key for key, _label in PLAYBACK_MODES) else defaults.playback_mode
     values["subtitle_offset_seconds"] = normalize_subtitle_offset(data.get("subtitle_offset_seconds"))
+    raw_downloads = data.get("downloads")
+    if isinstance(raw_downloads, dict):
+        directory = raw_downloads.get("directory", "")
+        if not isinstance(directory, str) or '\0' in directory or not Path(directory).is_absolute():
+            directory = ""
+        download_values = {"directory": directory}
+        for name in ("create_drama_folder", "announce_hidden_complete", "auto_close_hidden", "escape_hides"):
+            value = raw_downloads.get(name)
+            download_values[name] = value if isinstance(value, bool) else getattr(defaults.downloads, name)
+        sound = raw_downloads.get("play_sound")
+        # Keep explicit opt-outs when merging the former two independent cues.
+        download_values["play_sound"] = sound if isinstance(sound, bool) else not any(
+            raw_downloads.get(name) is False for name in ("completed_sound", "failed_sound"))
+        values["downloads"] = DownloadSettings(**download_values)
     return AppSettings(**values)
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import mmap
 import os
@@ -73,6 +73,7 @@ class DownloadSelection:
     items: list[MediaItem]
     checked: list[int]
     number_width: int = 2
+    sequence_positions: dict[int, int] = field(default_factory=dict)
 
 
 EPISODE_NUMBER = re.compile(r'(第\s*)([0-9０-９零〇一二两三四五六七八九十百千万]+)(\s*[集期])')
@@ -126,10 +127,12 @@ def load_selection(api: MaoerApi, item: MediaItem, whole_drama: bool) -> Downloa
             if whole_drama or str(exc) != "该音频没有关联的剧集":
                 raise
             # Standalone sounds have no drama name: use their list name for both.
-            return DownloadSelection(item.title, api.publisher_name_for_item(item), [item], [0])
+            return DownloadSelection(item.title, api.publisher_name_for_item(item), [item], [0],
+                                     sequence_positions={item.id: 1})
     episodes = list({entry.id: entry for entry in api.drama_episodes(drama.id)}.values())
     if not episodes:
         raise ApiError("该剧集没有可下载的音频")
+    sequence_positions = {entry.id: index + 1 for index, entry in enumerate(episodes)}
     main_count = sum(entry.subtitle.rsplit('/', 1)[-1].strip() == '正剧' for entry in episodes)
     if not main_count:
         main_count = sum(_episode_match(entry) is not None for entry in episodes)
@@ -143,7 +146,8 @@ def load_selection(api: MaoerApi, item: MediaItem, whole_drama: bool) -> Downloa
         checked = [i for i, entry in enumerate(episodes) if entry.id == item.id]
     else:
         checked = []
-    return DownloadSelection(drama.title, api.publisher_name_for_item(drama), episodes, checked, number_width)
+    return DownloadSelection(drama.title, api.publisher_name_for_item(drama), episodes, checked,
+                             number_width, sequence_positions)
 
 
 def file_name(title: str) -> str:
@@ -295,7 +299,8 @@ def remux_audio(source_file, destination: Path, key: bytes | None,
 
 def download_audio(api: MaoerApi, item: MediaItem, folder: Path, cancel: threading.Event,
                    get_key: Callable[[PlaybackInfo], bytes],
-                   progress: Callable[[str, int], None], *, number_width: int | None = None) -> Path:
+                   progress: Callable[[str, int], None], *, number_width: int | None = None,
+                   filename_prefix: str = '') -> Path:
     check_cancel(cancel)
     progress('正在检查播放权限', 0)
     playback = api.playback_info(item)
@@ -312,7 +317,7 @@ def download_audio(api: MaoerApi, item: MediaItem, folder: Path, cancel: threadi
         raise ApiError("官网返回的音频地址无效")
     folder.mkdir(parents=True, exist_ok=True)
     title = numbered_title(item, number_width) if number_width is not None else item.title
-    final = folder / (file_name(title) + extension)
+    final = folder / (file_name(filename_prefix + title) + extension)
     if final.exists():
         raise FileExistsError()
     check_cancel(cancel)

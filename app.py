@@ -30,7 +30,8 @@ from browser_player import (
     HiddenBrowserPlayer,
     PlayerUnavailable,
 )
-from download_dialog import show_download_dialog
+from download_manager import DownloadManager
+from download_settings import DownloadSettingsDialog
 from downloads import load_selection, download_error
 from login_dialog import AccountManagerDialog, CookieLoginDialog, LoginDialog, validated_account
 from maoer_api import (
@@ -1089,13 +1090,18 @@ class DanmakuCanvas(wx.Panel):
         self._advance_position()
         return self.position
 
-    def sync_position(self, seconds: float, paused: bool, playback_rate: float | None = None) -> None:
+    def sync_position(self, seconds: float, paused: bool, playback_rate: float | None = None,
+                      *, reset_cursor: bool = False) -> None:
         target = max(0.0, float(seconds))
         self._advance_position()
         if playback_rate is not None:
             self.playback_rate = self._normalised_playback_rate(playback_rate)
-        if abs(self.position - target) > 0.75:
-            self.position = target
+        position_jump = abs(self.position - target) > 0.75
+        # Always anchor the clock to the media position. The threshold only
+        # decides whether to rebuild the cursor; ignoring smaller differences
+        # made asynchronous pause/resume latency a persistent subtitle delay.
+        self.position = target
+        if position_jump or reset_cursor:
             self._emitted_ids.clear()
             self.active = []
             self.next_index = self._first_index_at_or_after(self.position)
@@ -2246,6 +2252,7 @@ class PlaybackFrame(wx.Frame):
             seconds if position is None else position,
             bool(result.get("paused", False)),
             self.playback_rate,
+            reset_cursor=True,
         )
         self.book_filter_last_role = None
         self.time_announcement_generation += 1
@@ -2422,6 +2429,7 @@ class MaoerFrame(wx.Frame):
         self.hide_list_detail_column = False
         self.navigation_stack: list[NavigationState] = []
         self.homepage_state: NavigationState | None = None
+        self._search_request: object | None = None
         self.comment_windows: list[CommentsFrame] = []
         self.last_mouse_context_menu_at = 0.0
         self.account_logged_in = bool(self.api.cookie_header)
@@ -2440,6 +2448,7 @@ class MaoerFrame(wx.Frame):
         self._follow_status_pending: dict[int, object] = {}
 
         self._build_ui()
+        self.download_manager = DownloadManager(self, self._focus_after_download_hide)
         self._build_menu()
         self._bind_events()
         if self._account_store_error:
@@ -2514,6 +2523,8 @@ class MaoerFrame(wx.Frame):
         self.help_hotkeys_menu_id = wx.NewIdRef()
         self.help_update_log_menu_id = wx.NewIdRef()
         self.help_about_menu_id = wx.NewIdRef()
+        self.download_tasks_menu_id = wx.NewIdRef()
+        self.download_settings_menu_id = wx.NewIdRef()
         self.item_detail_shortcut_id = wx.NewIdRef()
         self.item_download_shortcut_id = wx.NewIdRef()
         self.drama_download_shortcut_id = wx.NewIdRef()
@@ -2566,6 +2577,11 @@ class MaoerFrame(wx.Frame):
         vip_menu.Append(self.vip_free_dramas_menu_id, "会员限免剧(&F)")
         vip_menu.Append(self.vip_discount_dramas_menu_id, "会员折扣剧(&D)")
         menu_bar.Append(vip_menu, "会员(&V)")
+
+        download_menu = wx.Menu()
+        download_menu.Append(self.download_tasks_menu_id, "下载任务(&T)")
+        download_menu.Append(self.download_settings_menu_id, "下载设置(&S)…")
+        menu_bar.Append(download_menu, "下载(&D)")
 
         settings_menu = wx.Menu()
         playback_mode_menu = wx.Menu()
@@ -2651,6 +2667,8 @@ class MaoerFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_item_detail_shortcut, id=self.item_detail_shortcut_id)
         self.Bind(wx.EVT_MENU, self.on_item_download_shortcut, id=self.item_download_shortcut_id)
         self.Bind(wx.EVT_MENU, self.on_drama_download_shortcut, id=self.drama_download_shortcut_id)
+        self.Bind(wx.EVT_MENU, self.on_download_tasks, id=self.download_tasks_menu_id)
+        self.Bind(wx.EVT_MENU, self.on_download_settings, id=self.download_settings_menu_id)
         self.Bind(wx.EVT_MENU, self.on_item_comments_shortcut, id=self.item_comments_shortcut_id)
         self.Bind(wx.EVT_MENU, self.on_item_browser_shortcut, id=self.item_browser_shortcut_id)
         self.SetAcceleratorTable(wx.AcceleratorTable([
@@ -2668,6 +2686,7 @@ class MaoerFrame(wx.Frame):
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
     def load_homepage(self, focus_list: bool = False) -> None:
+        self._search_request = None
         self._run_background(
             "正在加载首页...",
             self.api.homepage,
@@ -2677,18 +2696,31 @@ class MaoerFrame(wx.Frame):
     def on_search(self, event: wx.Event) -> None:
         keyword = self.search_box.GetValue().strip()
         focus_list = event.GetEventObject() is self.search_box
+        request = object()
+        self._search_request = request
+        api = self.api
         if not keyword:
             self.load_homepage(focus_list=focus_list)
             return
+
+        def load_page(page: int) -> list[MediaItem]:
+            return api.search(keyword, page) if self.api is api else []
+
+        def current() -> bool:
+            return self._search_request is request and self.api is api
+
+        def done(items: list[MediaItem]) -> None:
+            if current():
+                self._set_root_items(
+                    items, f"搜索: {keyword}", focus_list=focus_list,
+                    page_state=PageState(1, load_page, has_more=bool(items)),
+                )
+
         self._run_background(
             f"正在搜索: {keyword}",
-            lambda: self.api.search(keyword),
-            lambda items: self._set_root_items(
-                items,
-                f"搜索: {keyword}",
-                focus_list=focus_list,
-                page_state=PageState(1, lambda page: self.api.search(keyword, page)),
-            ),
+            lambda: load_page(1),
+            done,
+            on_error=lambda message: self.show_error(message) if current() else None,
         )
 
     def on_account_favorites(self, _event: wx.Event) -> None:
@@ -4514,6 +4546,7 @@ class MaoerFrame(wx.Frame):
         hide_detail_column: bool = False,
         opened_drama_id: int | None = None,
     ) -> None:
+        self._search_request = None
         self.current_title = title
         self.items = items
         self._remember_followed_items(items, title)
@@ -5163,6 +5196,8 @@ class MaoerFrame(wx.Frame):
         return None
 
     def show_download(self, item: MediaItem, *, whole_drama: bool = False) -> None:
+        if not self.download_manager.can_start():
+            return
         token = self._download_request = object()
         cookie = self.api.cookie_header
 
@@ -5176,17 +5211,34 @@ class MaoerFrame(wx.Frame):
                 api.session.close()
 
         def ready(selection):
-            if self._download_request is not token:
+            if self._download_request is not token or self.download_manager.exiting:
                 return
             self.SetStatusText("下载列表已加载")
-            try:
-                show_download_dialog(self, selection, cookie, program_dir() / "下载")
-            finally:
-                self.list.SetFocus()
+            self.download_manager.select(selection, cookie, program_dir() / "下载", self.settings.downloads)
 
         self._run_background("正在获取下载列表…", load, ready,
                              on_error=lambda message: self.show_error(message)
                              if self._download_request is token else None)
+
+    def _focus_after_download_hide(self) -> None:
+        if self and not self.IsBeingDeleted():
+            self.Show()
+            self.Raise()
+            self.list.SetFocus()
+
+    def on_download_tasks(self, _event) -> None:
+        self.download_manager.show_tasks()
+
+    def on_download_settings(self, _event) -> None:
+        def save(options):
+            updated = replace(self.settings, downloads=options)
+            save_settings(updated)
+            self.settings = updated
+        dialog = DownloadSettingsDialog(self, self.settings.downloads, program_dir() / "下载", save)
+        try:
+            dialog.ShowModal()
+        finally:
+            dialog.Destroy()
 
     def on_item_download_shortcut(self, _event: wx.CommandEvent) -> None:
         item = self._selected_shortcut_item()
@@ -5330,6 +5382,14 @@ class MaoerFrame(wx.Frame):
         message_box(message or "未知错误", "错误", wx.OK | wx.ICON_ERROR, self)
 
     def on_close(self, event: wx.CloseEvent) -> None:
+        manager = getattr(self, 'download_manager', None)
+        if manager is not None:
+            if not manager.request_exit(self.Close):
+                if event.CanVeto():
+                    event.Veto()
+                return
+            manager.dispose()
+        self._download_request = object()
         self._publisher_request = object()
         self._audio_poll_generation += 1
         self.audio_output_router.close()

@@ -1574,14 +1574,14 @@ class PlaybackMenuTests(unittest.TestCase):
                                           {"ok": True, "duration": 120, "paused": True})
         self.assertEqual(self.player.seek_to.call_args.args[0], 61.375)
         self.assertTrue(self.player.seek_to.call_args.kwargs["resume"])
-        sync.assert_called_once_with(61.375, False, 1.0)
+        sync.assert_called_once_with(61.375, False, 1.0, reset_cursor=True)
 
     def test_failed_resume_reports_seek_success_but_keeps_canvas_paused(self):
         self.frame.playback = PlaybackInfo(123, "声音", "https://example.com/audio.mp3", duration_ms=120000)
         with patch.object(self.frame.danmaku_canvas, "sync_position") as sync:
             self.frame._jump_to_time_done(self.frame.load_generation, 30,
                                          {"ok": True, "position": 30, "paused": True, "resume_error": True})
-        sync.assert_called_once_with(30, True, 1.0)
+        sync.assert_called_once_with(30, True, 1.0, reset_cursor=True)
         self.frame.status_reader.announce.assert_called_once_with("已跳转到30秒，但未能开始播放，请按空格重试")
 
     def test_f9_and_shift_f9_switch_output_and_only_announce_latest_result(self):
@@ -1776,7 +1776,7 @@ class PlaybackJumpTests(unittest.TestCase):
         frame.player.seek_to.assert_called_once()
         self.assertEqual(frame.player.seek_to.call_args.args[0], 250)
         self.assertTrue(frame.player.seek_to.call_args.kwargs["resume"])
-        frame.danmaku_canvas.sync_position.assert_called_once_with(250, False, 1.0)
+        frame.danmaku_canvas.sync_position.assert_called_once_with(250, False, 1.0, reset_cursor=True)
         frame.status_reader.announce.assert_called_once_with("已跳转到4分10秒")
         frame.screen_reader.announce.assert_not_called()
         event.Skip.assert_not_called()
