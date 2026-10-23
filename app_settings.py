@@ -12,6 +12,7 @@ from app_paths import app_data_dir
 
 SETTINGS_FILENAME = "settings.json"
 PLAYBACK_MODES = (("single_loop", "单曲循环"), ("sequential", "顺序播放"), ("stop", "不播放"))
+DOWNLOAD_CONTENT_MODES = (("audio", "音频"), ("subtitles", "字幕"), ("both", "音频加字幕"))
 MAX_SUBTITLE_OFFSET_SECONDS = 3600.0
 
 
@@ -61,6 +62,7 @@ class DownloadSettings:
     play_sound: bool = True
     auto_close_hidden: bool = True
     escape_hides: bool = True
+    content_mode: str = 'audio'
 
 
 @dataclass(frozen=True)
@@ -161,6 +163,9 @@ def load_settings() -> AppSettings:
         if not isinstance(directory, str) or '\0' in directory or not Path(directory).is_absolute():
             directory = ""
         download_values = {"directory": directory}
+        content_mode = raw_downloads.get('content_mode')
+        download_values['content_mode'] = (content_mode if content_mode in tuple(
+            key for key, _label in DOWNLOAD_CONTENT_MODES) else defaults.downloads.content_mode)
         for name in ("create_drama_folder", "announce_hidden_complete", "auto_close_hidden", "escape_hides"):
             value = raw_downloads.get(name)
             download_values[name] = value if isinstance(value, bool) else getattr(defaults.downloads, name)

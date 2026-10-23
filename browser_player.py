@@ -358,15 +358,21 @@ CONTROL_SCRIPT = r"""
           return;
         }
 
-        if (!state.handled && item && isFinite(item.duration) && item.duration > 0 && isFinite(item.currentTime)) {
-          if (item.currentTime >= Math.max(0, item.duration - 0.25)) {
+        // Initial duration estimates may be tiny while metadata is loading.
+        // Zero progress must never satisfy an "end minus tolerance" check.
+        // Prefer the real media clock over SoundManager's loading estimate.
+        if (!state.handled && item && isFinite(item.duration) && item.duration > 0 &&
+            isFinite(item.currentTime) && item.currentTime > 0 && item.readyState >= 2) {
+          if (item.currentTime >= item.duration - Math.min(0.25, item.duration * 0.01)) {
             markHandled(item, sound);
             return;
           }
         }
 
-        if (!state.handled && sound && isFinite(sound.duration) && sound.duration > 0 && isFinite(sound.position)) {
-          if (sound.position >= Math.max(0, sound.duration - 300)) {
+        if (!item && !state.handled && sound && isFinite(sound.duration) && sound.duration > 0 &&
+            isFinite(sound.position) && sound.position > 0 &&
+            (sound.readyState == null || sound.readyState === 3)) {
+          if (sound.position >= sound.duration - Math.min(300, sound.duration * 0.01)) {
             markHandled(item, sound);
           }
         }
@@ -926,6 +932,11 @@ CONTROL_SCRIPT = r"""
     function autoplay() {
       var sound = demo();
       var item = currentMedia();
+      if (!sound && !item && /bilibili\.com/.test(document.title || "") &&
+          /错误号\s*[:：]\s*412|security control policy/.test(
+            document.body && document.body.innerText || "")) {
+        return result({ok: false, error: "page-rejected"});
+      }
       setVolume(value);
 
       // The site's buttons toggle playback. Never click one when a player is
@@ -1128,11 +1139,13 @@ class HiddenBrowserPlayer:
         self._next_script_callback_id = 1
         self._autoplay_generation: int | None = None
         self._autoplay_timer: wx.CallLater | None = None
+        self._startup_reload_attempted = False
         self._system_volume_lock = threading.Lock()
         self._pending_system_volume: int | None = None
         self._system_volume_running = False
 
     def play(self, playback: PlaybackInfo) -> None:
+        self._startup_reload_attempted = False
         self._seek_generation += 1
         self._resume_request = None
         self._last_position = 0.0
@@ -1648,8 +1661,17 @@ class HiddenBrowserPlayer:
             # A failed recovery navigation must still allow Space to retry
             # this episode, using the same saved position.
             self._fail_pause_resume(self._resume_request)
-        else:
-            self._current = None
+        elif self._current is not None:
+            # A failed main-page navigation must not discard the track before
+            # startup can recover it. Ignore errors from old tracks/resources.
+            if self._event_sound_id(event) != self._current.sound_id:
+                event.Skip()
+                return
+            if (self._last_position == 0 and not self._suppress_autoplay and
+                    not self._startup_reload_attempted):
+                self._startup_reload_attempted = True
+                self._cancel_autoplay_timer()
+                self._autoplay_timer = wx.CallLater(2000, self._retry_startup_page, self._load_generation)
         self._page_loaded = False
         event.Skip()
 
@@ -1682,11 +1704,32 @@ class HiddenBrowserPlayer:
                 return
             if result and result.get("ok") and result.get("playing"):
                 self._apply_volume(self._volume)
+                if self._startup_reload_attempted:
+                    self._run_control("rate", self._playback_rate)
+                return
+            if result and result.get("error") == "page-rejected":
+                if not self._startup_reload_attempted:
+                    self._startup_reload_attempted = True
+                    self._autoplay_timer = wx.CallLater(2000, self._retry_startup_page, generation)
                 return
             if attempts > 1:
                 self._autoplay_timer = wx.CallLater(800, self._autoplay_step, generation, attempts - 1)
 
         self._run_control_callback("autoplay", self._volume, done)
+
+    def _retry_startup_page(self, generation: int) -> None:
+        self._autoplay_timer = None
+        if (generation != self._load_generation or self._current is None or
+                self._webview is None or self._suppress_autoplay):
+            return
+        # Retry the same official page once, without changing identity or URLs.
+        # Old callbacks must not interfere with the new page or another track.
+        self._load_generation += 1
+        self._autoplay_generation = None
+        self._page_loaded = False
+        self._install_user_scripts(self._webview)
+        page_url = self._current.page_url or f"{BASE_URL}/sound/player?id={self._current.sound_id}"
+        self._load_playback_url(page_url, self._load_generation)
 
     def _single_sound_guard_script(self) -> str:
         return f"{CONTROL_SCRIPT}({json.dumps('guard')}, {json.dumps(self._single_sound_guard_options())});"

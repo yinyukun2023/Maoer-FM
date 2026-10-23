@@ -48,11 +48,13 @@ class OutputRouterTests(unittest.TestCase):
         self.assertEqual(self.router.device_id, "")
         self.assertIn("设备离线", result["error"])
 
-    def test_default_can_be_saved_before_playback_but_cycle_requires_audio(self):
+    def test_default_and_cycle_are_deferred_until_audio_session_exists(self):
         self.player_audio_sessions.return_value = {}
         self.assertTrue(self.request(self.router.select, "b")["ok"])
         self.route.assert_not_called()
-        self.assertFalse(self.request(self.router.cycle, 1)["ok"])
+        self.assertTrue(self.request(self.router.cycle, 1)["ok"])
+        self.assertEqual(self.router.device_id, '')
+        self.assertTrue(self.request(self.router.cycle, -1)["ok"])
         self.player_audio_sessions.return_value = {42: {"a"}}
         self.assertTrue(self.request(self.router.poll)["ok"])
         self.route.assert_called_once_with("b", {42})

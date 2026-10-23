@@ -95,7 +95,7 @@ class DownloadRefinementTests(unittest.TestCase):
                                         self.root, Mock())
         self.addCleanup(dialog.Destroy)
         labels = [control.GetLabel() for control in dialog.GetChildren() if isinstance(control, wx.StaticText)]
-        self.assertEqual(labels, ['默认下载路径(&L)：'])
+        self.assertEqual(labels, ['默认下载路径(&L)：', '默认下载内容：'])
         self.assertEqual(dialog.path.GetName(), '默认下载路径')
         checkbox = dialog.options['announce_hidden_complete']
         self.assertEqual(checkbox.GetLabel(), '每个音频下载成功或失败时通过活动区域朗读(&R)')

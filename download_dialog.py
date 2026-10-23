@@ -12,10 +12,11 @@ import wx
 import wx.html2 as html2
 
 from app_paths import webview2_profile_dir
+from app_settings import DownloadSettings
 from browser_player import HiddenBrowserPlayer
 from download_queue import CreatedDownload, DownloadBatch
 from downloads import (DownloadCancelled, DownloadControl, DownloadSelection, check_cancel, download_audio,
-                       download_error, folder_name)
+                       download_error, download_subtitle, folder_name)
 from maoer_api import ApiError, MaoerApi, MediaItem, PlaybackInfo
 from startup_sound import play_download_completed_sound, play_download_failed_sound
 from ui_dialogs import message_box
@@ -134,6 +135,16 @@ class DownloadRequest:
     cookie: str = field(repr=False)
     number_width: int | None = None
     download_root: Path | None = None
+    options: DownloadSettings = field(default_factory=DownloadSettings)
+    filename_prefixes: dict[int, str] = field(default_factory=dict)
+    download_subtitles: bool = False
+    download_audio: bool = True
+
+
+@dataclass
+class DownloadPartResult:
+    state: str
+    reason: str = ''
 
 
 @dataclass
@@ -142,15 +153,18 @@ class DownloadTask:
     state: str = 'pending'
     status: str = '等待下载'
     reason: str = ''
+    parts: dict[str, DownloadPartResult] = field(default_factory=dict)
 
 
 class DownloadDialog(wx.Dialog):
     """Selection only: no worker, playback component or live announcements."""
-    def __init__(self, parent: wx.Window, selection: DownloadSelection, cookie: str, root: Path) -> None:
-        super().__init__(parent, title=f"选择下载音频 — {selection.title}", size=(760, 520),
+    def __init__(self, parent: wx.Window, selection: DownloadSelection, cookie: str, root: Path,
+                 *, options: DownloadSettings | None = None) -> None:
+        super().__init__(parent, title=f"下载剧集 — {selection.title}", size=(760, 520),
                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.selection = selection
         self.cookie = cookie
+        self.options = options or DownloadSettings()
         self.request: DownloadRequest | None = None
         layout = wx.BoxSizer(wx.VERTICAL)
         layout.Add(wx.StaticText(self, label='选择要下载的音频；空格切换勾选。'), 0, wx.ALL, 10)
@@ -187,10 +201,21 @@ class DownloadDialog(wx.Dialog):
         layout.Add(path_row, 0, wx.EXPAND | wx.ALL, 10)
         self.browse.Bind(wx.EVT_BUTTON, self._browse)
         self.publisher = wx.CheckBox(self, label='文件夹名带发布者标签(&P)')
-        self.publisher.Enable(bool(selection.publisher))
+        self.publisher.Enable(self.options.create_drama_folder and bool(selection.publisher))
         layout.Add(self.publisher, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        self.publisher.Show(self.options.create_drama_folder)
         self.numbered = wx.CheckBox(self, label='正剧集数按数字编号命名(&N)')
         layout.Add(self.numbered, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        self.by_list_order = wx.CheckBox(self, label='音频文件名按发布顺序数字编号命名(&O)')
+        layout.Add(self.by_list_order, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        layout.Add(wx.StaticText(self, label='按完整剧集列表位置添加编号，例如 01 原文件名；下载单集或部分音频也保留原序号。'),
+                   0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        self.subtitles = wx.CheckBox(self, label='下载剧集字幕')
+        self.subtitles.SetValue(self.options.content_mode in ('subtitles', 'both'))
+        layout.Add(self.subtitles, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        self.audio = wx.CheckBox(self, label='下载音频')
+        self.audio.SetValue(self.options.content_mode != 'subtitles')
+        layout.Add(self.audio, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         self.destination = wx.StaticText(self, label='')
         layout.Add(self.destination, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         self.publisher.Bind(wx.EVT_CHECKBOX, self._update_folder)
@@ -206,7 +231,7 @@ class DownloadDialog(wx.Dialog):
         layout.Add(buttons, 0, wx.EXPAND | wx.ALL, 10)
         self.start_button.Bind(wx.EVT_BUTTON, self._start)
         self.SetSizer(layout)
-        self.SetMinSize((740, 480))
+        self.SetMinSize((740, 600))
         self.CentreOnParent()
         self.list.SetFocus()
 
@@ -223,7 +248,8 @@ class DownloadDialog(wx.Dialog):
         self.list.SetFocus()
 
     def _update_folder(self, event=None) -> None:
-        self.destination.SetLabel('剧集文件夹：' + folder_name(self.selection, self.publisher.GetValue()))
+        self.destination.SetLabel('剧集文件夹：' + folder_name(self.selection, self.publisher.GetValue())
+                                  if self.options.create_drama_folder else '直接保存到下载路径，不创建剧集文件夹。')
 
     def _browse(self, event) -> None:
         with wx.DirDialog(self, '选择下载路径', defaultPath=self.path.GetValue(),
@@ -238,20 +264,35 @@ class DownloadDialog(wx.Dialog):
             message_box('请至少勾选一个音频。', '下载', wx.OK | wx.ICON_INFORMATION, self)
             self.list.SetFocus()
             return
+        if not (self.audio.GetValue() or self.subtitles.GetValue()):
+            message_box('请选择下载音频或下载剧集字幕。', '下载', wx.OK | wx.ICON_INFORMATION, self)
+            self.audio.SetFocus()
+            return
         root = Path(self.path.GetValue().strip()).expanduser()
-        if not self.path.GetValue().strip() or not root.is_absolute():
+        if not self.path.GetValue().strip() or '\0' in str(root) or not root.is_absolute():
             message_box('请选择或填写完整的下载路径。', '下载', wx.OK | wx.ICON_INFORMATION, self)
             self.path.SetFocus()
             return
+        folder = root / folder_name(self.selection, self.publisher.GetValue()) if self.options.create_drama_folder else root
+        prefixes = {}
+        if self.by_list_order.GetValue():
+            positions = self.selection.sequence_positions or {
+                item.id: index + 1 for index, item in enumerate(self.selection.items)}
+            width = max(2, len(str(max(positions.values()))))
+            prefixes = {item.id: f'{positions[item.id]:0{width}} ' for item in selected}
         self.request = DownloadRequest(
-            self.selection.title, selected, root / folder_name(self.selection, self.publisher.GetValue()),
+            self.selection.title, selected, folder,
             self.cookie, self.selection.number_width if self.numbered.GetValue() else None,
-            download_root=root)
+            download_root=root, options=self.options, filename_prefixes=prefixes,
+            download_subtitles=self.subtitles.GetValue(),
+            download_audio=self.audio.GetValue())
         self.EndModal(wx.ID_OK)
 
 
-def show_download_dialog(parent, selection, cookie, root) -> None:
-    selector = DownloadDialog(parent, selection, cookie, root)
+def show_download_dialog(parent, selection, cookie, root, *, options=None,
+                         on_hidden=None, on_closed=None, announce=None):
+    """Select modally, then return an owned modeless task window to the caller."""
+    selector = DownloadDialog(parent, selection, cookie, root, options=options)
     request = None
     try:
         if selector.ShowModal() == wx.ID_OK:
@@ -260,19 +301,27 @@ def show_download_dialog(parent, selection, cookie, root) -> None:
         selector.Destroy()
     if request is None:
         return
-    progress = DownloadProgressDialog(parent, request)
-    try:
-        wx.CallAfter(progress.start)
-        progress.ShowModal()
-    finally:
-        progress.Destroy()
+    progress = DownloadProgressDialog(parent, request, on_hidden=on_hidden, on_closed=on_closed, announce=announce)
+    progress.Show()
+    wx.CallAfter(progress.start)
+    return progress
 
 
 class DownloadProgressDialog(wx.Dialog):
-    def __init__(self, parent: wx.Window, request: DownloadRequest) -> None:
+    def __init__(self, parent: wx.Window, request: DownloadRequest, *, on_hidden=None,
+                 on_closed=None, announce=None) -> None:
         super().__init__(parent, title=f"下载任务 — {request.title}", size=(820, 660),
                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.request = request
+        self.options = request.options
+        self.hidden = False
+        self._last_focus = None
+        self._on_hidden = on_hidden
+        self._on_closed = on_closed
+        self._announce = announce
+        self._exiting = False
+        self._disposed = False
+        self._completion_pending = False
         self.cookie = request.cookie
         self.tasks = [DownloadTask(item) for item in request.items]
         self.cancel = DownloadBatch(len(self.tasks))
@@ -283,6 +332,7 @@ class DownloadProgressDialog(wx.Dialog):
         self.close_requested = False
         self._confirming_cancel = False
         self._deferred_finished = None
+        self._deferred_clear = None
         self._clear_requested = self._clearing = False
         self._created_files = {}
         self._ownership_errors = {}
@@ -312,34 +362,108 @@ class DownloadProgressDialog(wx.Dialog):
         self.pending_list.Bind(wx.EVT_CONTEXT_MENU, self._on_task_context_menu)
         self.pending_list.Bind(wx.EVT_CHAR_HOOK, self._on_task_key)
         _label, self.completed_list = make_list('已下载')
-        self.failed_label, self.failed_list = make_list('下载失败', True)
-        self.failed_list.Bind(wx.EVT_CONTEXT_MENU, self._on_task_context_menu)
-        self.failed_list.Bind(wx.EVT_CHAR_HOOK, self._on_task_key)
-        self.failed_label.Hide()
-        self.failed_list.Hide()
+        self.audio_failed_label, self.audio_failed_list = make_list('音频下载失败', True)
+        self.subtitle_failed_label, self.subtitle_failed_list = make_list('字幕下载失败', True)
+        self.failed_label, self.failed_list = self.audio_failed_label, self.audio_failed_list
+        self._failure_lists = (self.audio_failed_list, self.subtitle_failed_list)
+        for label, control in ((self.audio_failed_label, self.audio_failed_list),
+                               (self.subtitle_failed_label, self.subtitle_failed_list)):
+            control.Bind(wx.EVT_CONTEXT_MENU, self._on_task_context_menu)
+            control.Bind(wx.EVT_CHAR_HOOK, self._on_task_key)
+            label.Hide()
+            control.Hide()
         self.auto_close = wx.CheckBox(self, label='下载完成后关闭窗口(&A)')
+        self.auto_close.SetValue(False)
         layout.Add(self.auto_close, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         buttons = wx.BoxSizer(wx.HORIZONTAL)
         self.open_folder_button = wx.Button(self, label='打开下载文件夹(&O)')
         self.pause_button = wx.Button(self, label='全部暂停(&P)')
         self.cancel_button = wx.Button(self, label='停止下载(&C)')
         self.clear_button = wx.Button(self, label='全部取消(&Q)')
+        self.hide_button = wx.Button(self, label='隐藏窗口（Ctrl+Shift+X）')
         self.close_button = wx.Button(self, wx.ID_CANCEL, label='关闭(&X)')
-        for button in (self.open_folder_button, self.pause_button, self.cancel_button, self.clear_button, self.close_button):
+        for button in (self.open_folder_button, self.pause_button, self.cancel_button, self.clear_button,
+                       self.hide_button, self.close_button):
             buttons.Add(button, 0, wx.RIGHT, 8)
         layout.Add(buttons, 0, wx.ALL | wx.ALIGN_RIGHT, 10)
         self.open_folder_button.Bind(wx.EVT_BUTTON, self._open_folder)
         self.pause_button.Bind(wx.EVT_BUTTON, self._toggle_pause)
         self.cancel_button.Bind(wx.EVT_BUTTON, lambda event: self._cancel_download(False))
         self.clear_button.Bind(wx.EVT_BUTTON, self._cancel_all)
+        self.hide_button.Bind(wx.EVT_BUTTON, self._hide)
         # Dialog-generated Cancel events (including Escape) must confirm too.
         self.Bind(wx.EVT_BUTTON, self._close, id=wx.ID_CANCEL)
         self.Bind(wx.EVT_CLOSE, self._close)
+        self.Bind(wx.EVT_CHAR_HOOK, self._on_window_key)
         self.SetSizer(layout)
         self.SetMinSize((760, 580))
-        self._refresh_lists()
+        self._refresh_controls()
         self.CentreOnParent()
         self.pending_list.SetFocus()
+
+    @property
+    def busy(self) -> bool:
+        return self.running or self._clearing or self._clear_requested or self._completion_pending or not self._started
+
+    def restore(self) -> None:
+        if self._disposed:
+            return
+        self.hidden = False
+        self.Show()
+        self.Raise()
+        focus = self._last_focus
+        if not focus or not focus.IsShown() or not focus.IsEnabled():
+            focus = self.pending_list if self.running else (
+                next((control for control in self._failure_lists if control.GetItemCount()), self.completed_list))
+        focus.SetFocus()
+
+    def _hide(self, event) -> None:
+        if self._disposed or self._exiting or self._confirming_cancel or self._completion_pending:
+            return
+        focus = wx.Window.FindFocus()
+        if focus and focus.GetTopLevelParent() is self:
+            self._last_focus = focus
+        self.hidden = True
+        self.Hide()
+        if self._on_hidden:
+            self._on_hidden()
+
+    def _on_window_key(self, event) -> None:
+        if event.GetKeyCode() == wx.WXK_ESCAPE and event.GetModifiers() == wx.MOD_NONE:
+            if self.options.escape_hides:
+                self._hide(event)
+            else:
+                # The native Cancel button is hidden while busy, so wx cannot
+                # reliably generate its normal Escape command for us.
+                self._close(event)
+            return
+        event.Skip()
+
+    def stop_for_exit(self) -> None:
+        """Called only after the application's exit confirmation was accepted."""
+        self._exiting = self.close_requested = True
+        self.cancel.set()
+        self._cancel_keys()
+        if not self._started:
+            self._started = True  # A queued start callback must not start a new worker.
+        self._finish_deferred()
+        if not self.running and not self._clearing and not self._clear_requested:
+            self._finish_window(wx.ID_CANCEL)
+        elif not self._disposed:
+            self._refresh_controls()
+
+    def _finish_window(self, code=wx.ID_CANCEL) -> None:
+        if self._disposed or self.running or self._clearing or self._completion_pending:
+            return
+        self._disposed = True
+        self.timer.Stop()
+        if self.player is not None:
+            self.player.shutdown()
+            self.player = None
+        self._last_focus = None
+        if self._on_closed:
+            self._on_closed(self)
+        self.Destroy()
 
     def _refresh_lists(self) -> None:
         if not self or self.IsBeingDeleted():
@@ -347,13 +471,19 @@ class DownloadProgressDialog(wx.Dialog):
         groups = (
             (self.pending_list, [i for i, task in enumerate(self.tasks)
                                  if task.state in {'pending', 'downloading', 'cancelling', 'cancelled'}]),
-            (self.completed_list, [i for i, task in enumerate(self.tasks) if task.state == 'complete']),
-            (self.failed_list, [i for i, task in enumerate(self.tasks) if task.state in {'failed', 'skipped'}]),
+            (self.completed_list, [i for i, task in enumerate(self.tasks) if task.state == 'complete'
+                                  or (task.state != 'cleared' and any(
+                                      part.state in {'complete', 'skipped'} for part in task.parts.values()))]),
+            (self.audio_failed_list, [i for i, task in enumerate(self.tasks) if self._part_failed(task, 'audio')]),
+            (self.subtitle_failed_list, [i for i, task in enumerate(self.tasks) if self._part_failed(task, 'subtitle')]),
         )
-        show_failed = bool(groups[2][1])
-        if self.failed_list.IsShown() != show_failed:
-            self.failed_label.Show(show_failed)
-            self.failed_list.Show(show_failed)
+        visibility_changed = False
+        for (control, ids), label in zip(groups[2:], (self.audio_failed_label, self.subtitle_failed_label)):
+            if control.IsShown() != bool(ids):
+                label.Show(bool(ids))
+                control.Show(bool(ids))
+                visibility_changed = True
+        if visibility_changed:
             self.Layout()
         for control, ids in groups:
             previous = [control.GetItemData(row) for row in range(control.GetItemCount())]
@@ -382,55 +512,107 @@ class DownloadProgressDialog(wx.Dialog):
                               and self.cancel.active != task_id):
                             status = '等待继续：' + status
                     values = [task.item.title, status]
-                    if control is self.failed_list:
-                        values.append(task.reason)
+                    if control in self._failure_lists:
+                        kind = 'audio' if control is self.audio_failed_list else 'subtitle'
+                        part = task.parts.get(kind)
+                        values[1] = '失败' if part else task.status
+                        values.append(part.reason if part else task.reason)
                     for column, text in enumerate(values):
                         if control.GetItemText(row, column) != text:
                             control.SetItem(row, column, text)
             finally:
                 control.Thaw()
 
+    def _part_failed(self, task: DownloadTask, kind: str) -> bool:
+        if task.state == 'cleared':
+            return False
+        if task.parts:
+            part = task.parts.get(kind)
+            return part is not None and part.state == 'failed'
+        # Single-outcome callers still identify the requested content correctly.
+        default_kind = 'audio' if self.request.download_audio else 'subtitle'
+        return kind == default_kind and task.state in {'failed', 'skipped'}
+
     def start(self) -> None:
-        if not self or self.IsBeingDeleted() or self._started:
+        if not self or self.IsBeingDeleted() or self._started or self._disposed or self._exiting:
             return
         self._started = self.running = True
+        self._refresh_controls()
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self) -> None:
         def work(index, control):
+            if not (self.request.download_audio or self.request.download_subtitles):
+                raise ApiError('请选择下载音频或下载剧集字幕')
             api = MaoerApi(cookie=self.cookie)
             try:
-                return download_audio(api, self.tasks[index].item, self.request.folder, control,
-                                      lambda playback: self._get_key(playback, control),
-                                      lambda stage, percent: wx.CallAfter(self._task_progress, index, stage, percent),
-                                      number_width=self.request.number_width)
+                item = self.tasks[index].item
+                prefix = self.request.filename_prefixes.get(item.id, '')
+                naming = {'filename_prefix': prefix} if prefix else {}
+                progress = lambda stage, percent: wx.CallAfter(self._task_progress, index, stage, percent)
+
+                parts = {}
+                for kind, enabled in (('audio', self.request.download_audio),
+                                      ('subtitle', self.request.download_subtitles)):
+                    if not enabled:
+                        continue
+                    try:
+                        check_cancel(control)
+                        if kind == 'audio':
+                            path = download_audio(api, item, self.request.folder, control,
+                                lambda playback: self._get_key(playback, control), progress,
+                                number_width=self.request.number_width, **naming)
+                        else:
+                            path = download_subtitle(api, item, self.request.folder, control, progress,
+                                                    number_width=self.request.number_width, **naming)
+                            if path is None:
+                                raise ApiError('该集暂无可下载的字幕')
+                        self._record_output(index if kind == 'audio' else (index, 'subtitle'), path)
+                        parts[kind] = DownloadPartResult('complete')
+                    except DownloadCancelled:
+                        parts[kind] = DownloadPartResult('cancelled')
+                        break
+                    except FileExistsError:
+                        parts[kind] = DownloadPartResult('skipped', '同名文件已存在，已跳过（未覆盖）')
+                    except Exception as exc:
+                        if control.is_set():
+                            parts[kind] = DownloadPartResult('cancelled')
+                            break
+                        parts[kind] = DownloadPartResult('failed', download_error(exc))
+                return parts
             finally:
                 api.session.close()
 
-        def result(index, path, error):
+        def result(index, parts, error):
             if error is None:
-                # The worker records ownership before any queued UI callback;
-                # a stop/clear racing the final rename cannot miss this file.
-                try:
-                    created = CreatedDownload.capture(path, self.request.folder)
-                except OSError:
-                    with self._output_lock:
-                        self._ownership_errors[index] = '无法核实文件位置或身份，未自动删除'
-                else:
-                    with self._output_lock:
-                        self._created_files[index] = created
-                state, reason = 'complete', ''
-            elif isinstance(error, DownloadCancelled) or self.controls[index].is_set():
-                state, reason = 'cancelled', ''
+                states = {part.state for part in parts.values()}
+                state = next((value for value in ('failed', 'cancelled', 'complete') if value in states), 'skipped')
             else:
-                state = 'skipped' if isinstance(error, FileExistsError) else 'failed'
-                reason = download_error(error)
-            wx.CallAfter(self._task_result, index, state, reason)
+                state = ('cancelled' if isinstance(error, DownloadCancelled) or self.controls[index].is_set()
+                         else 'skipped' if isinstance(error, FileExistsError) else 'failed')
+                parts = {kind: DownloadPartResult(state, '' if state == 'cancelled' else download_error(error))
+                         for kind, enabled in (('audio', self.request.download_audio),
+                                               ('subtitle', self.request.download_subtitles)) if enabled}
+            labels = {'audio': '音频', 'subtitle': '字幕'}
+            reason = '；'.join(f'{labels[kind]}：{part.reason}' for kind, part in parts.items()
+                              if part.reason and (part.state == 'failed' or state == 'skipped'))
+            wx.CallAfter(self._task_result, index, state, reason, parts)
 
         try:
             self.cancel.run(work, result)
         finally:
             wx.CallAfter(self._finished, self.cancel.is_set())
+
+    def _record_output(self, key, path: Path) -> None:
+        # Record each completed file before another step can fail or cancel.
+        try:
+            created = CreatedDownload.capture(path, self.request.folder)
+        except OSError:
+            with self._output_lock:
+                self._ownership_errors[key] = '无法核实文件位置或身份，未自动删除'
+        else:
+            with self._output_lock:
+                self._created_files[key] = created
 
     def _task_progress(self, index: int, stage: str, percent: int) -> None:
         if not self or self.IsBeingDeleted() or not self.running:
@@ -442,20 +624,35 @@ class DownloadProgressDialog(wx.Dialog):
         task.status = f'{stage} {max(0, min(100, percent))}%'
         self._refresh_lists()
 
-    def _task_result(self, index: int, state: str, reason: str) -> None:
+    def _task_result(self, index: int, state: str, reason: str,
+                     parts: dict[str, DownloadPartResult] | None = None) -> None:
         if not self or self.IsBeingDeleted() or not self.running:
             return
         task = self.tasks[index]
         if task.state in {'complete', 'failed', 'skipped', 'cleared'}:
             return
         task.state = state
+        if parts is not None:
+            task.parts = parts
         task.status = {'complete': '完成', 'failed': '失败', 'skipped': '已跳过', 'cancelled': '已取消'}[state]
+        if len(task.parts) > 1:
+            labels = {'audio': '音频', 'subtitle': '字幕'}
+            statuses = {'complete': '完成', 'failed': '失败', 'skipped': '已存在', 'cancelled': '已取消'}
+            task.status = '；'.join(labels[kind] + statuses[part.state] for kind, part in task.parts.items())
+        if state in {'complete', 'skipped'} and reason:
+            task.status += f'（{reason}）'
         task.reason = reason
         self._refresh_lists()
-        if state == 'complete':
+        if state == 'complete' and self.options.play_sound:
             play_download_completed_sound()
-        elif state == 'failed':
+        elif state == 'failed' and self.options.play_sound:
             play_download_failed_sound()
+        if (state in {'complete', 'failed'} and self.options.announce_hidden_complete
+                and self._announce and not self._exiting and not self._clear_requested):
+            message = f'{task.item.title}下载完成' if state == 'complete' else f'{task.item.title}下载失败'
+            if state == 'failed' and reason:
+                message += f'：{reason}'
+            self._announce(message)
 
     def _get_key(self, playback: PlaybackInfo, control: DownloadControl) -> bytes:
         ready = threading.Event()
@@ -495,7 +692,9 @@ class DownloadProgressDialog(wx.Dialog):
         self.key_pending = False
         try:
             if self.player is None:
-                self.player = _DownloadPlayer(self, self.cookie)
+                # Keep the WebView on the main window: hiding this task window
+                # must not hide, suspend or destroy the media preparation host.
+                self.player = _DownloadPlayer(self.GetParent() or self, self.cookie)
             self.player.play(playback)
             self.timer.Start(500)
         except Exception:
@@ -576,7 +775,9 @@ class DownloadProgressDialog(wx.Dialog):
 
     def _on_task_key(self, event) -> None:
         if event.GetKeyCode() in (wx.WXK_MENU, wx.WXK_WINDOWS_MENU) or (event.GetKeyCode() == wx.WXK_F10 and event.ShiftDown()):
-            if event.GetEventObject() is self.failed_list:
+            if event.GetEventObject() is self.subtitle_failed_list:
+                self._show_failed_menu(control=self.subtitle_failed_list)
+            elif event.GetEventObject() is self.failed_list:
                 self._show_failed_menu()
             else:
                 self._show_task_menu()
@@ -584,8 +785,10 @@ class DownloadProgressDialog(wx.Dialog):
         event.Skip()
 
     def _on_task_context_menu(self, event) -> None:
-        control = self.failed_list if event.GetEventObject() is self.failed_list else self.pending_list
-        show = self._show_failed_menu if control is self.failed_list else self._show_task_menu
+        control = event.GetEventObject() if event.GetEventObject() in self._failure_lists else self.pending_list
+        show = (lambda position=wx.DefaultPosition: self._show_failed_menu(position, control=control)) \
+            if control is self.subtitle_failed_list else self._show_failed_menu \
+            if control is self.failed_list else self._show_task_menu
         position = event.GetPosition()
         if position == wx.DefaultPosition:
             show()
@@ -601,27 +804,29 @@ class DownloadProgressDialog(wx.Dialog):
         control.Focus(row)
         show(position)
 
-    def _show_failed_menu(self, position=wx.DefaultPosition) -> None:
-        row = self.failed_list.GetFirstSelected()
+    def _show_failed_menu(self, position=wx.DefaultPosition, *, control=None) -> None:
+        control = control if control is not None else self.failed_list
+        row = control.GetFirstSelected()
         if row < 0 or self._clearing or self._clear_requested or self.close_requested or self._confirming_cancel:
             return
         if self.running and self.cancel.is_set():
             return
-        index = self.failed_list.GetItemData(row)
+        index = control.GetItemData(row)
         menu = wx.Menu()
         restart = menu.Append(wx.ID_ANY, '重新开始(&R)')
         restart_all = menu.Append(wx.ID_ANY, '全部开始(&A)')
         restart.Enable(self.tasks[index].state == 'failed')
-        restart_all.Enable(any(task.state == 'failed' for task in self.tasks))
+        indices = [control.GetItemData(row) for row in range(control.GetItemCount())]
+        restart_all.Enable(any(self.tasks[index].state == 'failed' for index in indices))
         restart_id, all_id = restart.GetId(), restart_all.GetId()
         try:
-            choice = self.failed_list.GetPopupMenuSelectionFromUser(menu, position)
+            choice = control.GetPopupMenuSelectionFromUser(menu, position)
         finally:
             menu.Destroy()
         if choice == restart_id:
             self._retry_tasks([index])
         elif choice == all_id:
-            self._retry_tasks(list(range(len(self.tasks))))
+            self._retry_tasks(indices)
 
     def _retry_tasks(self, indices: list[int]) -> None:
         if (not self or self.IsBeingDeleted() or self._clearing or self._clear_requested
@@ -636,6 +841,7 @@ class DownloadProgressDialog(wx.Dialog):
         for index in indices:
             task = self.tasks[index]
             task.state, task.status, task.reason = 'pending', '等待重试', ''
+            task.parts = {}
         self.cancel.retry(indices)
         self._retry_requested = True
         if not self.running:
@@ -754,23 +960,33 @@ class DownloadProgressDialog(wx.Dialog):
         threading.Thread(target=clean, daemon=True).start()
 
     def _clear_finished(self, removed, errors) -> None:
+        if self._confirming_cancel:
+            self._deferred_clear = (removed, errors)
+            return
         self._clearing = self._clear_requested = False
         with self._output_lock:
             for index in removed:
                 self._created_files.pop(index, None)
                 self._ownership_errors.pop(index, None)
-                self.tasks[index].state, self.tasks[index].status = 'cleared', '已清理'
+                task_index = index[0] if isinstance(index, tuple) else index
+                self.tasks[task_index].state, self.tasks[task_index].status = 'cleared', '已清理'
         self._refresh_controls()
         if errors:
-            details = '\n'.join(f'{self.tasks[index].item.title}：{reason}' for index, reason in errors.items())
-            message_box(f'已清理本次任务的 {len(removed)} 个文件。以下文件已保留：\n{details}',
-                        '部分文件未清理', wx.OK | wx.ICON_WARNING, self)
+            details = '\n'.join(f'{self.tasks[index[0] if isinstance(index, tuple) else index].item.title}：{reason}'
+                                for index, reason in errors.items())
+            message = f'已清理本次任务的 {len(removed)} 个文件。以下文件已保留：\n{details}'
         else:
-            message_box(f'本次任务已全部取消，已清理本次下载的 {len(removed)} 个文件。原来已有的文件未改动。',
-                        '全部取消', wx.OK | wx.ICON_INFORMATION, self)
+            message = f'本次任务已全部取消，已清理本次下载的 {len(removed)} 个文件。原来已有的文件未改动。'
+        if not self._exiting:
+            if self.hidden:
+                if self.options.announce_hidden_complete and self._announce:
+                    self._announce(message)
+            else:
+                message_box(message, '部分文件未清理' if errors else '全部取消',
+                            wx.OK | (wx.ICON_WARNING if errors else wx.ICON_INFORMATION), self)
         if self.close_requested:
-            self.EndModal(wx.ID_CANCEL)
-        else:
+            self._finish_window(wx.ID_CANCEL)
+        elif not self.hidden:
             self.close_button.SetFocus()
 
     def _toggle_pause(self, event) -> None:
@@ -789,6 +1005,8 @@ class DownloadProgressDialog(wx.Dialog):
         self.pause_button.SetLabel('全部继续(&P)' if self.cancel.is_paused() else '全部暂停(&P)')
         self.clear_button.Enable(not self._clear_requested and not self._clearing and
                                  (self.running or bool(self._created_files)))
+        if self.close_button.Show(not self.busy):
+            self.Layout()
         self._refresh_lists()
 
     def _open_folder(self, event) -> None:
@@ -830,6 +1048,9 @@ class DownloadProgressDialog(wx.Dialog):
         if self._deferred_finished is not None:
             cancelled, self._deferred_finished = self._deferred_finished, None
             self._finished(cancelled)
+        if not self._disposed and self._deferred_clear is not None:
+            result, self._deferred_clear = self._deferred_clear, None
+            self._clear_finished(*result)
 
     def _finished(self, cancelled: bool) -> None:
         if not self or self.IsBeingDeleted() or not self.running:
@@ -859,26 +1080,51 @@ class DownloadProgressDialog(wx.Dialog):
             self._begin_clear()
             return
         if self.close_requested:
-            self.EndModal(wx.ID_CANCEL)
+            self._finish_window(wx.ID_CANCEL)
             return
         if not cancelled:
             completed = sum(task.state == 'complete' for task in self.tasks)
             failed = sum(task.state == 'failed' for task in self.tasks)
             skipped = sum(task.state == 'skipped' for task in self.tasks)
             removed = sum(task.state == 'cancelled' for task in self.tasks)
-            message_box(f'恭喜，下载任务已完成。\n完成 {completed}，失败 {failed}，跳过 {skipped}，已取消 {removed}。',
-                        '下载完成', wx.OK | wx.ICON_INFORMATION, self)
-            if self.auto_close.GetValue():
-                self.EndModal(wx.ID_OK)
+            message = f'恭喜，下载任务已完成。\n完成 {completed}，失败 {failed}，跳过 {skipped}，已取消 {removed}。'
+            if self.request.download_subtitles:
+                audio_failed = sum(self._part_failed(task, 'audio') for task in self.tasks)
+                subtitle_failed = sum(self._part_failed(task, 'subtitle') for task in self.tasks)
+                message += f'\n音频失败 {audio_failed}，字幕失败 {subtitle_failed}。'
+            hidden = self.hidden
+            self._completion_pending = True
+            try:
+                # A hidden task still reports batch completion in a real dialog.
+                # Use its visible owner so Windows never buries it behind a hidden window.
+                message_box(message, '下载完成', wx.OK | wx.ICON_INFORMATION,
+                            (self.GetParent() or self) if hidden else self)
+            finally:
+                self._completion_pending = False
+            if hidden:
+                if self.options.announce_hidden_complete and self._announce:
+                    self._announce(f'{self.request.title}：{message}')
+                close = self.options.auto_close_hidden
+            else:
+                close = self.auto_close.GetValue()
+            if close:
+                self._finish_window(wx.ID_OK)
                 return
-        if self.failed_list.GetItemCount():
-            self.failed_list.SetFocus()
+        if self.hidden:
+            return
+        failures = next((control for control in self._failure_lists if control.GetItemCount()), None)
+        if failures is not None:
+            failures.SetFocus()
         elif self.completed_list.GetItemCount():
             self.completed_list.SetFocus()
         else:
             self.close_button.SetFocus()
 
     def _close(self, event) -> None:
+        if self._completion_pending:
+            if isinstance(event, wx.CloseEvent) and event.CanVeto():
+                event.Veto()
+            return
         if self._clearing:
             self.close_requested = True
             if isinstance(event, wx.CloseEvent) and event.CanVeto():
@@ -890,4 +1136,4 @@ class DownloadProgressDialog(wx.Dialog):
                 event.Veto()
             return
         self.timer.Stop()
-        self.EndModal(wx.ID_CANCEL)
+        self._finish_window(wx.ID_CANCEL)

@@ -2490,7 +2490,18 @@ class MaoerApi:
         return self.album_sounds(album_id)[start:end]
 
     def playback_info(self, item: MediaItem) -> PlaybackInfo:
-        data = self._get("/sound/getsound", {"soundid": item.id})
+        # This endpoint sometimes reports an existing sound as missing even
+        # with a valid login. Recheck only this logical error, not permission,
+        # authentication, HTTP or network failures. Keep the same account.
+        for attempt in range(3):
+            try:
+                data = self._get("/sound/getsound", {"soundid": item.id})
+                break
+            except ApiError as exc:
+                if (str(exc).strip().rstrip('。.!！') not in {'该音频不存在', '音频不存在'}
+                        or attempt == 2):
+                    raise
+                time.sleep(0.1 * (attempt + 1))
         info = data.get("info") or {}
         sound = info.get("sound") or {}
         if not isinstance(sound, dict):

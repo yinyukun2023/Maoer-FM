@@ -259,7 +259,10 @@ class AudioOutputRouter:
         def operation():
             self.devices = list_output_devices()
             index = next((i for i, item in enumerate(self.devices) if item.id == self.device_id), 0)
-            return self._apply(self.devices[(index + direction) % len(self.devices)], True)
+            # A short/loading/paused clip may not have an audio session yet.
+            # Keep the choice and let poll apply it when the session appears,
+            # just as selecting the default device before playback does.
+            return self._apply(self.devices[(index + direction) % len(self.devices)], False)
         self._submit(operation, callback)
 
     def poll(self, callback=None):

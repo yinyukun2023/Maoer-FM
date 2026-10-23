@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import json
+import math
 import mmap
 import os
 from pathlib import Path
@@ -11,12 +13,12 @@ import tempfile
 import threading
 import time
 from typing import Callable
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import av
 import requests
 
-from maoer_api import ApiError, MaoerApi, MediaItem, PlaybackInfo, PurchaseRequired
+from maoer_api import BASE_URL, ApiError, MaoerApi, MediaItem, PlaybackInfo, PurchaseRequired
 
 
 class DownloadCancelled(Exception):
@@ -295,6 +297,182 @@ def remux_audio(source_file, destination: Path, key: bytes | None,
             check.seek(check.duration - 2 * av.time_base)
             if next(check.decode(audio=0), None) is None:
                 raise ApiError("下载的音频末尾不完整")
+
+
+def _subtitle_milliseconds(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return round(number) if math.isfinite(number) and number >= 0 else None
+
+
+def subtitles_to_srt(data: object, duration_ms: int | None = None,
+                     cancel: threading.Event | None = None) -> str:
+    """Convert independent subtitle rows to UTF-8-ready SubRip text."""
+    if not isinstance(data, list):
+        raise ApiError('字幕文件格式不正确，无法转换为 SRT')
+    rows = []
+    duration = _subtitle_milliseconds(duration_ms)
+    duration = duration if duration else None
+    for row in data:
+        if cancel is not None:
+            check_cancel(cancel)
+        captions = MaoerApi._parse_independent_subtitles([row])
+        if not captions:
+            continue
+        start = _subtitle_milliseconds(row.get('start_time'))
+        if start is None or (duration is not None and start >= duration):
+            continue
+        # Blank lines delimit SRT cues, so retain text lines without empty separators.
+        text = '\n'.join(line for line in captions[0].text.splitlines() if line.strip())
+        if text:
+            rows.append((start, _subtitle_milliseconds(row.get('end_time')), text))
+    rows.sort(key=lambda row: row[0])
+    starts = sorted({row[0] for row in rows})
+    following = dict(zip(starts, starts[1:]))
+
+    def timestamp(milliseconds: int) -> str:
+        seconds, milliseconds = divmod(milliseconds, 1000)
+        minutes, seconds = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        return f'{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}'
+
+    blocks = []
+    for start, end, text in rows:
+        if cancel is not None:
+            check_cancel(cancel)
+        if end is None or end <= start:
+            # Missing end times are estimates, capped to avoid hanging captions.
+            end = min(following.get(start, start + 5000), start + 5000)
+        if duration is not None:
+            end = min(end, duration)
+        if end > start:
+            blocks.append(f'{len(blocks) + 1}\n{timestamp(start)} --> {timestamp(end)}\n{text}\n\n')
+    return ''.join(blocks)
+
+
+def _subtitle_playback_info(api: MaoerApi, item: MediaItem, cancel: threading.Event) -> PlaybackInfo:
+    """Recover only a false 'not found'; never replace current-account permission denial."""
+    last_error = None
+    check_cancel(cancel)
+    try:
+        return api.playback_info(item)
+    except PurchaseRequired:
+        raise
+    except ApiError as exc:
+        if str(exc).strip().rstrip('。.!！') not in {'该音频不存在', '音频不存在'}:
+            raise
+        last_error = exc
+    check_cancel(cancel)
+    if not api.cookie_header:
+        raise last_error
+    # A guest can confirm a public free item even when authenticated metadata
+    # misreports it. Do not carry account purchase flags into this check.
+    public_item = MediaItem('sound', item.id, item.title, duration_ms=item.duration_ms,
+                            drama_id=item.drama_id)
+    public = MaoerApi(cookie='', timeout=api.timeout)
+    try:
+        return public.playback_info(public_item)
+    except PurchaseRequired as exc:
+        raise ApiError('当前登录状态下暂时无法获取音频信息，请重试') from exc
+    except ApiError as exc:
+        if str(exc).strip().rstrip('。.!！') in {'该音频不存在', '音频不存在'}:
+            raise last_error
+        raise ApiError('音频信息获取失败，请重试') from exc
+    finally:
+        public.session.close()
+
+
+def download_subtitle(api: MaoerApi, item: MediaItem, folder: Path, cancel: threading.Event,
+                      progress: Callable[[str, int], None], *, number_width: int | None = None,
+                      filename_prefix: str = '') -> Path | None:
+    """Prefer independent JSON; otherwise export the official XML subtitle track."""
+    check_cancel(cancel)
+    progress('正在获取字幕', 0)
+    playback = _subtitle_playback_info(api, item, cancel)
+    title = numbered_title(item, number_width) if number_width is not None else item.title
+    final = folder / (file_name(filename_prefix + title) + '.srt')
+    if final.exists():
+        raise FileExistsError()
+    check_cancel(cancel)
+    folder.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=folder, prefix='.maoer-', suffix='.part', delete=False) as output:
+        temporary = Path(output.name)
+    try:
+        srt, source_error, independent_available = '', None, False
+        if playback.subtitle_url:
+            try:
+                data = _fetch_subtitle_json(playback.subtitle_url, temporary, cancel, progress)
+                independent_available = bool(MaoerApi._parse_independent_subtitles(data))
+                srt = subtitles_to_srt(data, playback.duration_ms, cancel)
+            except (ApiError, requests.RequestException, ValueError, UnicodeError) as exc:
+                source_error = exc
+        if independent_available and not srt:
+            raise ApiError('字幕时间超出音频总时长，无法转换为 SRT')
+        if not independent_available:
+            check_cancel(cancel)
+            progress('正在获取弹幕式字幕', 0)
+            # Empty URL explicitly selects XML only; never mix two subtitle sources.
+            try:
+                captions = api.sound_subtitles(item.id, subtitle_url='')
+            except (ApiError, requests.RequestException) as exc:
+                raise ApiError('字幕获取失败，请检查网络后重试') from exc
+            rows = [{'start_time': caption.time * 1000, 'content': caption.text}
+                    for caption in captions]
+            srt = subtitles_to_srt(rows, playback.duration_ms, cancel)
+        if not srt and source_error is not None:
+            if isinstance(source_error, (ApiError, requests.RequestException)):
+                raise source_error
+            raise ApiError('字幕文件格式不正确，且没有可用的弹幕式字幕') from source_error
+        if not srt:
+            return None
+        check_cancel(cancel)
+        progress('正在转换 SRT 字幕', 99)
+        temporary.write_text(srt, encoding='utf-8', newline='\n')
+        check_cancel(cancel)
+        if os.name == 'nt':
+            temporary.rename(final)
+        else:
+            os.link(temporary, final)
+        progress('字幕下载完成', 100)
+        return final
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _fetch_subtitle_json(url: str, temporary: Path, cancel: threading.Event,
+                         progress: Callable[[str, int], None]) -> object:
+    url = urljoin(BASE_URL + '/', url)
+    if urlsplit(url).scheme not in {'http', 'https'}:
+        raise ApiError('官网返回的字幕地址无效')
+    # A separate anonymous session must never forward an account Cookie to a CDN.
+    with MaoerApi(cookie='').session as session, session.get(
+            url, stream=True, timeout=(15, 15), headers={'Accept-Encoding': 'identity'}) as response:
+        if response.status_code != 200:
+            raise ApiError(f'字幕服务器返回错误（HTTP {response.status_code}）')
+        expected = int(response.headers.get('Content-Length') or 0)
+        limit = 16 * 1024 * 1024
+        if expected > limit:
+            raise ApiError('字幕文件过大，无法保存')
+        received = 0
+        with temporary.open('wb') as output:
+            for chunk in response.iter_content(256 * 1024):
+                check_cancel(cancel)
+                received += len(chunk)
+                if received > limit:
+                    raise ApiError('字幕文件过大，无法保存')
+                output.write(chunk)
+                progress('正在下载字幕', min(99, int(received * 100 / expected)) if expected else 0)
+        if not received or (expected and expected != received):
+            raise ApiError('字幕下载不完整，请重试')
+    check_cancel(cancel)
+    try:
+        return json.loads(temporary.read_bytes())
+    except (ValueError, UnicodeError) as exc:
+        raise ApiError('字幕文件格式不正确，无法转换为 SRT，请重试') from exc
 
 
 def download_audio(api: MaoerApi, item: MediaItem, folder: Path, cancel: threading.Event,

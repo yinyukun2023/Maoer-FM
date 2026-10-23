@@ -4,7 +4,7 @@ from typing import Callable
 
 import wx
 
-from app_settings import DownloadSettings
+from app_settings import DOWNLOAD_CONTENT_MODES, DownloadSettings
 from ui_dialogs import message_box
 from uia_live_region import set_native_accessible_name
 
@@ -24,6 +24,13 @@ class DownloadSettingsDialog(wx.Dialog):
         row.Add(self.path, 1, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 8)
         row.Add(self.browse)
         layout.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        layout.Add(wx.StaticText(self, label='默认下载内容：'), 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        self.content_mode = wx.ComboBox(self, choices=[label for _key, label in DOWNLOAD_CONTENT_MODES],
+                                        style=wx.CB_READONLY)
+        set_native_accessible_name(self.content_mode, '默认下载内容')
+        modes = [key for key, _label in DOWNLOAD_CONTENT_MODES]
+        self.content_mode.SetSelection(modes.index(settings.content_mode) if settings.content_mode in modes else 0)
+        layout.Add(self.content_mode, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         self.options = {}
         for name, label in (
             ('create_drama_folder', '下载时创建剧集文件夹(&F)'),
@@ -64,7 +71,9 @@ class DownloadSettingsDialog(wx.Dialog):
             message_box('请选择或填写完整的下载路径。', '下载设置', wx.OK | wx.ICON_INFORMATION, self)
             self.path.SetFocus()
             return
-        settings = DownloadSettings(directory=str(path), **{
+        index = self.content_mode.GetSelection()
+        content_mode = DOWNLOAD_CONTENT_MODES[max(0, index)][0]
+        settings = DownloadSettings(directory=str(path), content_mode=content_mode, **{
             name: control.GetValue() for name, control in self.options.items()
         })
         try:
