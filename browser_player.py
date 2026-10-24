@@ -1119,9 +1119,14 @@ class HiddenBrowserPlayer:
         parent: wx.Window,
         cookie: str = "",
         volume: int = 100,
+        *, reuse_cookie_primer: bool = False,
     ) -> None:
         self.parent = parent
         self.cookie = cookie
+        self._reuse_cookie_primer = reuse_cookie_primer
+        self._primed_cookie = None
+        self._startup_error = ''
+        self._startup_retry_pending = False
         self._volume = volume
         self._webview: html2.WebView | None = None
         self._current: PlaybackInfo | None = None
@@ -1145,6 +1150,8 @@ class HiddenBrowserPlayer:
         self._system_volume_running = False
 
     def play(self, playback: PlaybackInfo) -> None:
+        self._startup_error = ''
+        self._startup_retry_pending = False
         self._startup_reload_attempted = False
         self._seek_generation += 1
         self._resume_request = None
@@ -1160,7 +1167,7 @@ class HiddenBrowserPlayer:
         self._playback_rate = 1.0
         self._load_generation += 1
         self._install_user_scripts(webview)
-        if self.cookie:
+        if self.cookie and not (self._reuse_cookie_primer and self._primed_cookie == self.cookie):
             self._cookie_primer_target = page_url
             self._cookie_primer_generation = self._load_generation
             webview.LoadURL(BASE_URL + "/")
@@ -1650,6 +1657,7 @@ class HiddenBrowserPlayer:
         if not target:
             return
         self._run_cookie_script_now()
+        self._primed_cookie = self.cookie
         self._load_playback_url(target, generation)
 
     def _mark_loaded_if_current(self, generation: int) -> None:
@@ -1670,8 +1678,13 @@ class HiddenBrowserPlayer:
             if (self._last_position == 0 and not self._suppress_autoplay and
                     not self._startup_reload_attempted):
                 self._startup_reload_attempted = True
+                self._startup_retry_pending = True
                 self._cancel_autoplay_timer()
                 self._autoplay_timer = wx.CallLater(2000, self._retry_startup_page, self._load_generation)
+            # A native navigation error is not proof that media failed: a
+            # redirect/cancelled old load can report it while recovery works.
+            # Only the current page's confirmed rejection or exhausted startup
+            # checks may set _startup_error.
         self._page_loaded = False
         event.Skip()
 
@@ -1703,6 +1716,7 @@ class HiddenBrowserPlayer:
             if generation != self._load_generation or self._current is None or self._suppress_autoplay:
                 return
             if result and result.get("ok") and result.get("playing"):
+                self._startup_error = ''
                 self._apply_volume(self._volume)
                 if self._startup_reload_attempted:
                     self._run_control("rate", self._playback_rate)
@@ -1710,10 +1724,21 @@ class HiddenBrowserPlayer:
             if result and result.get("error") == "page-rejected":
                 if not self._startup_reload_attempted:
                     self._startup_reload_attempted = True
+                    self._startup_retry_pending = True
                     self._autoplay_timer = wx.CallLater(2000, self._retry_startup_page, generation)
+                elif not self._startup_retry_pending:
+                    self._startup_error = '官网播放页请求被拒绝（412），请稍后重试'
                 return
             if attempts > 1:
                 self._autoplay_timer = wx.CallLater(800, self._autoplay_step, generation, attempts - 1)
+            elif not self._startup_reload_attempted:
+                # A page may load normally while its own metadata/player fails
+                # silently. Recover lack of progress as well as navigation errors.
+                self._startup_reload_attempted = True
+                self._startup_retry_pending = True
+                self._autoplay_timer = wx.CallLater(2000, self._retry_startup_page, generation)
+            elif not self._startup_retry_pending:
+                self._startup_error = '官网播放器未能开始加载音频，请稍后重试'
 
         self._run_control_callback("autoplay", self._volume, done)
 
@@ -1724,6 +1749,8 @@ class HiddenBrowserPlayer:
             return
         # Retry the same official page once, without changing identity or URLs.
         # Old callbacks must not interfere with the new page or another track.
+        self._startup_retry_pending = False
+        self._startup_error = ''
         self._load_generation += 1
         self._autoplay_generation = None
         self._page_loaded = False

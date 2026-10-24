@@ -130,7 +130,7 @@ class DownloadRefinementTests(unittest.TestCase):
         for removed in ('completed_sound', 'failed_sound', 'auto_close'):
             self.assertNotIn(removed, dialog.options)
         window = self.selector()
-        self.assertEqual(window.by_list_order.GetLabel(), '音频文件名按发布顺序数字编号命名(&O)')
+        self.assertEqual(window.by_list_order.GetLabel(), '文件名按发布顺序数字编号命名(&O)')
 
     def test_old_sound_settings_migrate_without_turning_explicit_opt_outs_back_on(self):
         with patch('app_settings.app_data_dir', return_value=self.root):

@@ -59,23 +59,23 @@ class SubtitleMetadataRecoveryTests(unittest.TestCase):
                 self.assertEqual(self.api.session.headers['Cookie'], 'test_session=keep')
                 saved.unlink()
 
-    def test_three_logged_in_misreports_can_use_confirmed_public_free_metadata(self):
+    def test_persistent_logged_in_misreports_can_use_confirmed_public_free_metadata(self):
         saved = self.run_download(failures=99)
         self.assertIn('角色：围读字幕', saved.read_text(encoding='utf-8'))
-        self.assertEqual(self.calls, [(True, self.item.id)] * 3 + [(False, self.item.id)])
+        self.assertEqual(self.calls, [(True, self.item.id)] * 4 + [(False, self.item.id)])
         self.assertEqual(self.api.session.headers['Cookie'], 'test_session=keep')
 
     def test_fallback_never_treats_paid_guest_metadata_as_purchased(self):
         self.item.raw['_purchased_sound'] = True
         with self.assertRaisesRegex(ApiError, '音频信息'):
             self.run_download(failures=99, guest_paid=True)
-        self.assertEqual(self.calls, [(True, self.item.id)] * 3 + [(False, self.item.id)])
+        self.assertEqual(self.calls, [(True, self.item.id)] * 4 + [(False, self.item.id)])
         self.assertEqual(list(self.folder.iterdir()), [])
 
     def test_really_missing_sound_still_fails_after_bounded_checks(self):
         with self.assertRaisesRegex(ApiError, '该音频不存在'):
             self.run_download(failures=99, guest_missing=True)
-        self.assertEqual(len(self.calls), 6)
+        self.assertEqual(len(self.calls), 8)
         self.assertEqual(list(self.folder.iterdir()), [])
 
     def test_other_api_errors_or_network_errors_are_not_retried(self):

@@ -229,12 +229,8 @@ def _optional_need_pay(data: dict[str, Any]) -> bool | None:
 
 
 def _duration_ms(value: Any) -> int | None:
-    duration = _to_int(value)
-    if duration is None:
-        return None
-    if 0 < duration < 10000:
-        return duration * 1000
-    return duration
+    """Official sound and episode durations are milliseconds, including short clips."""
+    return _to_int(value)
 
 
 def _duration_text_ms(value: Any) -> int | None:
@@ -274,8 +270,10 @@ def _strip_repeated_subtitle_role(role: str, content: str) -> str:
 class MaoerApi:
     """Small wrapper around the Maoer FM endpoints found in the packet capture."""
 
-    def __init__(self, cookie: str | None = None, timeout: float = 15.0) -> None:
+    def __init__(self, cookie: str | None = None, timeout: float = 15.0, *, cache_sound_metadata: bool = False) -> None:
         self.timeout = timeout
+        # Opt-in only for a single download job; never cache normal playback.
+        self._sound_metadata_cache = {} if cache_sound_metadata else None
         self.session = requests.Session()
         self._account_info_cache: AccountInfo | None = None
         self._drama_detail_cache: dict[int, dict[str, Any]] = {}
@@ -604,7 +602,7 @@ class MaoerApi:
         )
 
     def sound_purchase_info(self, item: MediaItem) -> SoundPurchaseInfo:
-        data = self._get("/sound/getsound", {"soundid": item.id})
+        data = self._sound_metadata(item.id)
         info = data.get("info") or {}
         sound = info.get("sound") or {}
         if not isinstance(sound, dict):
@@ -821,7 +819,7 @@ class MaoerApi:
         return name
 
     def _sound_publisher_identity(self, sound_id: int) -> tuple[int | None, str]:
-        data = self._get("/sound/getsound", {"soundid": sound_id})
+        data = self._sound_metadata(sound_id)
         info = data.get("info") or {}
         if not isinstance(info, dict):
             return None, ""
@@ -993,7 +991,7 @@ class MaoerApi:
         return "\n".join(lines).strip() or "没有拿到广播剧详情"
 
     def sound_intro_text(self, sound_id: int) -> str:
-        data = self._get("/sound/getsound", {"soundid": sound_id})
+        data = self._sound_metadata(sound_id)
         info = data.get("info") or {}
         sound = info.get("sound") if isinstance(info, dict) else None
         if not isinstance(sound, dict) or not sound:
@@ -1142,7 +1140,7 @@ class MaoerApi:
 
         if subtitle_url is None:
             try:
-                data = self._get("/sound/getsound", {"soundid": int(sound_id)})
+                data = self._sound_metadata(int(sound_id))
                 subtitle_url = _text(((data.get("info") or {}).get("sound") or {}).get("subtitle_url"))
             except (ApiError, requests.RequestException):
                 subtitle_url = ""
@@ -2489,33 +2487,45 @@ class MaoerApi:
         end = start + page_size
         return self.album_sounds(album_id)[start:end]
 
-    def playback_info(self, item: MediaItem) -> PlaybackInfo:
+    def _sound_metadata(self, sound_id: int) -> dict[str, Any]:
         # This endpoint sometimes reports an existing sound as missing even
         # with a valid login. Recheck only this logical error, not permission,
         # authentication, HTTP or network failures. Keep the same account.
-        for attempt in range(3):
+        cache = getattr(self, '_sound_metadata_cache', None)
+        cache_key = (getattr(self, 'cookie_header', ''), sound_id)
+        if cache is not None and cache_key in cache:
+            return cache[cache_key]
+        for attempt in range(4):
             try:
-                data = self._get("/sound/getsound", {"soundid": item.id})
-                break
+                data = self._get("/sound/getsound", {"soundid": sound_id})
+                if cache is not None:
+                    cache[cache_key] = data
+                return data
             except ApiError as exc:
                 if (str(exc).strip().rstrip('。.!！') not in {'该音频不存在', '音频不存在'}
-                        or attempt == 2):
+                        or attempt == 3):
                     raise
-                time.sleep(0.1 * (attempt + 1))
+                time.sleep((0.3, 1.0, 2.0)[attempt])
+
+    def playback_info(self, item: MediaItem) -> PlaybackInfo:
+        data = self._sound_metadata(item.id)
         info = data.get("info") or {}
         sound = info.get("sound") or {}
         if not isinstance(sound, dict):
             sound = {}
         title = _text(sound.get("soundstr") or item.title)
         drama_id = item.drama_id or self._raw_drama_id(sound) or self._raw_drama_id(item.raw)
-        full_drama_purchased = self._is_full_drama_purchased(drama_id)
-        vip_limited = self._is_vip_limited_sound(item.raw) or self._is_vip_limited_sound(sound)
-        member_vip = vip_limited and self._is_member_vip_active()
-        can_play_paid = full_drama_purchased or member_vip
-
         purchased_sound = isinstance(item.raw, dict) and bool(item.raw.get("_purchased_sound"))
         fresh_need_pay = _optional_need_pay(sound)
         need_pay = item.need_pay if fresh_need_pay is None else fresh_need_pay
+        # A fresh playable response (or known single-episode purchase) needs
+        # no scan of the account's complete drama library. Such scans can span
+        # many network pages and previously ran again for every download job.
+        can_play_paid = purchased_sound
+        if need_pay and not can_play_paid:
+            can_play_paid = self._is_full_drama_purchased(drama_id)
+            if not can_play_paid and (self._is_vip_limited_sound(item.raw) or self._is_vip_limited_sound(sound)):
+                can_play_paid = self._is_member_vip_active()
         if need_pay and not (can_play_paid or purchased_sound):
             raise PurchaseRequired(f"《{title}》为付费内容。")
         if fresh_need_pay is not None:

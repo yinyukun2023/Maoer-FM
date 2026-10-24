@@ -28,7 +28,7 @@ class PlaybackMetadataRecoveryTests(unittest.TestCase):
         with patch.object(self.api, '_get', side_effect=ApiError('该音频不存在')) as get:
             with self.assertRaisesRegex(ApiError, '该音频不存在'):
                 self.api.playback_info(self.item)
-        self.assertEqual(get.call_count, 3)
+        self.assertEqual(get.call_count, 4)
 
     def test_other_errors_not_retried(self):
         for error in (ApiError('请先登录'), requests.Timeout('timeout')):

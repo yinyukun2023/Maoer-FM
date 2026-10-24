@@ -18,7 +18,7 @@ from download_queue import CreatedDownload, DownloadBatch
 from downloads import (DownloadCancelled, DownloadControl, DownloadSelection, check_cancel, download_audio,
                        download_error, download_subtitle, folder_name)
 from maoer_api import ApiError, MaoerApi, MediaItem, PlaybackInfo
-from startup_sound import play_download_completed_sound, play_download_failed_sound
+from startup_sound import play_download_completed_sound, play_download_failed_sound, play_download_mixed_sound
 from ui_dialogs import message_box
 from uia_live_region import set_native_accessible_name
 from web_login import call_webview_devtools, _remove_login_profile
@@ -79,7 +79,7 @@ DOWNLOAD_NO_HISTORY_SCRIPT = r"""(() => {
 class _DownloadPlayer(HiddenBrowserPlayer):
     """Reuse website playback without changing the user's player or its volume."""
     def __init__(self, parent: wx.Window, cookie: str) -> None:
-        super().__init__(parent, cookie=cookie, volume=0)
+        super().__init__(parent, cookie=cookie, volume=0, reuse_cookie_primer=True)
         root = webview2_profile_dir().resolve()
         self.profile = Path(tempfile.mkdtemp(prefix='download-', dir=root)).resolve()
         if self.profile.parent != root:
@@ -154,6 +154,7 @@ class DownloadTask:
     status: str = '等待下载'
     reason: str = ''
     parts: dict[str, DownloadPartResult] = field(default_factory=dict)
+    retry_kind: str | None = None
 
 
 class DownloadDialog(wx.Dialog):
@@ -206,7 +207,7 @@ class DownloadDialog(wx.Dialog):
         self.publisher.Show(self.options.create_drama_folder)
         self.numbered = wx.CheckBox(self, label='正剧集数按数字编号命名(&N)')
         layout.Add(self.numbered, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
-        self.by_list_order = wx.CheckBox(self, label='音频文件名按发布顺序数字编号命名(&O)')
+        self.by_list_order = wx.CheckBox(self, label='文件名按发布顺序数字编号命名(&O)')
         layout.Add(self.by_list_order, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         layout.Add(wx.StaticText(self, label='按完整剧集列表位置添加编号，例如 01 原文件名；下载单集或部分音频也保留原序号。'),
                    0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
@@ -349,6 +350,9 @@ class DownloadProgressDialog(wx.Dialog):
         def make_list(name, failed=False):
             label = wx.StaticText(self, label=name)
             control = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+            # Four visible lists must share the available height. Native best
+            # sizes otherwise reserve most space for the first two controls.
+            control.SetMinSize((-1, 65))
             set_native_accessible_name(control, name)
             control.InsertColumn(0, '音频', width=330)
             control.InsertColumn(1, '状态', width=100 if failed else 410)
@@ -544,17 +548,18 @@ class DownloadProgressDialog(wx.Dialog):
         def work(index, control):
             if not (self.request.download_audio or self.request.download_subtitles):
                 raise ApiError('请选择下载音频或下载剧集字幕')
-            api = MaoerApi(cookie=self.cookie)
+            api = MaoerApi(cookie=self.cookie, cache_sound_metadata=True)
             try:
                 item = self.tasks[index].item
                 prefix = self.request.filename_prefixes.get(item.id, '')
                 naming = {'filename_prefix': prefix} if prefix else {}
                 progress = lambda stage, percent: wx.CallAfter(self._task_progress, index, stage, percent)
 
-                parts = {}
+                task = self.tasks[index]
+                parts = dict(task.parts)
                 for kind, enabled in (('audio', self.request.download_audio),
                                       ('subtitle', self.request.download_subtitles)):
-                    if not enabled:
+                    if not enabled or (task.retry_kind is not None and task.retry_kind != kind):
                         continue
                     try:
                         check_cancel(control)
@@ -590,9 +595,10 @@ class DownloadProgressDialog(wx.Dialog):
             else:
                 state = ('cancelled' if isinstance(error, DownloadCancelled) or self.controls[index].is_set()
                          else 'skipped' if isinstance(error, FileExistsError) else 'failed')
-                parts = {kind: DownloadPartResult(state, '' if state == 'cancelled' else download_error(error))
+                parts = {**self.tasks[index].parts, **{kind: DownloadPartResult(state, '' if state == 'cancelled' else download_error(error))
                          for kind, enabled in (('audio', self.request.download_audio),
-                                               ('subtitle', self.request.download_subtitles)) if enabled}
+                                               ('subtitle', self.request.download_subtitles)) if enabled and
+                         (self.tasks[index].retry_kind is None or self.tasks[index].retry_kind == kind)}}
             labels = {'audio': '音频', 'subtitle': '字幕'}
             reason = '；'.join(f'{labels[kind]}：{part.reason}' for kind, part in parts.items()
                               if part.reason and (part.state == 'failed' or state == 'skipped'))
@@ -643,7 +649,10 @@ class DownloadProgressDialog(wx.Dialog):
             task.status += f'（{reason}）'
         task.reason = reason
         self._refresh_lists()
-        if state == 'complete' and self.options.play_sound:
+        mixed_result = ({part.state for part in task.parts.values()} >= {'complete', 'failed'})
+        if mixed_result and self.options.play_sound:
+            play_download_mixed_sound()
+        elif state == 'complete' and self.options.play_sound:
             play_download_completed_sound()
         elif state == 'failed' and self.options.play_sound:
             play_download_failed_sound()
@@ -655,15 +664,21 @@ class DownloadProgressDialog(wx.Dialog):
             self._announce(message)
 
     def _get_key(self, playback: PlaybackInfo, control: DownloadControl) -> bytes:
-        ready = threading.Event()
-        result = {}
-        wx.CallAfter(self._request_key, playback, ready, result, control)
-        while not ready.wait(0.1):
+        recoverable = ('官网音频准备超时', '官网播放页', '官网播放器未能')
+        for attempt in range(2):
             check_cancel(control)
-        check_cancel(control)
-        if 'error' in result:
-            raise ApiError(result['error'])
-        return result['key']
+            ready = threading.Event()
+            result = {'_fresh': True} if attempt else {}
+            if attempt and hasattr(control, 'index'):
+                wx.CallAfter(self._task_progress, control.index, '正在重新准备音频（第2次，共2次）', 0)
+            wx.CallAfter(self._request_key, playback, ready, result, control)
+            while not ready.wait(0.1):
+                check_cancel(control)
+            check_cancel(control)
+            if 'error' not in result:
+                return result['key']
+            if attempt or not str(result['error']).startswith(recoverable):
+                raise ApiError(result['error'])
 
     def _request_key(self, playback, ready, result, control) -> None:
         if control.is_set() or not self.running:
@@ -691,6 +706,11 @@ class DownloadProgressDialog(wx.Dialog):
         self.key_started = self.cancel.active_time()
         self.key_pending = False
         try:
+            # Recreate only at the serial preparation boundary, never while
+            # another queued/paused task owns the WebView.
+            if result.pop('_fresh', False) and self.player is not None:
+                self.player.shutdown()
+                self.player = None
             if self.player is None:
                 # Keep the WebView on the main window: hiding this task window
                 # must not hide, suspend or destroy the media preparation host.
@@ -709,6 +729,10 @@ class DownloadProgressDialog(wx.Dialog):
             self._key_done(error='下载已取消')
             return
         if self.cancel.is_paused():
+            return
+        startup_error = getattr(self.player, '_startup_error', '') if self.player is not None else ''
+        if isinstance(startup_error, str) and startup_error:
+            self._key_done(error=startup_error)
             return
         if self.cancel.active_time() - self.key_started > 45:
             self._key_done(error='官网音频准备超时，请确认当前账号可以播放该音频后重试')
@@ -748,9 +772,9 @@ class DownloadProgressDialog(wx.Dialog):
                 self._key_done(key=key)
 
         try:
+            self.key_pending = True
             self.key_handler = call_webview_devtools(self.player._webview, 'Runtime.evaluate',
                                                     {'expression': expression, 'returnByValue': True}, received)
-            self.key_pending = True
         except Exception:
             self.key_pending = False
 
@@ -824,15 +848,18 @@ class DownloadProgressDialog(wx.Dialog):
         finally:
             menu.Destroy()
         if choice == restart_id:
-            self._retry_tasks([index])
+            self._retry_tasks([index], kind='subtitle' if control is self.subtitle_failed_list else 'audio')
         elif choice == all_id:
-            self._retry_tasks(indices)
+            self._retry_tasks(indices, kind='subtitle' if control is self.subtitle_failed_list else 'audio')
 
-    def _retry_tasks(self, indices: list[int]) -> None:
+    def _retry_tasks(self, indices: list[int], *, kind: str | None = None) -> None:
         if (not self or self.IsBeingDeleted() or self._clearing or self._clear_requested
                 or self.close_requested or self._confirming_cancel or (self.running and self.cancel.is_set())):
             return
-        indices = [index for index in indices if self.tasks[index].state == 'failed']
+        if kind not in {None, 'audio', 'subtitle'}:
+            return
+        indices = [index for index in dict.fromkeys(indices) if self.tasks[index].state == 'failed'
+                   and (kind is None or self._part_failed(self.tasks[index], kind))]
         if not indices:
             return
         if not self.running:
@@ -841,7 +868,11 @@ class DownloadProgressDialog(wx.Dialog):
         for index in indices:
             task = self.tasks[index]
             task.state, task.status, task.reason = 'pending', '等待重试', ''
-            task.parts = {}
+            task.retry_kind = kind
+            if kind is None:
+                task.parts = {}
+            else:
+                task.parts.pop(kind, None)
         self.cancel.retry(indices)
         self._retry_requested = True
         if not self.running:

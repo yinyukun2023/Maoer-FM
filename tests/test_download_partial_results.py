@@ -27,6 +27,7 @@ class PartialDownloadTests(unittest.TestCase):
         self.enterContext(patch('download_dialog.message_box', return_value=wx.OK))
         self.enterContext(patch('download_dialog.play_download_completed_sound'))
         self.enterContext(patch('download_dialog.play_download_failed_sound'))
+        self.enterContext(patch('download_dialog.play_download_mixed_sound'))
 
     def window(self):
         window = DownloadProgressDialog(None, DownloadRequest('作品', [self.item], self.folder, '',
@@ -106,7 +107,7 @@ class PartialDownloadTests(unittest.TestCase):
         self.assertIn('字幕完成', window.completed_list.GetItemText(0, 1))
         self.assertIn('音频失败', window.completed_list.GetItemText(0, 1))
 
-    def test_retry_from_either_failure_list_retries_both_requested_parts(self):
+    def test_retry_from_failure_list_only_retries_its_own_content(self):
         for kind in ('audio', 'subtitle'):
             with self.subTest(kind=kind):
                 window = self.window()
@@ -120,7 +121,8 @@ class PartialDownloadTests(unittest.TestCase):
                     window._show_failed_menu(control=control)
                 start.assert_called_once()
                 self.assertEqual(window.tasks[0].state, 'pending')
-                self.assertEqual(window.tasks[0].parts, {})
+                other = 'subtitle' if kind == 'audio' else 'audio'
+                self.assertEqual(set(window.tasks[0].parts), {other})
                 def saved_subtitle():
                     path = self.folder / '番外.srt'
                     path.write_bytes(EXPECTED_SRT)
@@ -128,10 +130,11 @@ class PartialDownloadTests(unittest.TestCase):
                 window.running = True
                 self.run_jobs(window, subtitle_result=saved_subtitle)
                 self.assertEqual(set(window.tasks[0].parts), {'audio', 'subtitle'})
-                self.assertTrue(all(part.state == 'complete' for part in window.tasks[0].parts.values()))
-                self.assertEqual(window.audio_failed_list.GetItemCount(), 0)
-                self.assertEqual(window.subtitle_failed_list.GetItemCount(), 0)
-                self.assertEqual(window.tasks[0].state, 'complete')
+                self.assertEqual(window.tasks[0].parts[kind].state, 'complete')
+                self.assertEqual(window.tasks[0].parts[other].state, 'failed')
+                self.assertEqual(window.audio_failed_list.GetItemCount(), int(kind != 'audio'))
+                self.assertEqual(window.subtitle_failed_list.GetItemCount(), int(kind != 'subtitle'))
+                self.assertEqual(window.tasks[0].state, 'failed')
 
     def test_both_failure_lists_support_menu_key_and_shift_f10(self):
         window = self.window()

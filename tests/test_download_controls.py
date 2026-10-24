@@ -221,7 +221,7 @@ class DownloadControlTests(unittest.TestCase):
             with patch.object(dialog.failed_list, 'GetPopupMenuSelectionFromUser', side_effect=choose), \
                     patch.object(dialog, '_retry_tasks') as retry:
                 dialog._show_failed_menu()
-            retry.assert_called_once_with([0] if action == 0 else [0, 1, 2])
+            retry.assert_called_once_with([0] if action == 0 else [0, 1, 2], kind='audio')
         # Right-clicking another row changes the target; opening a menu starts no work.
         event = Mock()
         event.GetEventObject.return_value = dialog.failed_list
