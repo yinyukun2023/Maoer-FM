@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 
 import wx
 import wx.html2 as html2
@@ -15,13 +16,16 @@ from app_paths import webview2_profile_dir
 from app_settings import DownloadSettings
 from browser_player import HiddenBrowserPlayer
 from download_queue import CreatedDownload, DownloadBatch
-from downloads import (DownloadCancelled, DownloadControl, DownloadSelection, check_cancel, download_audio,
+from downloads import (DOWNLOAD_TIMEOUT, DownloadCancelled, DownloadControl, DownloadSelection, check_cancel, download_audio,
                        download_error, download_subtitle, folder_name)
 from maoer_api import ApiError, MaoerApi, MediaItem, PlaybackInfo
 from startup_sound import play_download_completed_sound, play_download_failed_sound, play_download_mixed_sound
 from ui_dialogs import message_box
 from uia_live_region import set_native_accessible_name
 from web_login import call_webview_devtools, _remove_login_profile
+
+
+DOWNLOAD_REJECTION_COOLDOWN = 30.0
 
 
 DOWNLOAD_NO_HISTORY_SCRIPT = r"""(() => {
@@ -78,6 +82,9 @@ DOWNLOAD_NO_HISTORY_SCRIPT = r"""(() => {
 
 class _DownloadPlayer(HiddenBrowserPlayer):
     """Reuse website playback without changing the user's player or its volume."""
+    # The download queue owns the cooldown and bounded retry for rejected pages.
+    _retry_rejected_page = False
+
     def __init__(self, parent: wx.Window, cookie: str) -> None:
         super().__init__(parent, cookie=cookie, volume=0, reuse_cookie_primer=True)
         root = webview2_profile_dir().resolve()
@@ -548,7 +555,9 @@ class DownloadProgressDialog(wx.Dialog):
         def work(index, control):
             if not (self.request.download_audio or self.request.download_subtitles):
                 raise ApiError('请选择下载音频或下载剧集字幕')
-            api = MaoerApi(cookie=self.cookie, cache_sound_metadata=True)
+            api = MaoerApi(cookie=self.cookie, timeout=DOWNLOAD_TIMEOUT, cache_sound_metadata=True)
+            subtitle_worker = None
+            audio_finished = threading.Event()
             try:
                 item = self.tasks[index].item
                 prefix = self.request.filename_prefixes.get(item.id, '')
@@ -557,36 +566,66 @@ class DownloadProgressDialog(wx.Dialog):
 
                 task = self.tasks[index]
                 parts = dict(task.parts)
-                for kind, enabled in (('audio', self.request.download_audio),
-                                      ('subtitle', self.request.download_subtitles)):
-                    if not enabled or (task.retry_kind is not None and task.retry_kind != kind):
-                        continue
+                want_audio = self.request.download_audio and task.retry_kind in (None, 'audio')
+                want_subtitle = self.request.download_subtitles and task.retry_kind in (None, 'subtitle')
+
+                def start_subtitle(playback):
+                    nonlocal subtitle_worker
+                    subtitle_worker = threading.Thread(target=run_part, args=('subtitle', playback), daemon=True)
+                    subtitle_worker.start()
+
+                def subtitle_progress(stage, percent):
+                    # Keep the audio progress stable while both transfers run.
+                    if not want_audio or audio_finished.is_set():
+                        progress(stage, percent)
+
+                def run_part(kind, playback=None):
+                    part_api = api
                     try:
                         check_cancel(control)
                         if kind == 'audio':
+                            options = {'on_playback': start_subtitle} if want_subtitle else {}
                             path = download_audio(api, item, self.request.folder, control,
                                 lambda playback: self._get_key(playback, control), progress,
-                                number_width=self.request.number_width, **naming)
+                                number_width=self.request.number_width, **options, **naming)
                         else:
-                            path = download_subtitle(api, item, self.request.folder, control, progress,
-                                                    number_width=self.request.number_width, **naming)
+                            # Reuse permission-checked metadata, but never share a
+                            # requests session between the audio and subtitle threads.
+                            if playback is not None:
+                                part_api = MaoerApi(cookie=self.cookie, timeout=DOWNLOAD_TIMEOUT)
+                            path = download_subtitle(part_api, item, self.request.folder, control, subtitle_progress,
+                                                    number_width=self.request.number_width, playback=playback, **naming)
                             if path is None:
                                 raise ApiError('该集暂无可下载的字幕')
                         self._record_output(index if kind == 'audio' else (index, 'subtitle'), path)
                         parts[kind] = DownloadPartResult('complete')
                     except DownloadCancelled:
                         parts[kind] = DownloadPartResult('cancelled')
-                        break
                     except FileExistsError:
                         parts[kind] = DownloadPartResult('skipped', '同名文件已存在，已跳过（未覆盖）')
                     except Exception as exc:
                         if control.is_set():
                             parts[kind] = DownloadPartResult('cancelled')
-                            break
-                        parts[kind] = DownloadPartResult('failed', download_error(exc))
-                return parts
+                        else:
+                            parts[kind] = DownloadPartResult('failed', download_error(exc))
+                    finally:
+                        if part_api is not api:
+                            part_api.session.close()
+
+                if want_audio:
+                    run_part('audio')
+                audio_finished.set()
+                if subtitle_worker is not None:
+                    if subtitle_worker.is_alive():
+                        progress('正在等待字幕下载完成', 0)
+                elif want_subtitle and not control.is_set():
+                    # Metadata failure must still allow the existing subtitle fallback.
+                    run_part('subtitle')
             finally:
+                if subtitle_worker is not None:
+                    subtitle_worker.join()
                 api.session.close()
+            return parts
 
         def result(index, parts, error):
             if error is None:
@@ -665,20 +704,30 @@ class DownloadProgressDialog(wx.Dialog):
 
     def _get_key(self, playback: PlaybackInfo, control: DownloadControl) -> bytes:
         recoverable = ('官网音频准备超时', '官网播放页', '官网播放器未能')
-        for attempt in range(2):
+        for attempt in range(3):
             check_cancel(control)
             ready = threading.Event()
             result = {'_fresh': True} if attempt else {}
             if attempt and hasattr(control, 'index'):
-                wx.CallAfter(self._task_progress, control.index, '正在重新准备音频（第2次，共2次）', 0)
+                wx.CallAfter(self._task_progress, control.index, f'正在重新准备音频（第{attempt + 1}次，共3次）', 0)
             wx.CallAfter(self._request_key, playback, ready, result, control)
             while not ready.wait(0.1):
                 check_cancel(control)
             check_cancel(control)
             if 'error' not in result:
                 return result['key']
-            if attempt or not str(result['error']).startswith(recoverable):
+            if attempt == 2 or not str(result['error']).startswith(recoverable):
                 raise ApiError(result['error'])
+            if '412' in str(result['error']):
+                if hasattr(control, 'index'):
+                    wx.CallAfter(self._task_progress, control.index, '官网拒绝请求，正在等待30秒冷却', 0)
+                retry_at = time.monotonic() + DOWNLOAD_REJECTION_COOLDOWN
+                while True:
+                    check_cancel(control)
+                    remaining = retry_at - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    control.wait(min(remaining, 0.1))
 
     def _request_key(self, playback, ready, result, control) -> None:
         if control.is_set() or not self.running:

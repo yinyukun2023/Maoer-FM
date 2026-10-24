@@ -21,6 +21,9 @@ import requests
 from maoer_api import BASE_URL, ApiError, MaoerApi, MediaItem, PlaybackInfo, PurchaseRequired
 
 
+DOWNLOAD_TIMEOUT = (30, 30)  # Connection timeout, read timeout (seconds).
+
+
 class DownloadCancelled(Exception):
     pass
 
@@ -247,7 +250,7 @@ def normalize_empty_saiz(data: mmap.mmap) -> int:
 
 
 def remux_audio(source_file, destination: Path, key: bytes | None,
-                cancel: threading.Event, expected_ms: int | None) -> None:
+                cancel: threading.Event) -> None:
     options = {"decryption_key": key.hex()} if key else {}
     digest = hashlib.sha256()
     count = 0
@@ -278,11 +281,9 @@ def remux_audio(source_file, destination: Path, key: bytes | None,
                 count += 1
     if not count:
         raise ApiError("下载的音频为空")
-    # Verify the full encoded payload and duration before publishing the file.
+    # Verify the full encoded payload before publishing; site durations can be stale.
     actual = hashlib.sha256()
     with av.open(str(destination)) as check:
-        if expected_ms and (check.duration is None or abs(check.duration / 1000 - expected_ms) > 2000):
-            raise ApiError("下载的音频时长不完整")
         for packet in check.demux(audio=0):
             check_cancel(cancel)
             if packet.pts is not None:
@@ -388,11 +389,11 @@ def _subtitle_playback_info(api: MaoerApi, item: MediaItem, cancel: threading.Ev
 
 def download_subtitle(api: MaoerApi, item: MediaItem, folder: Path, cancel: threading.Event,
                       progress: Callable[[str, int], None], *, number_width: int | None = None,
-                      filename_prefix: str = '') -> Path | None:
+                      filename_prefix: str = '', playback: PlaybackInfo | None = None) -> Path | None:
     """Prefer independent JSON; otherwise export the official XML subtitle track."""
     check_cancel(cancel)
     progress('正在获取字幕', 0)
-    playback = _subtitle_playback_info(api, item, cancel)
+    playback = playback if playback is not None else _subtitle_playback_info(api, item, cancel)
     title = numbered_title(item, number_width) if number_width is not None else item.title
     final = folder / (file_name(filename_prefix + title) + '.srt')
     if final.exists():
@@ -450,7 +451,7 @@ def _fetch_subtitle_json(url: str, temporary: Path, cancel: threading.Event,
         raise ApiError('官网返回的字幕地址无效')
     # A separate anonymous session must never forward an account Cookie to a CDN.
     with MaoerApi(cookie='').session as session, session.get(
-            url, stream=True, timeout=(15, 15), headers={'Accept-Encoding': 'identity'}) as response:
+            url, stream=True, timeout=DOWNLOAD_TIMEOUT, headers={'Accept-Encoding': 'identity'}) as response:
         if response.status_code != 200:
             raise ApiError(f'字幕服务器返回错误（HTTP {response.status_code}）')
         expected = int(response.headers.get('Content-Length') or 0)
@@ -478,10 +479,13 @@ def _fetch_subtitle_json(url: str, temporary: Path, cancel: threading.Event,
 def download_audio(api: MaoerApi, item: MediaItem, folder: Path, cancel: threading.Event,
                    get_key: Callable[[PlaybackInfo], bytes],
                    progress: Callable[[str, int], None], *, number_width: int | None = None,
-                   filename_prefix: str = '') -> Path:
+                   filename_prefix: str = '',
+                   on_playback: Callable[[PlaybackInfo], None] | None = None) -> Path:
     check_cancel(cancel)
     progress('正在检查播放权限', 0)
     playback = api.playback_info(item)
+    if on_playback is not None:
+        on_playback(playback)
     # The official player uses native MP4 when videourl is present, even if
     # has_video is false and a separate encrypted DASH audio track exists.
     audio = {} if playback.video_url else playback.dash_audio
@@ -511,7 +515,7 @@ def download_audio(api: MaoerApi, item: MediaItem, folder: Path, cancel: threadi
             expected = int(audio.get('size') or 0)
             # A separate anonymous session must never send the account Cookie to a CDN.
             with MaoerApi(cookie='').session as session, session.get(
-                    url, stream=True, timeout=(15, 15), headers={'Accept-Encoding': 'identity'}) as response:
+                    url, stream=True, timeout=DOWNLOAD_TIMEOUT, headers={'Accept-Encoding': 'identity'}) as response:
                 if response.status_code != 200:
                     raise ApiError(f"音频服务器返回错误（HTTP {response.status_code}）")
                 length = int(response.headers.get('Content-Length') or 0)
@@ -538,7 +542,7 @@ def download_audio(api: MaoerApi, item: MediaItem, folder: Path, cancel: threadi
                     with mmap.mmap(source_file.fileno(), 0) as data:
                         normalize_empty_saiz(data)
                 source_file.seek(0)
-                remux_audio(source_file, temporary, key, cancel, playback.duration_ms)
+                remux_audio(source_file, temporary, key, cancel)
             else:
                 source_file.seek(0)
                 with temporary.open('wb') as output:

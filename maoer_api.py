@@ -270,7 +270,7 @@ def _strip_repeated_subtitle_role(role: str, content: str) -> str:
 class MaoerApi:
     """Small wrapper around the Maoer FM endpoints found in the packet capture."""
 
-    def __init__(self, cookie: str | None = None, timeout: float = 15.0, *, cache_sound_metadata: bool = False) -> None:
+    def __init__(self, cookie: str | None = None, timeout: float | tuple[float, float] = 30.0, *, cache_sound_metadata: bool = False) -> None:
         self.timeout = timeout
         # Opt-in only for a single download job; never cache normal playback.
         self._sound_metadata_cache = {} if cache_sound_metadata else None

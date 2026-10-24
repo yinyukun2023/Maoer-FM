@@ -4,7 +4,8 @@ from unittest.mock import Mock, patch
 
 from browser_player import HiddenBrowserPlayer
 from maoer_api import ApiError, MaoerApi, MediaItem, PlaybackInfo, PurchaseRequired
-from download_dialog import DownloadPartResult, DownloadProgressDialog, DownloadRequest
+from download_dialog import DownloadPartResult, DownloadProgressDialog, DownloadRequest, _DownloadPlayer
+from downloads import DownloadCancelled
 from tests.test_download_controls import DownloadControlTests
 
 
@@ -63,6 +64,54 @@ class DownloadRequestReductionTests(unittest.TestCase):
 
 
 class PreparationCallbackTests(DownloadControlTests):
+    def test_download_rejection_does_not_trigger_a_fast_inner_reload(self):
+        player = _DownloadPlayer.__new__(_DownloadPlayer)
+        HiddenBrowserPlayer.__init__(player, None)
+        player._current = PlaybackInfo(1, '集', '')
+        player._webview = Mock()
+        # A navigation failure may already have queued a page reload.
+        player._startup_retry_pending = True
+        player._run_control_callback = Mock(side_effect=lambda action, value, done:
+            done({'ok': False, 'error': 'page-rejected'}))
+        with patch('browser_player.wx.CallLater') as later:
+            player._autoplay_step(0, 12)
+        self.assertIn('412', player._startup_error)
+        later.assert_not_called()
+        player._retry_startup_page(0)
+        player._webview.LoadURL.assert_not_called()
+
+    def test_only_the_412_retry_waits_30_seconds_and_can_be_cancelled(self):
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                dialog = self.dialog()
+                dialog.cancel.active = 0
+                control = dialog.controls[0]
+                now, calls = [100.0], []
+                def request(playback, ready, result, control):
+                    calls.append(now[0])
+                    result['error'] = '官网播放页请求被拒绝（412），请稍后重试'
+                    ready.set()
+                def wait(seconds):
+                    self.assertLessEqual(seconds, 0.1)
+                    if cancel:
+                        control.set()
+                    else:
+                        now[0] += 30.0
+                with patch('download_dialog.time.monotonic', side_effect=lambda: now[0]), \
+                        patch.object(control, 'wait', side_effect=wait) as waiting, \
+                        patch.object(dialog, '_request_key', side_effect=request), \
+                        patch('download_dialog.wx.CallAfter', side_effect=lambda f, *a: f(*a)):
+                    with self.assertRaises(DownloadCancelled if cancel else ApiError):
+                        dialog._get_key(PlaybackInfo(1, '集', ''), control)
+                    self.assertEqual(calls, [100.0] if cancel else [100.0, 130.0, 160.0])
+                    self.assertEqual(waiting.call_count, 1 if cancel else 2)
+                if not cancel:
+                    dialog.running = True
+                    dialog.player = Mock()
+                    dialog._request_key(PlaybackInfo(2, '下一集', ''), threading.Event(), {}, dialog.controls[1])
+                    dialog.player.play.assert_called_once()
+
+    @patch('download_dialog.DOWNLOAD_REJECTION_COOLDOWN', 0)
     def test_transient_preparation_recreates_once_but_other_errors_do_not_retry(self):
         for message,expected in (('官网播放器未能开始加载音频，请稍后重试',2),('官网播放页请求被拒绝（412），请稍后重试',2),('无法启动音频组件',1)):
             dialog=self.dialog()
@@ -80,7 +129,7 @@ class PreparationCallbackTests(DownloadControlTests):
                     with self.assertRaises(ApiError):dialog._get_key(PlaybackInfo(1,'集',''),dialog.controls[0])
             self.assertEqual(calls,[False,True] if expected==2 else [False])
 
-    def test_preparation_retry_is_bounded_to_two_attempts(self):
+    def test_preparation_retry_is_bounded_to_three_attempts(self):
         dialog=self.dialog()
         dialog.cancel.active=0
         calls=[]
@@ -90,7 +139,25 @@ class PreparationCallbackTests(DownloadControlTests):
             ready.set()
         with patch.object(dialog,'_request_key',side_effect=request),patch('download_dialog.wx.CallAfter',side_effect=lambda f,*a:f(*a)):
             with self.assertRaises(ApiError):dialog._get_key(PlaybackInfo(1,'集',''),dialog.controls[0])
-        self.assertEqual(len(calls),2)
+        self.assertEqual(len(calls),3)
+
+    def test_third_preparation_attempt_can_succeed(self):
+        dialog = self.dialog()
+        dialog.cancel.active = 0
+        calls = []
+        def request(playback, ready, result, control):
+            calls.append(bool(result.get('_fresh')))
+            if len(calls) < 3:
+                result['error'] = '官网音频准备超时，请稍后重试'
+            else:
+                result['key'] = b'fixture'
+            ready.set()
+        with patch.object(dialog, '_request_key', side_effect=request), \
+                patch.object(dialog, '_task_progress') as progress, \
+                patch('download_dialog.wx.CallAfter', side_effect=lambda f, *a: f(*a)):
+            self.assertEqual(dialog._get_key(PlaybackInfo(1, '集', ''), dialog.controls[0]), b'fixture')
+        self.assertEqual(calls, [False, True, True])
+        self.assertIn('第3次，共3次', progress.call_args.args[1])
 
     def test_31_episode_both_content_batch_uses_only_31_metadata_reads(self):
         folder=self.root/'batch31'

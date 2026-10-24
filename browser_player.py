@@ -1114,6 +1114,8 @@ CONTROL_SCRIPT = r"""
 """
 
 class HiddenBrowserPlayer:
+    _retry_rejected_page = True
+
     def __init__(
         self,
         parent: wx.Window,
@@ -1722,7 +1724,11 @@ class HiddenBrowserPlayer:
                     self._run_control("rate", self._playback_rate)
                 return
             if result and result.get("error") == "page-rejected":
-                if not self._startup_reload_attempted:
+                if not self._retry_rejected_page:
+                    self._startup_retry_pending = False
+                    self._suppress_autoplay = True
+                    self._cancel_autoplay_timer()
+                if self._retry_rejected_page and not self._startup_reload_attempted:
                     self._startup_reload_attempted = True
                     self._startup_retry_pending = True
                     self._autoplay_timer = wx.CallLater(2000, self._retry_startup_page, generation)

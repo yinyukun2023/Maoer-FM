@@ -123,6 +123,13 @@ class SubtitleFileTests(unittest.TestCase):
         self.http.assert_not_called()
         self.assertEqual(list(self.folder.iterdir()), [])
 
+    def test_prechecked_playback_info_does_not_request_metadata_again(self):
+        playback = self.api.playback_info.return_value
+        self.api.playback_info.side_effect = AssertionError('Audio already checked playback permissions')
+        saved = self.fetch(playback=playback)
+        self.assertEqual(saved.read_bytes(), EXPECTED_SRT)
+        self.api.playback_info.assert_not_called()
+
     def test_missing_url_or_empty_track_returns_no_file(self):
         self.api.playback_info.return_value.subtitle_url = ''
         self.assertIsNone(self.fetch())

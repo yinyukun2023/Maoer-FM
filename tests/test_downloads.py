@@ -312,7 +312,7 @@ class DownloadTests(unittest.TestCase):
             return result.digest()
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / '第一集.m4a'
-            remux_audio(io.BytesIO(payload), output, None, threading.Event(), None)
+            remux_audio(io.BytesIO(payload), output, None, threading.Event())
             self.assertEqual(fingerprint(io.BytesIO(payload)), fingerprint(str(output)))
             self.assertNotIn(b'pssh', output.read_bytes())
 

@@ -113,7 +113,7 @@ class CaptchaAudioPlayer:
                 "User-Agent": USER_AGENT,
                 "Referer": "https://www.missevan.com/",
             },
-            timeout=15,
+            timeout=30,
         )
         response.raise_for_status()
 

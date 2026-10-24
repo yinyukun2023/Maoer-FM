@@ -9,7 +9,7 @@ import wx
 import requests
 
 from download_dialog import DownloadProgressDialog, DownloadRequest
-from downloads import download_subtitle
+from downloads import check_cancel, download_audio, download_subtitle
 from maoer_api import ApiError, MaoerApi, MediaItem, PlaybackInfo
 from tests.test_download_subtitles import PAYLOAD, EXPECTED_SRT, response_for
 
@@ -72,6 +72,108 @@ class PartialDownloadTests(unittest.TestCase):
         subtitle.write_text('subtitle', encoding='utf-8')
         download = self.run_jobs(window, audio_error=ApiError('音频失败'), subtitle_result=subtitle)
         download.assert_called_once()
+
+    def test_subtitle_starts_during_audio_preparation_and_reuses_playback_info(self):
+        window = self.window()
+        playback = PlaybackInfo(1, '番外', '', drm=True, dash_audio={
+            'base_url': 'https://cdn.invalid/audio.m4s', 'bilidrm_uri': 'fixture'})
+        apis = []
+        def make_api(**kwargs):
+            api = Mock()
+            api.playback_info.return_value = playback
+            apis.append(api)
+            return api
+        subtitle_ready = threading.Event()
+        observed = []
+        def subtitle(api, item, folder, control, progress, **kwargs):
+            observed.append((api, kwargs.get('playback')))
+            path = folder / '番外.srt'
+            path.write_bytes(EXPECTED_SRT)
+            subtitle_ready.set()
+            return path
+        def prepare(*args):
+            if not subtitle_ready.wait(1):
+                raise ApiError('字幕仍在等待音频结束')
+            raise ApiError('模拟音频准备失败')
+        callbacks = []
+        with patch('download_dialog.MaoerApi', side_effect=make_api), \
+                patch('download_dialog.download_audio', side_effect=download_audio), \
+                patch('download_dialog.download_subtitle', side_effect=subtitle), \
+                patch.object(window, '_get_key', side_effect=prepare), \
+                patch('download_dialog.wx.CallAfter', side_effect=lambda f, *a, **kw: callbacks.append((f, a, kw))):
+            window._run()
+        for callback, args, kwargs in callbacks:
+            callback(*args, **kwargs)
+        self.assertEqual(window.tasks[0].parts['audio'].reason, '模拟音频准备失败')
+        self.assertEqual(window.tasks[0].parts['subtitle'].state, 'complete')
+        self.assertIs(observed[0][1], playback)
+        self.assertIsNot(observed[0][0], apis[0], 'Concurrent transfers must not share an HTTP session')
+        self.assertEqual(sum(api.playback_info.call_count for api in apis), 1)
+        self.assertTrue(all(api.session.close.call_count == 1 for api in apis))
+
+    def test_parallel_parts_pause_together_and_finish_before_the_job_is_released(self):
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                folder = self.folder / str(cancel)
+                folder.mkdir()
+                window = DownloadProgressDialog(None, DownloadRequest('作品',
+                    [self.item, MediaItem('sound', 2, '第二集')], folder, '',
+                    download_audio=True, download_subtitles=True))
+                self.addCleanup(window.Destroy)
+                self.addCleanup(window.timer.Stop)
+                window.running = window._started = True
+                audio_started, subtitle_started = threading.Event(), threading.Event()
+                release, second_started = threading.Event(), threading.Event()
+                def save(kind, item, control):
+                    if item.id == 1:
+                        (audio_started if kind == 'audio' else subtitle_started).set()
+                        while not release.wait(0.01):
+                            check_cancel(control)
+                        check_cancel(control)
+                    else:
+                        second_started.set()
+                    path = folder / (str(item.id) + ('.mp3' if kind == 'audio' else '.srt'))
+                    path.write_bytes(b'fixture')
+                    return path
+                def audio(api, item, folder, control, key, progress, **kwargs):
+                    kwargs['on_playback'](PlaybackInfo(item.id, item.title, ''))
+                    return save('audio', item, control)
+                def subtitle(api, item, folder, control, progress, **kwargs):
+                    return save('subtitle', item, control)
+                callbacks = []
+                with patch('download_dialog.MaoerApi'), \
+                        patch('download_dialog.download_audio', side_effect=audio), \
+                        patch('download_dialog.download_subtitle', side_effect=subtitle), \
+                        patch('download_dialog.wx.CallAfter', side_effect=lambda f, *a, **kw: callbacks.append((f, a, kw))):
+                    worker = threading.Thread(target=window._run, daemon=True)
+                    worker.start()
+                    try:
+                        self.assertTrue(audio_started.wait(2))
+                        self.assertTrue(subtitle_started.wait(2))
+                        self.assertFalse(second_started.is_set())
+                        window.controls[0].pause()
+                        self.assertTrue(second_started.wait(2), 'A paused pair must let the next episode run')
+                        self.assertFalse(window.controls[0].done)
+                        self.assertFalse((folder / '1.mp3').exists())
+                        self.assertFalse((folder / '1.srt').exists())
+                        if cancel:
+                            window.controls[0].set()
+                        else:
+                            window.controls[0].resume()
+                            release.set()
+                        worker.join(3)
+                        self.assertFalse(worker.is_alive(), 'Both part workers must finish before queue exit')
+                    finally:
+                        window.cancel.set()
+                        release.set()
+                        worker.join(3)
+                for callback, args, kwargs in callbacks:
+                    callback(*args, **kwargs)
+                state = 'cancelled' if cancel else 'complete'
+                self.assertEqual({part.state for part in window.tasks[0].parts.values()}, {state})
+                self.assertEqual(set(window.tasks[0].parts), {'audio', 'subtitle'})
+                self.assertEqual(window.tasks[1].state, 'complete')
+                self.assertEqual(len(window._created_files), 2 if cancel else 4)
 
     def test_xml_caption_available_without_independent_json_is_downloadable(self):
         api = MaoerApi(cookie='')
