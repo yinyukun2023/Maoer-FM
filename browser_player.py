@@ -937,6 +937,17 @@ CONTROL_SCRIPT = r"""
             document.body && document.body.innerText || "")) {
         return result({ok: false, error: "page-rejected"});
       }
+      var limited = typeof document.querySelector === "function" &&
+        document.querySelector(".limited-modal");
+      if (limited && limited.getClientRects && limited.getClientRects().length) {
+        var titleNode = limited.querySelector(".title");
+        var infoNode = limited.querySelector(".info");
+        var titleText = titleNode && titleNode.textContent || "";
+        if (/同时播放设备超限|版权限制/.test(titleText)) {
+          return result({ok: false, error: "playback-restricted",
+            message: (titleText + "：" + (infoNode && infoNode.textContent || "")).slice(0, 300)});
+        }
+      }
       setVolume(value);
 
       // The site's buttons toggle playback. Never click one when a player is
@@ -1004,7 +1015,11 @@ CONTROL_SCRIPT = r"""
       var loadingSound = demo();
       var loadingMedia = currentMedia();
       if (window.__maoerResumeHold) {
-        if (loadingSound && !loadingSound.__maoerResumeLoadRequested &&
+        // New official HTML/DASH wrappers already own their initialized media
+        // element, but have no SoundManager readyState. Loading them again
+        // replaces the same episode's URL and trips the single-sound guard.
+        if (loadingSound && !(loadingSound.element && typeof loadingSound.element.play === "function") &&
+            !loadingSound.__maoerResumeLoadRequested &&
             (!loadingSound.readyState || loadingSound.readyState === 2) &&
             typeof loadingSound.load === "function") {
           loadingSound.__maoerResumeLoadRequested = true;
@@ -1169,7 +1184,8 @@ class HiddenBrowserPlayer:
         self._playback_rate = 1.0
         self._load_generation += 1
         self._install_user_scripts(webview)
-        if self.cookie and not (self._reuse_cookie_primer and self._primed_cookie == self.cookie):
+        if (webview.GetCurrentURL() in ('', 'about:blank') or
+                (self.cookie and not (self._reuse_cookie_primer and self._primed_cookie == self.cookie))):
             self._cookie_primer_target = page_url
             self._cookie_primer_generation = self._load_generation
             webview.LoadURL(BASE_URL + "/")
@@ -1182,9 +1198,24 @@ class HiddenBrowserPlayer:
         if self._webview is None or generation != self._load_generation or self._current is None:
             return
         self._cookie_primer_target = None
-        self._webview.LoadURL(page_url)
+        self._navigate_playback_page(page_url)
         wx.CallLater(1500, self._mark_loaded_if_current, self._load_generation)
         wx.CallLater(2500, self._schedule_autoplay, self._load_generation)
+
+    def _navigate_playback_page(self, page_url: str) -> None:
+        # LoadURL is an address-bar navigation and drops the current page's
+        # Referer. The official player can reject that request with HTTP 412.
+        # Navigate from the actual official document instead; let the browser
+        # apply its normal referrer policy, cookies and server checks.
+        current = self._webview.GetCurrentURL()
+        origin = urlparse(BASE_URL)
+        if isinstance(current, str):
+            source, target = urlparse(current), urlparse(page_url)
+            if ((source.scheme, source.netloc) == (origin.scheme, origin.netloc) ==
+                    (target.scheme, target.netloc)):
+                self._webview.RunScriptAsync(f'location.assign({json.dumps(page_url)});')
+                return
+        self._webview.LoadURL(page_url)
 
     def seek(self, seconds: int) -> None:
         self._seek_generation += 1
@@ -1355,7 +1386,7 @@ class HiddenBrowserPlayer:
         # normal authenticated player. Never reuse a possibly expired media URL.
         self._install_user_scripts(self._webview)
         page = self._current.page_url or f"{BASE_URL}/sound/player?id={self._current.sound_id}"
-        self._webview.LoadURL(page)
+        self._navigate_playback_page(page)
         wx.CallLater(300, self._restore_paused_position, request, 50)
 
     def _restore_paused_position(self, request: _PauseResume, attempts: int) -> None:
@@ -1722,6 +1753,12 @@ class HiddenBrowserPlayer:
                 self._apply_volume(self._volume)
                 if self._startup_reload_attempted:
                     self._run_control("rate", self._playback_rate)
+                return
+            if result and result.get("error") == "playback-restricted":
+                self._startup_error = '官网限制本集播放：' + str(result.get('message') or '请到官网查看详情')[:300]
+                self._startup_retry_pending = False
+                self._suppress_autoplay = True
+                self._cancel_autoplay_timer()
                 return
             if result and result.get("error") == "page-rejected":
                 if not self._retry_rejected_page:

@@ -2531,6 +2531,17 @@ class MaoerApi:
         if fresh_need_pay is not None:
             item.need_pay = fresh_need_pay
 
+        # Paid status and permission to start playback are separate. The official
+        # player receives no media URLs when limit_type restricts this session.
+        limit_type = _to_int(sound.get("limit_type"), 0) or 0
+        if limit_type:
+            reason = {
+                1: "同时播放设备超限",
+                2: "需要有效会员权益",
+                5: "受版权限制，当前地区无法收听",
+            }.get(limit_type, f"限制代码 {limit_type}，请到官网查看详情")
+            raise ApiError(f"官网限制本集播放：{reason}。")
+
         url = _text(sound.get("soundurl") or sound.get("soundurl_128"))
         if not url:
             if _needs_payment(sound.get("need_pay")) and not (can_play_paid or purchased_sound):

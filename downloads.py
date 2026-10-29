@@ -490,6 +490,8 @@ def download_audio(api: MaoerApi, item: MediaItem, folder: Path, cancel: threadi
     # has_video is false and a separate encrypted DASH audio track exists.
     audio = {} if playback.video_url else playback.dash_audio
     url = str(playback.video_url or audio.get('base_url') or playback.url)
+    if not url:
+        raise ApiError("官网暂未返回本集的音频地址，请稍后重试")
     extension = '.m4a' if audio else Path(urlsplit(url).path).suffix.lower()
     if not audio:
         allowed = {'.mp4'} if playback.video_url else {'.mp3', '.m4a'}
